@@ -1,0 +1,99 @@
+{
+  "name": "artifact-graph",
+  "version": "0.8.1",
+  "description": "Git-native Markdown artifact graph scanner and validator",
+  "license": "Apache-2.0",
+  "type": "module",
+  "packageManager": "pnpm@10.17.1",
+  "keywords": [
+    "artifact-graph",
+    "traceability",
+    "markdown",
+    "agent-tools",
+    "codex"
+  ],
+  "bin": {
+    "artifact-graph": "./dist/cli.js"
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./schemas/review-result.schema.json": "./schemas/review-result.schema.json",
+    "./contracts/e2e-test/schema.json": "./contracts/e2e-test/schema.json"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm,cjs --dts --splitting false && tsup src/cli.ts --format esm --dts --splitting false",
+    "test": "vitest run --config vitest.config.ts",
+    "test:ci": "ARTIFACT_GRAPH_PUBLIC_REPO=1 vitest run --config vitest.config.ts && pnpm test:npm-consumer",
+    "test:npm-consumer": "node test/npm-bin-install.test.mjs",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist coverage",
+    "packet:audit": "node scripts/run-packet-audit.mjs",
+    "packet:prompt-audit": "node scripts/run-packet-prompt-audit.mjs"
+  },
+  "dependencies": {
+    "ajv": "^8.20.0",
+    "better-sqlite3": "^11.9.0",
+    "commander": "^13.1.0",
+    "gray-matter": "^4.0.3",
+    "js-yaml": "^4.2.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.19.20",
+    "tsup": "^8.4.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.1.0"
+  },
+  "files": [
+    "README.md",
+    "README.zh-CN.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "NOTICE",
+    "INSTALL.md",
+    "CONTRIBUTING.md",
+    "CODE_OF_CONDUCT.md",
+    "SECURITY.md",
+    ".github",
+    "dist",
+    "schemas",
+    "contracts",
+    "scripts",
+    "templates"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ifoohoo/artifact-graph.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ifoohoo/artifact-graph/issues"
+  },
+  "homepage": "https://github.com/ifoohoo/artifact-graph#readme",
+  "author": "广州市风荷科技有限公司",
+  "contributors": [
+    "mzdbxqh"
+  ],
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "esbuild"
+    ]
+  }
+}
