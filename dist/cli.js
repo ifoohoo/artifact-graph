@@ -407,6 +407,1552 @@ var init_target_selector = __esm({
   }
 });
 
+// src/git-changes.ts
+import { execFile } from "child_process";
+import { promisify } from "util";
+async function collectChangedPaths(root, options) {
+  const args = gitDiffArgs(options);
+  let stdout;
+  try {
+    ({ stdout } = await execFileAsync("git", args, { cwd: root }));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Unable to collect git changed paths (${options.mode}): ${message}`);
+  }
+  const trackedChangedPaths = normalizeGitPathList(stdout);
+  const untrackedPaths = options.mode === "worktree" || options.mode === "staged" ? await collectUntrackedPaths(root) : [];
+  const changedPaths = options.mode === "worktree" ? sortUnique([...trackedChangedPaths, ...untrackedPaths]) : trackedChangedPaths;
+  const unstagedPaths = options.mode === "staged" ? sortUnique([...await collectUnstagedPaths(root), ...untrackedPaths]) : [];
+  const stagedUnstagedConflictPaths = options.mode === "staged" ? intersect(changedPaths, unstagedPaths) : [];
+  return {
+    root,
+    mode: options.mode,
+    base: options.base,
+    changedPaths,
+    unstagedPaths,
+    stagedUnstagedConflictPaths
+  };
+}
+function gitDiffArgs(options) {
+  const common = ["diff", "--name-only", "-z", "--diff-filter=ACDMRT"];
+  if (options.mode === "staged") {
+    return [...common, "--cached"];
+  }
+  if (options.mode === "worktree") {
+    return common;
+  }
+  if (!options.base) {
+    throw new Error("--base requires a ref when collecting base changed paths");
+  }
+  return [...common, `${options.base}...HEAD`];
+}
+async function collectUnstagedPaths(root) {
+  try {
+    const { stdout } = await execFileAsync("git", ["diff", "--name-only", "-z", "--diff-filter=ACDMRT"], { cwd: root });
+    return normalizeGitPathList(stdout);
+  } catch {
+    return [];
+  }
+}
+async function collectUntrackedPaths(root) {
+  try {
+    const { stdout } = await execFileAsync("git", ["ls-files", "--others", "--exclude-standard", "-z"], { cwd: root });
+    return normalizeGitPathList(stdout);
+  } catch {
+    return [];
+  }
+}
+function normalizeGitPathList(stdout) {
+  return sortUnique(stdout.split("\0").filter((path) => path.length > 0));
+}
+function intersect(left, right) {
+  const rightSet = new Set(right);
+  return left.filter((item) => rightSet.has(item));
+}
+function sortUnique(items) {
+  return [...new Set(items)].sort((left, right) => left.localeCompare(right));
+}
+var execFileAsync;
+var init_git_changes = __esm({
+  "src/git-changes.ts"() {
+    "use strict";
+    execFileAsync = promisify(execFile);
+  }
+});
+
+// src/versioned-traceability.ts
+import { createHash } from "crypto";
+import { existsSync } from "fs";
+import { mkdir, readFile, writeFile } from "fs/promises";
+import { dirname, join as join2, relative as relative2 } from "path";
+async function buildVersionIndex(root, graph) {
+  const scannedGraph = graph ?? await scanArtifacts(root);
+  const hashCache = /* @__PURE__ */ new Map();
+  const nodes = await Promise.all(scannedGraph.nodes.map(async (node) => ({
+    uid: node.uid,
+    type: node.type,
+    id: node.code,
+    path: node.path,
+    title: node.title,
+    line: node.line,
+    sourceKind: classifyNode(node),
+    contentHash: await hashRelativePath(root, node.path, hashCache)
+  })));
+  const hashByUid = new Map(nodes.map((node) => [node.uid, node.contentHash]));
+  const edges = scannedGraph.edges.map((edge2) => ({
+    from: edge2.from,
+    to: edge2.to,
+    kind: normalizeVersionEdgeKind(edge2),
+    source: edge2.source,
+    sourcePath: edge2.sourcePath,
+    sourceLine: edge2.sourceLine,
+    fromHash: hashByUid.get(edge2.from),
+    toHash: hashByUid.get(edge2.to)
+  }));
+  return {
+    schemaVersion: VERSION_INDEX_SCHEMA_VERSION,
+    root,
+    graph: {
+      nodes: scannedGraph.nodes.length,
+      edges: scannedGraph.edges.length
+    },
+    nodes: sortBy(nodes, (node) => node.uid),
+    edges: sortBy(edges, (edge2) => `${edge2.from}	${edge2.to}	${edge2.kind}	${edge2.sourcePath}	${edge2.sourceLine}`)
+  };
+}
+async function auditVersionLock(root, lockPath = VERSION_LOCK_PATH, graph, config) {
+  const index = await buildVersionIndex(root, graph);
+  const schema = config ?? await loadConfig(root);
+  const safeLockPath = normalizeRelativePath(root, lockPath);
+  const lock = await readVersionLock(root, safeLockPath);
+  const nodeByArtifact = new Map(index.nodes.map((node) => [`${node.type}:${node.id}`, node]));
+  const nodeByPath = new Map(index.nodes.map((node) => [node.path, node]));
+  const currentEdges = implementationEdges(index);
+  const lockableEdges = await lockableImplementationEdges(root, index, schema);
+  const currentEdgeIds = new Set(currentEdges.map((edge2) => edge2.edgeId));
+  const issues = [];
+  let fresh = 0;
+  for (const entry of lock.locks) {
+    const artifactNode = nodeByArtifact.get(`${entry.artifact.type}:${entry.artifact.id}`);
+    const sourceNode = nodeByPath.get(entry.source.path);
+    if (!artifactNode || !sourceNode) {
+      issues.push({
+        status: "orphan_lock",
+        edgeId: entry.edgeId,
+        message: `Lock references missing ${!artifactNode ? "artifact" : "source"} node`,
+        artifact: entry.artifact,
+        source: entry.source
+      });
+      continue;
+    }
+    const entryIssues = [];
+    if (!currentEdgeIds.has(entry.edgeId)) {
+      entryIssues.push({
+        status: "orphan_lock",
+        edgeId: entry.edgeId,
+        message: `Locked traceability edge no longer exists in the current graph`,
+        artifact: entry.artifact,
+        source: entry.source
+      });
+    }
+    if (artifactNode.contentHash !== entry.artifact.contentHash) {
+      entryIssues.push({
+        status: "artifact_changed",
+        edgeId: entry.edgeId,
+        message: `${entry.artifact.type}:${entry.artifact.id} changed since the lock was written`,
+        artifact: entry.artifact,
+        source: entry.source,
+        currentArtifactHash: artifactNode.contentHash
+      });
+    }
+    if (sourceNode.contentHash !== entry.source.contentHash) {
+      entryIssues.push({
+        status: "source_changed",
+        edgeId: entry.edgeId,
+        message: `${entry.source.path} changed since the lock was written`,
+        artifact: entry.artifact,
+        source: entry.source,
+        currentSourceHash: sourceNode.contentHash
+      });
+    }
+    for (const verifiedBy of entry.verifiedBy ?? []) {
+      const verifierNode = nodeByPath.get(verifiedBy.path);
+      if (!verifierNode) {
+        entryIssues.push({
+          status: "orphan_lock",
+          edgeId: entry.edgeId,
+          message: `Verifier ${verifiedBy.path} is missing`,
+          artifact: entry.artifact,
+          source: entry.source,
+          verifiedByPath: verifiedBy.path
+        });
+        continue;
+      }
+      if (verifierNode.contentHash !== verifiedBy.contentHash) {
+        entryIssues.push({
+          status: "verified_by_changed",
+          edgeId: entry.edgeId,
+          message: `Verifier ${verifiedBy.path} changed since the lock was written`,
+          artifact: entry.artifact,
+          source: entry.source,
+          currentVerifiedByHash: verifierNode.contentHash,
+          verifiedByPath: verifiedBy.path
+        });
+      }
+      if (artifactNode && !currentEdges.some((edge2) => edge2.from === verifierNode.uid && edge2.to === artifactNode.uid)) {
+        entryIssues.push({
+          status: "orphan_lock",
+          edgeId: entry.edgeId,
+          message: `Verifier ${verifiedBy.path} no longer declares a traceability link to ${entry.artifact.type}:${entry.artifact.id}`,
+          artifact: entry.artifact,
+          source: entry.source,
+          verifiedByPath: verifiedBy.path
+        });
+      }
+    }
+    if (entryIssues.length === 0) {
+      fresh += 1;
+    } else {
+      issues.push(...entryIssues);
+    }
+  }
+  const livenessCache = /* @__PURE__ */ new Map();
+  for (const entry of lock.locks) {
+    if (entry.kind !== "verifies") continue;
+    const sourcePath = entry.source.path;
+    const fullSourcePath = join2(root, sourcePath);
+    if (!existsSync(fullSourcePath)) continue;
+    let liveness = livenessCache.get(sourcePath);
+    if (liveness === void 0) {
+      liveness = await getTestFileRunnerLiveness(root, sourcePath, schema);
+      livenessCache.set(sourcePath, liveness);
+    }
+    if (liveness === "inactive") {
+      issues.push({
+        status: "orphan_lock",
+        edgeId: entry.edgeId,
+        message: `Liveness: ${sourcePath} is not active in any configured runner \u2014 locked verifies edges may reference dead tests`,
+        severity: "warning",
+        artifact: entry.artifact,
+        source: entry.source
+      });
+    }
+  }
+  const reportedMissingLocks = /* @__PURE__ */ new Set();
+  for (const edge2 of lockableEdges) {
+    const edgeId = edge2.edgeId;
+    if (!lock.locks.some((entry) => entry.edgeId === edgeId)) {
+      if (reportedMissingLocks.has(edgeId)) {
+        continue;
+      }
+      reportedMissingLocks.add(edgeId);
+      const source = index.nodes.find((node) => node.uid === edge2.from);
+      const artifact = index.nodes.find((node) => node.uid === edge2.to);
+      issues.push({
+        status: "missing_lock",
+        edgeId,
+        message: `${edge2.from} ${edge2.kind} ${edge2.to} has no version lock`,
+        artifact: artifact ? lockRefFromNode(artifact) : void 0,
+        source: source ? sourceRefFromNode(source) : void 0
+      });
+    }
+  }
+  const currentArtifactRelationEdges = artifactRelationEdges(index);
+  const currentArtifactRelationEdgeIds = new Set(currentArtifactRelationEdges.map((edge2) => edge2.edgeId));
+  const artifactRelationLocks = lock.artifactRelations ?? [];
+  let artifactRelationFresh = 0;
+  for (const relLock of artifactRelationLocks) {
+    const relEdgeId = relLock.edgeId;
+    const sourceKey = `${relLock.source.type}:${relLock.source.id}`;
+    const targetKey = `${relLock.target.type}:${relLock.target.id}`;
+    const sourceNode = nodeByArtifact.get(sourceKey);
+    const targetNode = nodeByArtifact.get(targetKey);
+    if (!sourceNode || !targetNode) {
+      issues.push({
+        status: "orphan_lock",
+        edgeId: relEdgeId,
+        message: `Artifact relation lock references missing ${!sourceNode ? "source" : "target"} node: ${!sourceNode ? sourceKey : targetKey}`
+      });
+      continue;
+    }
+    const entryIssues = [];
+    if (!currentArtifactRelationEdgeIds.has(relEdgeId)) {
+      entryIssues.push({
+        status: "orphan_lock",
+        edgeId: relEdgeId,
+        message: `Artifact relation ${relLock.source.type}:${relLock.source.id} --[${relLock.kind}]--> ${relLock.target.type}:${relLock.target.id} no longer exists in the current graph`
+      });
+    }
+    if (sourceNode.path !== relLock.source.path) {
+      entryIssues.push({
+        status: "source_changed",
+        edgeId: relEdgeId,
+        message: `Artifact relation source ${sourceKey} moved from ${relLock.source.path} to ${sourceNode.path}`,
+        currentSourceHash: sourceNode.contentHash
+      });
+    }
+    if (targetNode.path !== relLock.target.path) {
+      entryIssues.push({
+        status: "artifact_changed",
+        edgeId: relEdgeId,
+        message: `Artifact relation target ${targetKey} moved from ${relLock.target.path} to ${targetNode.path}`,
+        currentArtifactHash: targetNode.contentHash
+      });
+    }
+    if (sourceNode.contentHash !== relLock.source.contentHash) {
+      entryIssues.push({
+        status: "source_changed",
+        edgeId: relEdgeId,
+        message: `Artifact relation source ${sourceKey} changed since the lock was written`,
+        currentSourceHash: sourceNode.contentHash
+      });
+    }
+    if (targetNode.contentHash !== relLock.target.contentHash) {
+      entryIssues.push({
+        status: "artifact_changed",
+        edgeId: relEdgeId,
+        message: `Artifact relation target ${targetKey} changed since the lock was written`,
+        currentArtifactHash: targetNode.contentHash
+      });
+    }
+    if (!existsSync(join2(root, sourceNode.path))) {
+      entryIssues.push({
+        status: "orphan_lock",
+        edgeId: relEdgeId,
+        message: `Artifact relation source file ${sourceNode.path} no longer exists`
+      });
+    }
+    if (!existsSync(join2(root, targetNode.path))) {
+      entryIssues.push({
+        status: "orphan_lock",
+        edgeId: relEdgeId,
+        message: `Artifact relation target file ${targetNode.path} no longer exists`
+      });
+    }
+    if (entryIssues.length === 0) {
+      artifactRelationFresh += 1;
+    } else {
+      issues.push(...entryIssues);
+    }
+  }
+  const reportedMissingRelationLocks = /* @__PURE__ */ new Set();
+  for (const edge2 of currentArtifactRelationEdges) {
+    const edgeId = edge2.edgeId;
+    if (!artifactRelationLocks.some((lock2) => lock2.edgeId === edgeId)) {
+      if (reportedMissingRelationLocks.has(edgeId)) {
+        continue;
+      }
+      reportedMissingRelationLocks.add(edgeId);
+      const source = index.nodes.find((node) => node.uid === edge2.from);
+      const target = index.nodes.find((node) => node.uid === edge2.to);
+      issues.push({
+        status: "missing_lock",
+        edgeId,
+        message: `Artifact relation ${edge2.from} --[${edge2.kind}]--> ${edge2.to} has no version lock`,
+        artifact: target ? lockRefFromNode(target) : void 0,
+        source: source ? lockRefFromNode(source) : void 0
+      });
+    }
+  }
+  return {
+    schemaVersion: "1.0",
+    root,
+    lockPath: safeLockPath,
+    totalLocks: lock.locks.length,
+    fresh,
+    totalArtifactRelationLocks: artifactRelationLocks.length,
+    artifactRelationFresh,
+    issues: sortBy(issues.map(enrichVersionLockIssue), (issue2) => `${issue2.status}	${issue2.edgeId}	${issue2.verifiedByPath ?? ""}`)
+  };
+}
+function isLivenessIssue(issue2) {
+  return issue2.status === "orphan_lock" && issue2.message.startsWith(LIVENESS_MESSAGE_PREFIX);
+}
+function versionLockIssueSeverity(issue2) {
+  if (issue2.severity) {
+    return issue2.severity;
+  }
+  if (issue2.status === "missing_lock") {
+    return "warning";
+  }
+  if (issue2.status === "orphan_lock" && issue2.message.startsWith(LIVENESS_MESSAGE_PREFIX)) {
+    return "warning";
+  }
+  return "error";
+}
+function isVersionLockIssueBlocking(issue2, strictMissingLock) {
+  if (issue2.status === "missing_lock") {
+    return strictMissingLock;
+  }
+  return versionLockIssueSeverity(issue2) === "error";
+}
+function versionLockIssueRemediation(issue2) {
+  switch (issue2.status) {
+    case "artifact_changed":
+      return [
+        "\u786E\u8BA4\u8FD9\u6B21\u5236\u54C1\u53D8\u66F4\uFF08\u5185\u5BB9\u6216\u8DEF\u5F84\uFF09\u662F\u6709\u610F\u7684\u3002",
+        "\u8FD0\u884C `artifact-graph version-lock refresh --changed-only --worktree --format markdown`\uFF08\u65E5\u5E38\u5F00\u53D1\uFF09\u6216 `artifact-graph version-lock refresh --changed-only --staged --format markdown`\uFF08\u63D0\u4EA4\u524D\uFF09\u5237\u65B0\u53D7\u5F71\u54CD\u7684\u9501\u3002",
+        "\u8FD0\u884C `git diff artifacts/traceability-version-lock.json` \u5BA1\u67E5\u9501\u53D8\u66F4\uFF0C\u786E\u8BA4\u540E `git add artifacts/traceability-version-lock.json` \u5E76\u91CD\u65B0\u63D0\u4EA4\u3002"
+      ];
+    case "source_changed":
+      return [
+        "\u786E\u8BA4\u8FD9\u6B21\u6E90\u7801/\u6D4B\u8BD5\u53D8\u66F4\uFF08\u5185\u5BB9\u6216\u8DEF\u5F84\uFF09\u662F\u6709\u610F\u7684\u3002",
+        "\u8FD0\u884C `artifact-graph version-lock refresh --changed-only --worktree --format markdown`\uFF08\u65E5\u5E38\u5F00\u53D1\uFF09\u6216 `artifact-graph version-lock refresh --changed-only --staged --format markdown`\uFF08\u63D0\u4EA4\u524D\uFF09\u5237\u65B0\u53D7\u5F71\u54CD\u7684\u9501\u3002",
+        "\u8FD0\u884C `git diff artifacts/traceability-version-lock.json` \u5BA1\u67E5\u9501\u53D8\u66F4\uFF0C\u786E\u8BA4\u540E `git add artifacts/traceability-version-lock.json` \u5E76\u91CD\u65B0\u63D0\u4EA4\u3002"
+      ];
+    case "verified_by_changed":
+      return [
+        "\u786E\u8BA4\u8FD9\u6B21\u9A8C\u8BC1\u6587\u4EF6\u53D8\u66F4\u662F\u6709\u610F\u7684\u3002",
+        "\u8FD0\u884C `artifact-graph version-lock refresh --changed-only --worktree --format markdown`\uFF08\u65E5\u5E38\u5F00\u53D1\uFF09\u6216 `artifact-graph version-lock refresh --changed-only --staged --format markdown`\uFF08\u63D0\u4EA4\u524D\uFF09\u5237\u65B0\u53D7\u5F71\u54CD\u7684\u9501\u3002",
+        "\u8FD0\u884C `git diff artifacts/traceability-version-lock.json` \u5BA1\u67E5\u9501\u53D8\u66F4\uFF0C\u786E\u8BA4\u540E `git add artifacts/traceability-version-lock.json` \u5E76\u91CD\u65B0\u63D0\u4EA4\u3002"
+      ];
+    case "missing_lock":
+      return [
+        "\u65B0\u589E\u8FFD\u6EAF\u8FB9\u8FD8\u6CA1\u6709\u5BF9\u5E94\u7248\u672C\u9501\uFF1B\u9ED8\u8BA4\u4E0D\u963B\u65AD\uFF0C`--strict-missing-lock` \u4E0B\u4F1A\u963B\u65AD\u3002",
+        "\u8FD0\u884C `artifact-graph version-lock refresh --changed-only --worktree --format markdown` \u4E3A\u53D7\u5F71\u54CD\u8FB9\u8865\u9501\uFF1B\u9996\u6B21\u5EFA\u7ACB\u57FA\u7EBF\u6216\u914D\u7F6E\u53D8\u66F4\u65F6\u7528 `artifact-graph version-lock refresh --all --format markdown`\u3002",
+        "\u8FD0\u884C `git diff artifacts/traceability-version-lock.json` \u5BA1\u67E5\u540E `git add artifacts/traceability-version-lock.json` \u6682\u5B58\u3002"
+      ];
+    case "orphan_lock":
+      if (isLivenessIssue(issue2)) {
+        return [
+          "\u8FD9\u662F liveness \u8B66\u544A\uFF0C\u4E0D\u662F\u6821\u9A8C\u5931\u8D25\uFF1A\u9501\u4ECD\u7136\u4FDD\u7559\uFF0C\u9ED8\u8BA4\u4E0D\u963B\u65AD\u3002",
+          "\u5982\u679C\u6D4B\u8BD5\u5DF2\u5E9F\u5F03\uFF1A\u5220\u9664\u8BE5\u6587\u4EF6\u6216\u79FB\u9664\u5176\u4E2D\u7684\u8FFD\u6EAF\u6CE8\u91CA\uFF0C\u7136\u540E\u8FD0\u884C `artifact-graph version-lock refresh --all --remove-orphans --format markdown` \u6E05\u7406\u5BF9\u5E94\u7684\u9501\u3002",
+          "\u5982\u679C\u6D4B\u8BD5\u4ECD\u7136\u6709\u6548\uFF1A\u628A\u5B83\u52A0\u5165 artifact-graph.config.yaml \u4E2D\u67D0\u4E2A e2e runner \u7684 include\uFF0C\u6216\u68C0\u67E5 exclude/testIgnore \u662F\u5426\u8BEF\u4F24\u3002"
+        ];
+      }
+      return [
+        "\u9501\u5F15\u7528\u7684\u5236\u54C1\u3001\u6E90\u7801\u6216\u8FFD\u6EAF\u8FB9\u5728\u5F53\u524D\u56FE\u4E2D\u5DF2\u4E0D\u5B58\u5728\uFF0C\u5E38\u89C1\u4E8E\u5236\u54C1\u5220\u9664\u6216\u62C6\u5206\u4E4B\u540E\u3002",
+        "\u786E\u8BA4\u5220\u9664\u662F\u6709\u610F\u7684\u540E\uFF0C\u8FD0\u884C `artifact-graph version-lock refresh --all --remove-orphans --format markdown` \u6E05\u7406\u5B64\u7ACB\u9501\u3002",
+        "\u8FD0\u884C `git diff artifacts/traceability-version-lock.json` \u5BA1\u67E5\u88AB\u79FB\u9664\u7684\u9501\u6761\u76EE\uFF0C\u786E\u8BA4\u540E `git add artifacts/traceability-version-lock.json` \u6682\u5B58\u3002",
+        "\u5982\u679C\u5220\u9664\u662F\u8BEF\u64CD\u4F5C\uFF0C\u5148\u6062\u590D\u5BF9\u5E94\u5236\u54C1\u6216\u6E90\u7801\u6587\u4EF6\uFF0C\u518D\u8FD0\u884C\u4E0D\u5E26 `--remove-orphans` \u7684 refresh \u5237\u65B0\u54C8\u5E0C\u3002"
+      ];
+    case "target_not_found":
+      return [
+        "\u68C0\u67E5 `--target` \u7684 `type:id` \u662F\u5426\u62FC\u5199\u6B63\u786E\u3002",
+        "\u5982\u679C\u8BE5\u5236\u54C1\u5DF2\u88AB\u5220\u9664\u6216\u6539\u540D\uFF0C\u6539\u7528\u5F53\u524D\u5B58\u5728\u7684\u5236\u54C1\u6807\u8BC6\u91CD\u8BD5\u3002"
+      ];
+    default:
+      return [];
+  }
+}
+function enrichVersionLockIssue(issue2) {
+  return {
+    ...issue2,
+    severity: versionLockIssueSeverity(issue2),
+    remediation: issue2.remediation ?? versionLockIssueRemediation(issue2)
+  };
+}
+async function updateVersionLock(root, options) {
+  const index = await buildVersionIndex(root);
+  const currentEdges = implementationEdges(index);
+  const targetUid = parseTarget(options.target);
+  const sourcePath = normalizeRelativePath(root, options.source);
+  const source = index.nodes.find((node) => node.path === sourcePath);
+  const artifact = index.nodes.find((node) => node.uid === targetUid);
+  if (!artifact) {
+    throw new Error(`Target artifact not found: ${options.target}`);
+  }
+  if (!source) {
+    throw new Error(`Source node not found or has no traceability comment: ${sourcePath}`);
+  }
+  if (source.sourceKind !== "code" && source.sourceKind !== "test") {
+    throw new Error(`Source must be code or test, got ${source.sourceKind}: ${sourcePath}`);
+  }
+  const matchingEdge = currentEdges.find((edge2) => edge2.from === source.uid && edge2.to === artifact.uid);
+  if (!matchingEdge) {
+    throw new Error(`Source ${sourcePath} does not declare a traceability link to ${options.target}`);
+  }
+  const verifiedBy = (options.verifiedBy ?? []).map((path) => {
+    const verifierPath = normalizeRelativePath(root, path);
+    const verifier = index.nodes.find((node) => node.path === verifierPath);
+    if (!verifier) {
+      throw new Error(`Verifier node not found or has no traceability comment: ${verifierPath}`);
+    }
+    if (verifier.sourceKind !== "code" && verifier.sourceKind !== "test") {
+      throw new Error(`Verifier must be code or test, got ${verifier.sourceKind}: ${verifierPath}`);
+    }
+    const verifierEdge = currentEdges.find((edge2) => edge2.from === verifier.uid && edge2.to === artifact.uid);
+    if (!verifierEdge) {
+      throw new Error(`Verifier ${verifierPath} does not declare a traceability link to ${options.target}`);
+    }
+    return sourceRefFromNode(verifier);
+  });
+  const kind = source.sourceKind === "test" ? "verifies" : "implements";
+  const entry = {
+    edgeId: lockEdgeIdFor(source, artifact, kind),
+    kind,
+    artifact: lockRefFromNode(artifact),
+    source: sourceRefFromNode(source),
+    verifiedBy: verifiedBy.length > 0 ? sortBy(verifiedBy, (item) => item.path) : void 0
+  };
+  const lockPath = normalizeRelativePath(root, options.lockPath ?? VERSION_LOCK_PATH);
+  const lock = await readVersionLock(root, lockPath);
+  const filtered = lock.locks.filter((item) => item.edgeId !== entry.edgeId);
+  const next = {
+    schemaVersion: VERSION_LOCK_SCHEMA_VERSION,
+    locks: sortBy([...filtered, entry], (item) => item.edgeId),
+    artifactRelations: lock.artifactRelations
+  };
+  await writeVersionLock(root, lockPath, next);
+  return next;
+}
+async function bootstrapVersionLock(root, options = {}) {
+  const index = await buildVersionIndex(root);
+  const config = await loadConfig(root);
+  const lockPath = normalizeRelativePath(root, options.lockPath ?? VERSION_LOCK_PATH);
+  if (!options.force) {
+    const existing = await readVersionLock(root, lockPath);
+    if (existing.locks.length > 0) {
+      throw new Error(`Version lock already contains ${existing.locks.length} locks. Use --force to overwrite.`);
+    }
+  }
+  const nodeByUid = new Map(index.nodes.map((node) => [node.uid, node]));
+  const entries = /* @__PURE__ */ new Map();
+  for (const edge2 of await lockableImplementationEdges(root, index, config)) {
+    const source = nodeByUid.get(edge2.from);
+    const artifact = nodeByUid.get(edge2.to);
+    if (!source || !artifact) {
+      continue;
+    }
+    const kind = source.sourceKind === "test" ? "verifies" : "implements";
+    const edgeId = edge2.edgeId;
+    if (entries.has(edgeId)) {
+      continue;
+    }
+    entries.set(edgeId, {
+      edgeId,
+      kind,
+      artifact: lockRefFromNode(artifact),
+      source: sourceRefFromNode(source)
+    });
+  }
+  const artifactRelationEntries = [];
+  for (const edge2 of artifactRelationEdges(index)) {
+    const source = nodeByUid.get(edge2.from);
+    const target = nodeByUid.get(edge2.to);
+    if (!source || !target) continue;
+    artifactRelationEntries.push(artifactRelationLockFromEdge(edge2, source, target));
+  }
+  const next = {
+    schemaVersion: VERSION_LOCK_SCHEMA_VERSION,
+    locks: sortBy([...entries.values()], (item) => item.edgeId),
+    artifactRelations: sortBy(artifactRelationEntries, artifactRelationLockSortKey)
+  };
+  await writeVersionLock(root, lockPath, next);
+  return next;
+}
+async function refreshVersionLock(root, options = {}) {
+  const lockPath = normalizeRelativePath(root, options.lockPath ?? VERSION_LOCK_PATH);
+  const changedPaths = sortUnique2((options.changedPaths ?? []).map((path) => normalizeRelativePath(root, path)));
+  const all = options.all === true || options.changedOnly !== true;
+  const mode = all ? "all" : "changed-only";
+  const warnings = [];
+  if (!all && changedPaths.includes("artifact-graph.config.yaml")) {
+    throw new Error("Changed-only version-lock refresh includes artifact-graph.config.yaml and requires --all");
+  }
+  const index = await buildVersionIndex(root);
+  const config = await loadConfig(root);
+  const lock = await readVersionLock(root, lockPath);
+  const nodeByUid = new Map(index.nodes.map((node) => [node.uid, node]));
+  const nodeByPath = new Map(index.nodes.map((node) => [node.path, node]));
+  const currentImplementationEdges = await lockableImplementationEdges(root, index, config);
+  const currentEdgePairs = new Set(currentImplementationEdges.map((edge2) => `${edge2.from}	${edge2.to}`));
+  const currentEntries = /* @__PURE__ */ new Map();
+  const changedPathSet = new Set(changedPaths);
+  const affectedEdges = /* @__PURE__ */ new Set();
+  const addedLocks = [];
+  const updatedLocks = [];
+  const retainedOrphans = [];
+  const removedOrphans = [];
+  const nextLocks = /* @__PURE__ */ new Map();
+  for (const edge2 of currentImplementationEdges) {
+    const source = nodeByUid.get(edge2.from);
+    const artifact = nodeByUid.get(edge2.to);
+    if (!source || !artifact || currentEntries.has(edge2.edgeId)) {
+      continue;
+    }
+    const existing = lock.locks.find((entry) => entry.edgeId === edge2.edgeId);
+    currentEntries.set(edge2.edgeId, lockEntryFromCurrentEdge(
+      edge2.edgeId,
+      source,
+      artifact,
+      existing,
+      nodeByPath,
+      currentEdgePairs,
+      options.removeOrphans === true,
+      removedOrphans
+    ));
+  }
+  for (const existing of lock.locks) {
+    const current = currentEntries.get(existing.edgeId);
+    const affected = all || lockEntryTouchesAnyPath(existing, changedPathSet);
+    if (affected) {
+      affectedEdges.add(existing.edgeId);
+    }
+    if (!current) {
+      if (affected && options.removeOrphans === true) {
+        removedOrphans.push(existing.edgeId);
+      } else {
+        if (affected) {
+          retainedOrphans.push(existing.edgeId);
+        }
+        nextLocks.set(existing.edgeId, existing);
+      }
+      continue;
+    }
+    if (affected || currentEdgeTouchesAnyPath(current, changedPathSet)) {
+      affectedEdges.add(existing.edgeId);
+      if (stableEntryJson(existing) !== stableEntryJson(current)) {
+        updatedLocks.push(existing.edgeId);
+      }
+      nextLocks.set(existing.edgeId, current);
+    } else {
+      nextLocks.set(existing.edgeId, existing);
+    }
+  }
+  for (const [edgeId, current] of currentEntries) {
+    if (nextLocks.has(edgeId)) {
+      continue;
+    }
+    const affected = all || currentEdgeTouchesAnyPath(current, changedPathSet);
+    if (!affected) {
+      continue;
+    }
+    affectedEdges.add(edgeId);
+    addedLocks.push(edgeId);
+    nextLocks.set(edgeId, current);
+  }
+  if (mode === "changed-only" && changedPaths.length === 0) {
+    warnings.push("No changed paths were provided; no locks were refreshed.");
+  }
+  const currentArtifactRelationEdgeList = artifactRelationEdges(index);
+  const existingArtifactRelationLocks = lock.artifactRelations ?? [];
+  const addedArtifactRelationLocks = [];
+  const updatedArtifactRelationLocks = [];
+  const retainedArtifactRelationOrphans = [];
+  const removedArtifactRelationLocks = [];
+  const nextArtifactRelationLocks = [];
+  const processedRelationEdgeIds = /* @__PURE__ */ new Set();
+  for (const edge2 of currentArtifactRelationEdgeList) {
+    const source = nodeByUid.get(edge2.from);
+    const target = nodeByUid.get(edge2.to);
+    if (!source || !target || processedRelationEdgeIds.has(edge2.edgeId)) {
+      continue;
+    }
+    processedRelationEdgeIds.add(edge2.edgeId);
+    const existingLock = existingArtifactRelationLocks.find(
+      (lock2) => lock2.edgeId === edge2.edgeId
+    );
+    const affected = all || existingLock && artifactRelationLockTouchesPaths(existingLock, changedPathSet) || changedPathSet.has(source.path) || changedPathSet.has(target.path);
+    if (!affected) {
+      if (existingLock) {
+        nextArtifactRelationLocks.push(existingLock);
+      }
+      continue;
+    }
+    affectedEdges.add(edge2.edgeId);
+    const newLock = artifactRelationLockFromEdge(edge2, source, target);
+    if (existingLock) {
+      if (stableArtifactRelationLockJson(existingLock) === stableArtifactRelationLockJson(newLock)) {
+        nextArtifactRelationLocks.push(existingLock);
+      } else {
+        updatedArtifactRelationLocks.push(edge2.edgeId);
+        nextArtifactRelationLocks.push(newLock);
+      }
+    } else {
+      addedArtifactRelationLocks.push(edge2.edgeId);
+      nextArtifactRelationLocks.push(newLock);
+    }
+  }
+  for (const existingLock of existingArtifactRelationLocks) {
+    const relEdgeId = existingLock.edgeId;
+    if (processedRelationEdgeIds.has(relEdgeId)) {
+      continue;
+    }
+    const affected = all || artifactRelationLockTouchesPaths(existingLock, changedPathSet);
+    if (affected) {
+      affectedEdges.add(relEdgeId);
+      if (options.removeOrphans === true) {
+        removedArtifactRelationLocks.push(relEdgeId);
+      } else {
+        retainedArtifactRelationOrphans.push(relEdgeId);
+        nextArtifactRelationLocks.push(existingLock);
+      }
+    } else {
+      nextArtifactRelationLocks.push(existingLock);
+    }
+  }
+  const next = {
+    schemaVersion: VERSION_LOCK_SCHEMA_VERSION,
+    locks: sortBy([...nextLocks.values()], (item) => item.edgeId),
+    artifactRelations: sortBy(nextArtifactRelationLocks, artifactRelationLockSortKey)
+  };
+  await writeVersionLock(root, lockPath, next);
+  const postAudit = await auditVersionLock(root, lockPath, void 0, config);
+  return {
+    schemaVersion: "1.0",
+    root,
+    lockPath,
+    mode,
+    changedPaths,
+    affectedEdges: sortUnique2([...affectedEdges]),
+    addedLocks: sortUnique2(addedLocks),
+    updatedLocks: sortUnique2(updatedLocks),
+    retainedOrphans: sortUnique2(retainedOrphans),
+    removedOrphans: sortUnique2(removedOrphans),
+    addedArtifactRelationLocks: sortUnique2(addedArtifactRelationLocks),
+    updatedArtifactRelationLocks: sortUnique2(updatedArtifactRelationLocks),
+    retainedArtifactRelationOrphans: sortUnique2(retainedArtifactRelationOrphans),
+    removedArtifactRelationLocks: sortUnique2(removedArtifactRelationLocks),
+    postAudit,
+    warnings
+  };
+}
+async function traceVersion(root, target, lockPath = VERSION_LOCK_PATH) {
+  const index = await buildVersionIndex(root);
+  const safeLockPath = normalizeRelativePath(root, lockPath);
+  const config = await loadConfig(root);
+  const audit = await auditVersionLock(root, safeLockPath, void 0, config);
+  const targetUid = parseTarget(target);
+  const lock = await readVersionLock(root, safeLockPath);
+  const targetNode = index.nodes.find((node) => node.uid === targetUid);
+  const targetIssues = targetNode ? [] : [{
+    status: "target_not_found",
+    edgeId: targetUid,
+    message: `Target artifact not found: ${target}`
+  }];
+  const targetArtifactRelations = (lock.artifactRelations ?? []).filter((rel) => {
+    const sourceKey = `${rel.source.type}:${rel.source.id}`;
+    const targetKey = `${rel.target.type}:${rel.target.id}`;
+    return sourceKey === targetUid || targetKey === targetUid;
+  });
+  return {
+    schemaVersion: "1.0",
+    root,
+    lockPath: safeLockPath,
+    target: {
+      uid: targetUid,
+      node: targetNode
+    },
+    currentEdges: index.edges.filter((edge2) => edge2.from === targetUid || edge2.to === targetUid),
+    locks: lock.locks.filter((entry) => `${entry.artifact.type}:${entry.artifact.id}` === targetUid),
+    artifactRelations: targetArtifactRelations,
+    issues: [...targetIssues.map(enrichVersionLockIssue), ...audit.issues.filter((issue2) => `${issue2.artifact?.type}:${issue2.artifact?.id}` === targetUid || issue2.edgeId.includes(`#${targetUid}`))]
+  };
+}
+function renderIssueBlockingTag(issue2, strictMissingLock) {
+  return isVersionLockIssueBlocking(issue2, strictMissingLock) ? "\u963B\u65AD" : "\u8B66\u544A";
+}
+function renderIssueBlockingExplanation(issue2, strictMissingLock) {
+  if (!isVersionLockIssueBlocking(issue2, strictMissingLock)) {
+    return "\u5426\uFF08\u4EC5\u63D0\u9192\uFF0C\u4E0D\u963B\u65AD\uFF09";
+  }
+  if (issue2.status === "missing_lock" && versionLockIssueSeverity(issue2) !== "error") {
+    return "\u662F\uFF08\u5DF2\u7531 --strict-missing-lock \u5347\u7EA7\u4E3A\u963B\u65AD\uFF09";
+  }
+  return "\u662F\uFF08\u4F1A\u4F7F\u547D\u4EE4\u4EE5\u975E\u96F6\u9000\u51FA\u7801\u7ED3\u675F\uFF09";
+}
+function appendIssueDetails(lines, issues, strictMissingLock) {
+  issues.forEach((issue2, index) => {
+    const label = VERSION_LOCK_STATUS_LABELS[issue2.status] ?? issue2.status;
+    lines.push(`### ${index + 1}. [${renderIssueBlockingTag(issue2, strictMissingLock)}] ${label}\uFF08\`${issue2.status}\`\uFF09`);
+    lines.push("");
+    lines.push(`- \u8FB9: \`${issue2.edgeId}\``);
+    lines.push(`- \u8BE6\u60C5: ${issue2.message}`);
+    lines.push(`- \u662F\u5426\u963B\u65AD: ${renderIssueBlockingExplanation(issue2, strictMissingLock)}`);
+    const remediation = issue2.remediation ?? [];
+    if (remediation.length > 0) {
+      lines.push("- \u89E3\u51B3\u6B65\u9AA4:");
+      remediation.forEach((step, stepIndex) => {
+        lines.push(`  ${stepIndex + 1}. ${step}`);
+      });
+    }
+    lines.push("");
+  });
+}
+function renderVersionLockAuditMarkdown(result, options = {}) {
+  const strictMissingLock = options.strictMissingLock === true;
+  const blockingCount = result.issues.filter((issue2) => isVersionLockIssueBlocking(issue2, strictMissingLock)).length;
+  const nonBlockingCount = result.issues.length - blockingCount;
+  const lines = [
+    "# \u7248\u672C\u9501\u5BA1\u8BA1\uFF08version-lock audit\uFF09",
+    "",
+    `- \u6839\u76EE\u5F55: \`${result.root}\``,
+    `- \u9501\u6587\u4EF6: \`${result.lockPath}\``,
+    `- \u5B9E\u73B0/\u9A8C\u8BC1\u9501: ${result.totalLocks}\uFF08\u65B0\u9C9C ${result.fresh}\uFF09`,
+    `- \u5236\u54C1\u5173\u7CFB\u9501: ${result.totalArtifactRelationLocks}\uFF08\u65B0\u9C9C ${result.artifactRelationFresh}\uFF09`,
+    `- \u963B\u65AD\u7B56\u7565: ${strictMissingLock ? "--strict-missing-lock\uFF08missing_lock \u5347\u7EA7\u4E3A\u963B\u65AD\uFF09" : "\u9ED8\u8BA4\uFF08missing_lock \u4E0D\u963B\u65AD\uFF09"}`,
+    `- \u95EE\u9898: ${result.issues.length}\uFF08\u963B\u65AD ${blockingCount}\uFF0C\u4E0D\u963B\u65AD ${nonBlockingCount}\uFF09`,
+    "",
+    "> \u5BA1\u8BA1\u8303\u56F4\uFF1A\u5DF2\u53D1\u73B0\u7684\u8FFD\u6EAF\u5173\u7CFB\u53CA\u5DF2\u6709\u7248\u672C\u9501\u3002\u901A\u8FC7\u4E0D\u4EE3\u8868\u6240\u6709\u53D1\u5E03\u6587\u4EF6\u6216\u5236\u54C1\u5747\u6709\u5B9E\u73B0\u8986\u76D6\uFF1B\u96F6\u9501\u4E5F\u53EF\u80FD\u901A\u8FC7\u3002",
+    "> \u6CE8\u91CA\u8BED\u6CD5\u3001\u626B\u63CF\u8DEF\u5F84\u4E0E\u8986\u76D6\u8FB9\u754C\u89C1 INSTALL.md \u7684 Code Traceability And Coverage Boundaries\u3002",
+    ""
+  ];
+  if (result.issues.length === 0) {
+    lines.push("\u672A\u53D1\u73B0\u7248\u672C\u9501\u95EE\u9898\u3002");
+    return `${lines.join("\n")}
+`;
+  }
+  if (blockingCount > 0) {
+    lines.push(`\u5F53\u524D\u7B56\u7565\u4E0B\u5B58\u5728 ${blockingCount} \u4E2A\u963B\u65AD\u95EE\u9898\uFF0C\u547D\u4EE4\u5C06\u4EE5\u975E\u96F6\u9000\u51FA\u7801\u7ED3\u675F\uFF1B\u8BF7\u6309\u4E0B\u65B9\u6B65\u9AA4\u9010\u9879\u5904\u7406\u3002`);
+  } else {
+    lines.push("\u5F53\u524D\u7B56\u7565\u4E0B\u6CA1\u6709\u963B\u65AD\u95EE\u9898\uFF0C\u4EE5\u4E0B\u4EC5\u4E3A\u63D0\u9192\uFF0C\u547D\u4EE4\u4EE5\u96F6\u9000\u51FA\u7801\u7ED3\u675F\u3002");
+  }
+  lines.push("");
+  lines.push("## \u95EE\u9898\u6E05\u5355");
+  lines.push("");
+  appendIssueDetails(lines, result.issues, strictMissingLock);
+  return `${lines.join("\n")}
+`;
+}
+function renderVersionLockRefreshMarkdown(result) {
+  const strictMissingLock = true;
+  const blockingCount = result.postAudit.issues.filter((issue2) => isVersionLockIssueBlocking(issue2, strictMissingLock)).length;
+  const nonBlockingCount = result.postAudit.issues.length - blockingCount;
+  const lines = [
+    "# \u7248\u672C\u9501\u5237\u65B0\uFF08version-lock refresh\uFF09",
+    "",
+    `- \u6839\u76EE\u5F55: \`${result.root}\``,
+    `- \u9501\u6587\u4EF6: \`${result.lockPath}\``,
+    `- \u6A21\u5F0F: \`${result.mode}\`\uFF08\u53D8\u66F4\u8DEF\u5F84 ${result.changedPaths.length} \u4E2A\uFF0C\u53D7\u5F71\u54CD\u8FB9 ${result.affectedEdges.length} \u6761\uFF09`,
+    `- \u5B9E\u73B0/\u9A8C\u8BC1\u9501: \u65B0\u589E ${result.addedLocks.length} | \u66F4\u65B0 ${result.updatedLocks.length} | \u4FDD\u7559\u5B64\u7ACB ${result.retainedOrphans.length} | \u5220\u9664\u5B64\u7ACB ${result.removedOrphans.length}`,
+    `- \u5236\u54C1\u5173\u7CFB\u9501: \u65B0\u589E ${result.addedArtifactRelationLocks.length} | \u66F4\u65B0 ${result.updatedArtifactRelationLocks.length} | \u4FDD\u7559\u5B64\u7ACB ${result.retainedArtifactRelationOrphans.length} | \u5220\u9664 ${result.removedArtifactRelationLocks.length}`,
+    `- \u963B\u65AD\u7B56\u7565: refresh \u56FA\u5B9A\u6309 --strict-missing-lock \u5224\u5B9A\uFF0Cmissing_lock \u4E5F\u4F1A\u963B\u65AD`,
+    `- \u5237\u65B0\u540E\u5BA1\u8BA1\u95EE\u9898: ${result.postAudit.issues.length}\uFF08\u963B\u65AD ${blockingCount}\uFF0C\u4E0D\u963B\u65AD ${nonBlockingCount}\uFF09`,
+    "",
+    "\u9501\u6587\u4EF6\u5DF2\u5199\u5165\u3002\u82E5\u9501\u6587\u4EF6\u76F8\u5BF9\u6682\u5B58\u533A\u6709\u53D8\u5316\uFF08\u4F8B\u5982 pre-commit \u573A\u666F\uFF09\uFF0C\u8BF7\u5148\u5BA1\u67E5\u5E76\u6682\u5B58\uFF1A",
+    "",
+    "1. `git diff artifacts/traceability-version-lock.json`",
+    "2. `git add artifacts/traceability-version-lock.json`",
+    "3. \u91CD\u65B0\u6267\u884C `git commit`",
+    ""
+  ];
+  appendList(lines, "\u65B0\u589E\u7684\u9501", result.addedLocks);
+  appendList(lines, "\u66F4\u65B0\u7684\u9501", result.updatedLocks);
+  appendList(lines, "\u4FDD\u7559\u7684\u5B64\u7ACB\u9501", result.retainedOrphans);
+  if (result.retainedOrphans.length > 0) {
+    lines.push("> \u4EE5\u4E0A\u662F\u5DF2\u5220\u9664/\u62C6\u5206\u5236\u54C1\u6216\u5931\u6548\u8FFD\u6EAF\u8FB9\u9057\u7559\u7684\u9501\u3002\u786E\u8BA4\u4E0D\u518D\u9700\u8981\u540E\u8FD0\u884C `artifact-graph version-lock refresh --all --remove-orphans --format markdown` \u6E05\u7406\uFF0C\u5BA1\u67E5 `git diff artifacts/traceability-version-lock.json` \u540E\u518D\u6682\u5B58\u3002");
+    lines.push("");
+  }
+  appendList(lines, "\u5220\u9664\u7684\u5B64\u7ACB\u9501", result.removedOrphans);
+  appendList(lines, "\u65B0\u589E\u7684\u5236\u54C1\u5173\u7CFB\u9501", result.addedArtifactRelationLocks);
+  appendList(lines, "\u66F4\u65B0\u7684\u5236\u54C1\u5173\u7CFB\u9501", result.updatedArtifactRelationLocks);
+  appendList(lines, "\u4FDD\u7559\u7684\u5B64\u7ACB\u5236\u54C1\u5173\u7CFB\u9501", result.retainedArtifactRelationOrphans);
+  if (result.retainedArtifactRelationOrphans.length > 0) {
+    lines.push("> \u4EE5\u4E0A\u662F\u5931\u6548\u5236\u54C1\u5173\u7CFB\u9057\u7559\u7684\u9501\u3002\u786E\u8BA4\u540E\u8FD0\u884C `artifact-graph version-lock refresh --all --remove-orphans --format markdown` \u6E05\u7406\uFF0C\u5BA1\u67E5\u9501 diff \u540E\u518D\u6682\u5B58\u3002");
+    lines.push("");
+  }
+  appendList(lines, "\u5220\u9664\u7684\u5236\u54C1\u5173\u7CFB\u9501", result.removedArtifactRelationLocks);
+  appendList(lines, "\u63D0\u9192", result.warnings);
+  if (result.postAudit.issues.length > 0) {
+    if (blockingCount > 0) {
+      lines.push(`## \u5237\u65B0\u540E\u5BA1\u8BA1\u95EE\u9898\uFF08\u963B\u65AD ${blockingCount}\uFF0C\u4E0D\u963B\u65AD ${nonBlockingCount}\uFF09`);
+    } else {
+      lines.push(`## \u5237\u65B0\u540E\u5BA1\u8BA1\u95EE\u9898\uFF08\u5F53\u524D\u7B56\u7565\u4E0B\u5168\u90E8\u4E0D\u963B\u65AD\uFF09`);
+    }
+    lines.push("");
+    appendIssueDetails(lines, result.postAudit.issues, strictMissingLock);
+  }
+  return `${lines.join("\n")}
+`;
+}
+function renderTraceVersionMarkdown(result) {
+  const lines = [
+    "# Trace Version",
+    "",
+    `Target: \`${result.target.uid}\``,
+    result.target.node ? `Current hash: \`${result.target.node.contentHash}\`` : "Current hash: target not found",
+    `Edges: ${result.currentEdges.length} | Locks: ${result.locks.length} | Artifact Relations: ${result.artifactRelations.length} | Issues: ${result.issues.length}`,
+    ""
+  ];
+  if (result.locks.length > 0) {
+    lines.push("## Locks");
+    for (const lock of result.locks) {
+      lines.push(`- \`${lock.edgeId}\` source=\`${lock.source.path}\` sourceHash=\`${lock.source.contentHash}\` artifactHash=\`${lock.artifact.contentHash}\``);
+    }
+    lines.push("");
+  }
+  if (result.artifactRelations.length > 0) {
+    lines.push("## Artifact Relations");
+    for (const rel of result.artifactRelations) {
+      lines.push(`- \`${rel.edgeId}\` kind=\`${rel.kind}\` source=\`${rel.source.type}:${rel.source.id}\` target=\`${rel.target.type}:${rel.target.id}\``);
+    }
+    lines.push("");
+  }
+  if (result.currentEdges.length > 0) {
+    lines.push("## Current Edges");
+    for (const edge2 of result.currentEdges) {
+      lines.push(`- \`${edge2.from}\` ${edge2.kind} \`${edge2.to}\` fromHash=\`${edge2.fromHash ?? "unknown"}\` toHash=\`${edge2.toHash ?? "unknown"}\``);
+    }
+    lines.push("");
+  }
+  if (result.issues.length > 0) {
+    lines.push("## Issues");
+    for (const issue2 of result.issues) {
+      lines.push(`- [${issue2.status}] \`${issue2.edgeId}\` \u2014 ${issue2.message}`);
+    }
+  }
+  return `${lines.join("\n")}
+`;
+}
+async function readVersionLock(root, lockPath) {
+  const safeLockPath = normalizeRelativePath(root, lockPath);
+  try {
+    const raw = await readFile(join2(root, safeLockPath), "utf-8");
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (error) {
+      throw new Error(`Version lock ${safeLockPath} is not valid JSON: ${error.message}`);
+    }
+    return validateVersionLockFile(parsed, safeLockPath);
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return { schemaVersion: VERSION_LOCK_SCHEMA_VERSION, locks: [], artifactRelations: [] };
+    }
+    throw error;
+  }
+}
+function validateVersionLockFile(value, lockPath) {
+  if (!value || typeof value !== "object") {
+    throw new Error(`Invalid version lock schema in ${lockPath}: root must be an object`);
+  }
+  const record = value;
+  if (record.schemaVersion !== VERSION_LOCK_SCHEMA_VERSION || !Array.isArray(record.locks)) {
+    throw new Error(`Invalid version lock schema in ${lockPath}`);
+  }
+  const seen = /* @__PURE__ */ new Set();
+  const locks = record.locks.map((entry, index) => validateVersionLockEntry(entry, index, seen));
+  const artifactRelations = record.artifactRelations !== void 0 ? validateArtifactRelationLocks(record.artifactRelations, lockPath) : [];
+  return {
+    schemaVersion: VERSION_LOCK_SCHEMA_VERSION,
+    locks,
+    artifactRelations
+  };
+}
+function validateVersionLockEntry(value, index, seen) {
+  if (!value || typeof value !== "object") {
+    throw new Error(`Invalid version lock entry at locks[${index}]: entry must be an object`);
+  }
+  const entry = value;
+  const edgeId = requireString(entry.edgeId, `locks[${index}].edgeId`);
+  if (seen.has(edgeId)) {
+    throw new Error(`Invalid version lock entry at locks[${index}]: duplicate edgeId ${edgeId}`);
+  }
+  seen.add(edgeId);
+  const kind = requireString(entry.kind, `locks[${index}].kind`);
+  if (kind !== "implements" && kind !== "verifies") {
+    throw new Error(`Invalid version lock entry at locks[${index}]: kind must be implements or verifies`);
+  }
+  const artifact = validateVersionLockRef(entry.artifact, `locks[${index}].artifact`);
+  const source = validateVersionLockSourceRef(entry.source, `locks[${index}].source`);
+  const verifiedBy = entry.verifiedBy === void 0 ? void 0 : validateVerifiedBy(entry.verifiedBy, `locks[${index}].verifiedBy`);
+  return {
+    edgeId,
+    kind,
+    artifact,
+    source,
+    verifiedBy
+  };
+}
+function validateVersionLockRef(value, path) {
+  if (!value || typeof value !== "object") {
+    throw new Error(`Invalid version lock entry at ${path}: ref must be an object`);
+  }
+  const record = value;
+  return {
+    type: requireString(record.type, `${path}.type`),
+    id: requireString(record.id, `${path}.id`),
+    path: requireSafeRelativePath(requireString(record.path, `${path}.path`), `${path}.path`),
+    contentHash: requireHash(record.contentHash, `${path}.contentHash`)
+  };
+}
+function validateVersionLockSourceRef(value, path) {
+  if (!value || typeof value !== "object") {
+    throw new Error(`Invalid version lock entry at ${path}: source must be an object`);
+  }
+  const record = value;
+  const type = requireString(record.type, `${path}.type`);
+  if (type !== "code" && type !== "test") {
+    throw new Error(`Invalid version lock entry at ${path}.type: source type must be code or test`);
+  }
+  return {
+    type,
+    path: requireSafeRelativePath(requireString(record.path, `${path}.path`), `${path}.path`),
+    contentHash: requireHash(record.contentHash, `${path}.contentHash`)
+  };
+}
+function validateVerifiedBy(value, path) {
+  if (!Array.isArray(value)) {
+    throw new Error(`Invalid version lock entry at ${path}: verifiedBy must be an array`);
+  }
+  return value.map((item, index) => validateVersionLockSourceRef(item, `${path}[${index}]`));
+}
+function validateArtifactRelationLocks(value, lockPath) {
+  if (!Array.isArray(value)) {
+    throw new Error(`Invalid version lock schema in ${lockPath}: artifactRelations must be an array`);
+  }
+  const seen = /* @__PURE__ */ new Set();
+  const result = value.map((entry, index) => {
+    const lock = validateArtifactRelationLockEntry(entry, index, lockPath);
+    const key = artifactRelationLockSortKey(lock);
+    if (seen.has(key)) {
+      throw new Error(`Invalid artifactRelations[${index}] in ${lockPath}: duplicate relation ${key}`);
+    }
+    seen.add(key);
+    return lock;
+  });
+  return sortBy(result, artifactRelationLockSortKey);
+}
+function validateArtifactRelationLockEntry(value, index, lockPath) {
+  if (!value || typeof value !== "object") {
+    throw new Error(`Invalid artifactRelations[${index}] in ${lockPath}: entry must be an object`);
+  }
+  const entry = value;
+  const kind = requireString(entry.kind, `artifactRelations[${index}].kind`);
+  const source = validateArtifactRelationEndpoint(entry.source, `artifactRelations[${index}].source`);
+  const target = validateArtifactRelationEndpoint(entry.target, `artifactRelations[${index}].target`);
+  const edgeId = requireString(entry.edgeId, `artifactRelations[${index}].edgeId`);
+  return { edgeId, kind, source, target };
+}
+function validateArtifactRelationEndpoint(value, path) {
+  if (!value || typeof value !== "object") {
+    throw new Error(`Invalid ${path}: endpoint must be an object`);
+  }
+  const record = value;
+  const type = requireString(record.type, `${path}.type`);
+  const id = requireString(record.id, `${path}.id`);
+  return {
+    type,
+    id,
+    path: requireSafeRelativePath(requireString(record.path, `${path}.path`), `${path}.path`),
+    contentHash: requireHash(record.contentHash, `${path}.contentHash`)
+  };
+}
+function artifactRelationLockSortKey(lock) {
+  return `${lock.kind}	${lock.source.type}	${lock.source.id}	${lock.target.type}	${lock.target.id}`;
+}
+function artifactRelationLockTouchesPaths(lock, paths) {
+  return paths.has(lock.source.path) || paths.has(lock.target.path);
+}
+function requireString(value, path) {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new Error(`Invalid version lock entry at ${path}: expected non-empty string`);
+  }
+  return value;
+}
+function requireHash(value, path) {
+  const hash = requireString(value, path);
+  if (!/^sha256:[a-f0-9]{64}$/.test(hash)) {
+    throw new Error(`Invalid version lock entry at ${path}: expected sha256 hash`);
+  }
+  return hash;
+}
+function requireSafeRelativePath(value, path) {
+  const normalized = value.replace(/\\/g, "/").replace(/^\.\//, "");
+  if (normalized.startsWith("/") || normalized === ".." || normalized.startsWith("../")) {
+    throw new Error(`Invalid version lock entry at ${path}: path must stay within root`);
+  }
+  return normalized;
+}
+async function writeVersionLock(root, lockPath, lock) {
+  const safeLockPath = normalizeRelativePath(root, lockPath);
+  const fullPath = join2(root, safeLockPath);
+  await mkdir(dirname(fullPath), { recursive: true });
+  await writeFile(fullPath, `${JSON.stringify(lock, null, 2)}
+`);
+}
+function implementationEdges(index) {
+  const nodesByUid = new Map(index.nodes.map((node) => [node.uid, node]));
+  return index.edges.filter((edge2) => {
+    const source = nodesByUid.get(edge2.from);
+    return source?.sourceKind === "code" || source?.sourceKind === "test";
+  }).map((edge2) => {
+    const source = nodesByUid.get(edge2.from);
+    const artifact = nodesByUid.get(edge2.to);
+    const kind = source.sourceKind === "test" ? "verifies" : "implements";
+    return {
+      ...edge2,
+      kind,
+      edgeId: artifact ? lockEdgeIdFor(source, artifact, kind) : `${source.sourceKind}:${source.path}#${kind}#${edge2.to}`
+    };
+  });
+}
+async function lockableImplementationEdges(root, index, config) {
+  const edges = implementationEdges(index);
+  const nodesByUid = new Map(index.nodes.map((node) => [node.uid, node]));
+  const livenessByPath = /* @__PURE__ */ new Map();
+  const result = [];
+  for (const edge2 of edges) {
+    const source = nodesByUid.get(edge2.from);
+    if (source?.sourceKind !== "test") {
+      result.push(edge2);
+      continue;
+    }
+    let liveness = livenessByPath.get(source.path);
+    if (liveness === void 0) {
+      liveness = await getTestFileRunnerLiveness(root, source.path, config);
+      livenessByPath.set(source.path, liveness);
+    }
+    if (liveness !== "inactive") {
+      result.push(edge2);
+    }
+  }
+  return result;
+}
+function lockRefFromNode(node) {
+  return {
+    type: node.type,
+    id: node.id,
+    path: node.path,
+    contentHash: node.contentHash
+  };
+}
+function artifactRelationEdges(index) {
+  const nodesByUid = new Map(index.nodes.map((node) => [node.uid, node]));
+  return index.edges.filter((edge2) => {
+    const source = nodesByUid.get(edge2.from);
+    const target = nodesByUid.get(edge2.to);
+    return source?.sourceKind === "artifact" && target?.sourceKind === "artifact";
+  }).map((edge2) => {
+    const source = nodesByUid.get(edge2.from);
+    const target = nodesByUid.get(edge2.to);
+    return {
+      ...edge2,
+      edgeId: artifactRelationEdgeId(source, target, edge2.kind)
+    };
+  });
+}
+function artifactRelationEdgeId(source, target, kind) {
+  return `relation:${source.type}:${source.id}#${kind}#${target.type}:${target.id}`;
+}
+function artifactRelationLockFromEdge(edge2, source, target) {
+  return {
+    edgeId: edge2.edgeId,
+    kind: edge2.kind,
+    source: {
+      type: source.type,
+      id: source.id,
+      path: source.path,
+      contentHash: source.contentHash
+    },
+    target: {
+      type: target.type,
+      id: target.id,
+      path: target.path,
+      contentHash: target.contentHash
+    }
+  };
+}
+function sourceRefFromNode(node) {
+  return {
+    type: node.sourceKind === "test" ? "test" : "code",
+    path: node.path,
+    contentHash: node.contentHash
+  };
+}
+function appendList(lines, title, items) {
+  if (items.length === 0) {
+    return;
+  }
+  lines.push(`## ${title}`);
+  for (const item of items) {
+    lines.push(`- \`${item}\``);
+  }
+  lines.push("");
+}
+function lockEntryFromCurrentEdge(edgeId, source, artifact, existing, nodeByPath, currentEdgePairs, removeOrphans, removedOrphans) {
+  const verifiedBy = (existing?.verifiedBy ?? []).flatMap((item) => {
+    const verifier = nodeByPath.get(item.path);
+    if (!verifier || verifier.sourceKind !== "code" && verifier.sourceKind !== "test") {
+      if (removeOrphans) {
+        removedOrphans.push(`${edgeId}#verifiedBy:${item.path}`);
+        return [];
+      }
+      return [item];
+    }
+    if (!currentEdgePairs.has(`${verifier.uid}	${artifact.uid}`)) {
+      if (removeOrphans) {
+        removedOrphans.push(`${edgeId}#verifiedBy:${item.path}`);
+        return [];
+      }
+      return [sourceRefFromNode(verifier)];
+    }
+    return [sourceRefFromNode(verifier)];
+  });
+  return {
+    edgeId,
+    kind: source.sourceKind === "test" ? "verifies" : "implements",
+    artifact: lockRefFromNode(artifact),
+    source: sourceRefFromNode(source),
+    verifiedBy: verifiedBy.length > 0 ? sortBy(verifiedBy, (item) => item.path) : void 0
+  };
+}
+function currentEdgeTouchesAnyPath(entry, paths) {
+  return paths.has(entry.artifact.path) || paths.has(entry.source.path) || (entry.verifiedBy ?? []).some((item) => paths.has(item.path));
+}
+function lockEntryTouchesAnyPath(entry, paths) {
+  return currentEdgeTouchesAnyPath(entry, paths);
+}
+function stableEntryJson(entry) {
+  return JSON.stringify({
+    edgeId: entry.edgeId,
+    kind: entry.kind,
+    artifact: entry.artifact,
+    source: entry.source,
+    verifiedBy: entry.verifiedBy ?? []
+  });
+}
+function stableArtifactRelationLockJson(lock) {
+  return JSON.stringify({
+    edgeId: lock.edgeId,
+    kind: lock.kind,
+    source: lock.source,
+    target: lock.target
+  });
+}
+function normalizeVersionEdgeKind(edge2) {
+  if (edge2.source === "test-comment") {
+    return edge2.kind === "verifies" ? "verifies" : "implements";
+  }
+  return edge2.kind;
+}
+function classifyNode(node) {
+  if (node.type === "implementation") {
+    return "code";
+  }
+  if (node.type === "test") {
+    return "test";
+  }
+  return "artifact";
+}
+function parseTarget(target) {
+  const separator = target.indexOf(":");
+  if (separator < 1 || separator === target.length - 1) {
+    throw new Error(`Invalid target "${target}". Expected type:id`);
+  }
+  return `${target.slice(0, separator)}:${target.slice(separator + 1)}`;
+}
+function lockEdgeIdFor(source, artifact, kind) {
+  return `${source.sourceKind}:${source.path}#${kind}#${artifact.type}:${artifact.id}`;
+}
+async function hashRelativePath(root, path, cache) {
+  const normalized = normalizeRelativePath(root, path);
+  const cached = cache.get(normalized);
+  if (cached) return cached;
+  const content = await readFile(join2(root, normalized));
+  const hash = `sha256:${createHash("sha256").update(content).digest("hex")}`;
+  cache.set(normalized, hash);
+  return hash;
+}
+function normalizeRelativePath(root, path) {
+  const normalized = path.replace(/\\/g, "/");
+  const relativePath = normalized.startsWith("/") ? relative2(root, normalized).replace(/\\/g, "/") : normalized.replace(/^\.\//, "");
+  if (relativePath === ".." || relativePath.startsWith("../")) {
+    throw new Error(`Path is outside root: ${path}`);
+  }
+  return relativePath;
+}
+function sortBy(items, keyFn) {
+  return [...items].sort((left, right) => keyFn(left).localeCompare(keyFn(right)));
+}
+async function getTestFileRunnerLiveness(root, filePath, config) {
+  const schema = config ?? await loadConfig(root);
+  const runners = schema.e2e?.runners ?? [];
+  if (runners.length === 0) {
+    if (!/e2e/i.test(filePath) && !/\.e2e\./i.test(filePath)) {
+      return "active";
+    }
+    const fullSourcePath = join2(root, filePath);
+    if (!existsSync(fullSourcePath)) return "inactive";
+    try {
+      const content = await readFile(fullSourcePath, "utf-8");
+      return /\/\/!?\s*@(?:e2e_test|tc)\s+/.test(content) ? "active" : "inactive";
+    } catch {
+      return "inactive";
+    }
+  }
+  let inRunnerScope = false;
+  for (const runner of runners) {
+    if (!isFileIncludedByRunner(filePath, runner)) continue;
+    inRunnerScope = true;
+    const isActive = await isFileActiveInRunner(root, filePath, runner);
+    if (isActive) return "active";
+  }
+  return inRunnerScope ? "inactive" : "unscoped";
+}
+function isFileIncludedByRunner(filePath, runner) {
+  const normalizedPath = filePath.replace(/\\/g, "/");
+  const runnerRoot = runner.root.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/$/, "") || ".";
+  if (runnerRoot !== "." && !normalizedPath.startsWith(`${runnerRoot}/`)) return false;
+  const relativePath = runnerRoot === "." ? normalizedPath : normalizedPath.slice(runnerRoot.length + 1);
+  return runner.include.some((pattern) => matchesRunnerGlob(relativePath, pattern));
+}
+async function isFileActiveInRunner(root, filePath, runner) {
+  if (!isFileIncludedByRunner(filePath, runner)) return false;
+  const normalizedPath = filePath.replace(/\\/g, "/");
+  const runnerRoot = runner.root.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/$/, "") || ".";
+  const relativePath = runnerRoot === "." ? normalizedPath : normalizedPath.slice(runnerRoot.length).replace(/^\//, "");
+  const matchesExclude = (runner.exclude ?? []).some(
+    (pattern) => matchesRunnerGlob(relativePath, pattern)
+  );
+  if (matchesExclude) return false;
+  const matchesTestIgnore = (runner.testIgnore ?? []).some(
+    (pattern) => matchesRunnerGlob(relativePath, pattern)
+  );
+  if (matchesTestIgnore) return false;
+  return true;
+}
+function sortUnique2(items) {
+  return [...new Set(items)].sort((left, right) => left.localeCompare(right));
+}
+var VERSION_LOCK_PATH, VERSION_INDEX_SCHEMA_VERSION, VERSION_LOCK_SCHEMA_VERSION, LIVENESS_MESSAGE_PREFIX, VERSION_LOCK_STATUS_LABELS;
+var init_versioned_traceability = __esm({
+  "src/versioned-traceability.ts"() {
+    "use strict";
+    init_index();
+    init_glob_matcher();
+    VERSION_LOCK_PATH = "artifacts/traceability-version-lock.json";
+    VERSION_INDEX_SCHEMA_VERSION = "1.0";
+    VERSION_LOCK_SCHEMA_VERSION = "1.0";
+    LIVENESS_MESSAGE_PREFIX = "Liveness:";
+    VERSION_LOCK_STATUS_LABELS = {
+      fresh: "\u65B0\u9C9C",
+      target_not_found: "\u76EE\u6807\u5236\u54C1\u4E0D\u5B58\u5728",
+      artifact_changed: "\u5236\u54C1\u5DF2\u53D8\u5316",
+      source_changed: "\u6E90\u7801/\u6D4B\u8BD5\u5DF2\u53D8\u5316",
+      verified_by_changed: "\u9A8C\u8BC1\u6587\u4EF6\u5DF2\u53D8\u5316",
+      missing_lock: "\u7F3A\u5C11\u7248\u672C\u9501",
+      orphan_lock: "\u5B64\u7ACB\u9501"
+    };
+  }
+});
+
+// src/impact.ts
+import { isAbsolute, normalize, relative as relative3, resolve } from "path";
+async function computeImpact(root, options = {}) {
+  const absoluteRoot = resolve(root);
+  const mode = options.mode ?? "worktree";
+  if (mode === "base" && !options.base) throw new Error("Impact mode base requires a base ref.");
+  if (mode === "paths" && !options.paths) throw new Error("Impact mode paths requires paths.");
+  const schema = options.schema ?? await loadConfig(absoluteRoot);
+  const changedPaths = mode === "paths" ? normalizeExplicitPaths(absoluteRoot, options.paths ?? []) : (await collectChangedPaths(absoluteRoot, {
+    mode,
+    ...mode === "base" ? { base: options.base } : {}
+  })).changedPaths;
+  const graph = await scanArtifacts(absoluteRoot, schema);
+  const changed = new Set(changedPaths);
+  const directNodes = graph.nodes.filter((node) => changed.has(node.path));
+  const directUids = new Set(directNodes.map((node) => node.uid));
+  const relatedUids = /* @__PURE__ */ new Set();
+  for (const candidate of graph.edges) {
+    if (directUids.has(candidate.from) && !directUids.has(candidate.to)) relatedUids.add(candidate.to);
+    if (directUids.has(candidate.to) && !directUids.has(candidate.from)) relatedUids.add(candidate.from);
+  }
+  const relatedNodes = graph.nodes.filter((node) => relatedUids.has(node.uid));
+  const affectedEdges = graph.edges.filter((candidate) => changed.has(candidate.sourcePath) || directUids.has(candidate.from) || directUids.has(candidate.to));
+  const mappedPaths = /* @__PURE__ */ new Set([
+    ...graph.nodes.map((node) => node.path),
+    ...graph.edges.map((candidate) => candidate.sourcePath)
+  ]);
+  const graphControlPaths = changedPaths.filter(isGraphControlPath);
+  const scopedUnresolvedPaths = changedPaths.filter((path) => !isGraphControlPath(path) && matchesConfiguredArtifactPath(path, schema) && !mappedPaths.has(path));
+  const unmappedPaths = changedPaths.filter((path) => !isGraphControlPath(path) && !matchesConfiguredArtifactPath(path, schema));
+  return {
+    schemaVersion: "1.0",
+    root: absoluteRoot,
+    mode,
+    ...mode === "base" && options.base ? { base: options.base } : {},
+    changedPaths,
+    directNodes: directNodes.map(toNodeRef),
+    relatedNodes: relatedNodes.map(toNodeRef),
+    affectedEdges: affectedEdges.map(toEdgeRef),
+    scopedUnresolvedPaths,
+    graphControlPaths,
+    unmappedPaths,
+    writes: "none"
+  };
+}
+function renderImpactMarkdown(report) {
+  const lines = [
+    "# Artifact Impact",
+    "",
+    `- Root: \`${report.root}\``,
+    `- Mode: \`${report.mode}\`${report.base ? ` (base \`${report.base}\`)` : ""}`,
+    `- Changed paths: ${report.changedPaths.length}`,
+    `- Direct artifacts: ${report.directNodes.length}`,
+    `- Related artifacts: ${report.relatedNodes.length}`,
+    `- Affected relations: ${report.affectedEdges.length}`,
+    "",
+    "## Direct artifacts",
+    ...report.directNodes.map((node) => `- \`${node.uid}\` \u2014 \`${node.path}\``),
+    "",
+    "## Related artifacts",
+    ...report.relatedNodes.map((node) => `- \`${node.uid}\` \u2014 \`${node.path}\``),
+    "",
+    "## Path coverage boundary",
+    ...report.graphControlPaths.map((path) => `- graph control: \`${path}\``),
+    ...report.scopedUnresolvedPaths.map((path) => `- scanned scope without graph mapping: \`${path}\``),
+    ...report.unmappedPaths.map((path) => `- outside configured scan scope: \`${path}\``),
+    ""
+  ];
+  return `${lines.join("\n")}
+`;
+}
+function normalizeExplicitPaths(root, paths) {
+  const normalized = paths.map((input) => {
+    const value = input.trim();
+    if (!value) return "";
+    const absolutePath = isAbsolute(value) ? normalize(value) : resolve(root, value);
+    const projectRelative = relative3(root, absolutePath);
+    const result = projectRelative.replace(/\\/g, "/").replace(/^\.\//, "");
+    if (result === ".." || result.startsWith("../") || result.startsWith("/")) {
+      throw new Error(`Impact path is outside project root: ${input}`);
+    }
+    return result;
+  }).filter(Boolean);
+  return [...new Set(normalized)].sort((left, right) => left.localeCompare(right));
+}
+function isGraphControlPath(path) {
+  return path === "artifact-graph.config.yaml" || path === VERSION_LOCK_PATH;
+}
+function toNodeRef(node) {
+  return { uid: node.uid, type: node.type, code: node.code, title: node.title, path: node.path };
+}
+function toEdgeRef(candidate) {
+  return {
+    from: candidate.from,
+    to: candidate.to,
+    kind: candidate.kind,
+    sourcePath: candidate.sourcePath,
+    sourceLine: candidate.sourceLine,
+    ...candidate.attrs ? { attrs: candidate.attrs } : {}
+  };
+}
+var init_impact = __esm({
+  "src/impact.ts"() {
+    "use strict";
+    init_index();
+    init_git_changes();
+    init_versioned_traceability();
+  }
+});
+
+// src/coverage.ts
+import { resolve as resolve2 } from "path";
+async function computeCoverageBoundary(root, opts = {}) {
+  const absoluteRoot = resolve2(root);
+  const schema = opts.schema ?? await loadConfig(absoluteRoot);
+  const graph = await scanArtifacts(absoluteRoot, schema);
+  const issues = validateGraph(graph, schema);
+  const lockAudit = await auditVersionLock(absoluteRoot, void 0, graph, schema);
+  let impact;
+  let changedPathScope = "worktree";
+  try {
+    impact = await computeImpact(absoluteRoot, { mode: "worktree", schema });
+  } catch {
+    impact = await computeImpact(absoluteRoot, { mode: "paths", paths: [], schema });
+    changedPathScope = "unavailable";
+  }
+  const declared = graph.edges.length;
+  const locked = lockAudit.totalLocks + lockAudit.totalArtifactRelationLocks;
+  const fresh = lockAudit.fresh + lockAudit.artifactRelationFresh;
+  const errorCount = issues.filter((candidate) => candidate.severity === "error").length;
+  const mappedScanPaths = /* @__PURE__ */ new Set([
+    ...graph.nodes.map((node) => node.path),
+    ...graph.edges.map((candidate) => candidate.sourcePath)
+  ]);
+  const configuredTypes = Object.keys(schema.types).sort((left, right) => left.localeCompare(right));
+  const scannedFiles = (await walkFiles(absoluteRoot)).filter((path) => matchesConfiguredArtifactPath(path, schema));
+  const declaredReferences = graph.edges.filter((candidate) => ["implements", "verifies", "evidence"].includes(candidate.kind)).map((candidate) => ({
+    from: candidate.from,
+    to: candidate.to,
+    kind: candidate.kind,
+    sourcePath: candidate.sourcePath,
+    sourceLine: candidate.sourceLine
+  })).sort((left, right) => `${left.from}	${left.to}	${left.kind}`.localeCompare(`${right.from}	${right.to}	${right.kind}`));
+  const inputList = normalizeInputList(opts.releaseInput ?? []);
+  const mappedReleasePaths = inputList.filter((path) => mappedScanPaths.has(path));
+  const unmappedReleasePaths = inputList.filter((path) => !mappedScanPaths.has(path));
+  return {
+    schemaVersion: "1.0",
+    root: absoluteRoot,
+    graphHealth: {
+      validateIssues: issues.length,
+      errorCount,
+      lockIssues: lockAudit.issues.length,
+      relationLocks: { declared, locked, fresh },
+      assessment: errorCount > 0 || lockAudit.issues.length > 0 ? "issues" : declared === 0 ? "healthy-no-declarations" : "healthy-with-declarations"
+    },
+    scanCoverage: {
+      configuredTypes,
+      scannedFiles: scannedFiles.length,
+      mappedFiles: mappedScanPaths.size,
+      changedPathScope,
+      scopedUnresolved: impact.scopedUnresolvedPaths,
+      unmapped: impact.unmappedPaths
+    },
+    behaviorVerification: {
+      status: "not-evaluated",
+      declaredReferences,
+      note: "Relationship declarations, source annotations, files, and locks do not prove that behavior was executed successfully."
+    },
+    releaseCoverage: {
+      source: opts.releaseInput === void 0 ? "none" : "caller",
+      ...opts.releaseInput === void 0 ? {} : { inputList },
+      mappedPaths: mappedReleasePaths,
+      unmappedPaths: unmappedReleasePaths,
+      status: opts.releaseInput === void 0 ? "not-requested" : "unknown",
+      evidence: [],
+      note: opts.releaseInput === void 0 ? "No caller-provided release file list was evaluated." : "The caller-provided list was compared with scanned graph paths; no release result evidence was evaluated."
+    }
+  };
+}
+function renderCoverageBoundaryMarkdown(report) {
+  const lines = [
+    "# Artifact Coverage Boundary",
+    "",
+    `- Graph assessment: \`${report.graphHealth.assessment}\``,
+    `- Validation issues: ${report.graphHealth.validateIssues} (${report.graphHealth.errorCount} errors)`,
+    `- Lock audit issues: ${report.graphHealth.lockIssues}`,
+    `- Declared relations: ${report.graphHealth.relationLocks.declared}`,
+    `- Relation locks: ${report.graphHealth.relationLocks.locked} (${report.graphHealth.relationLocks.fresh} fresh)`,
+    `- Configured types: ${report.scanCoverage.configuredTypes.length}`,
+    `- Files in configured scan scope: ${report.scanCoverage.scannedFiles}`,
+    `- Files mapped into the graph: ${report.scanCoverage.mappedFiles}`,
+    `- Changed-path classification scope: \`${report.scanCoverage.changedPathScope}\``,
+    "",
+    "## Behavior verification boundary",
+    "",
+    `- Status: \`${report.behaviorVerification.status}\``,
+    `- Declaration references: ${report.behaviorVerification.declaredReferences.length}`,
+    `- ${report.behaviorVerification.note}`,
+    "",
+    "## Release coverage boundary",
+    "",
+    `- Source: \`${report.releaseCoverage.source}\``,
+    `- Status: \`${report.releaseCoverage.status}\``,
+    `- Mapped input paths: ${report.releaseCoverage.mappedPaths.length}`,
+    `- Unmapped input paths: ${report.releaseCoverage.unmappedPaths.length}`,
+    `- ${report.releaseCoverage.note}`,
+    ""
+  ];
+  return `${lines.join("\n")}
+`;
+}
+function normalizeInputList(input) {
+  return [...new Set(input.map((item) => item.trim().replace(/\\/g, "/").replace(/^\.\//, "")).filter(Boolean))].sort((left, right) => left.localeCompare(right));
+}
+var init_coverage = __esm({
+  "src/coverage.ts"() {
+    "use strict";
+    init_index();
+    init_impact();
+    init_versioned_traceability();
+    init_file_walker();
+  }
+});
+
 // src/packet-assembler.ts
 function toPacketItem(item) {
   const pi = {
@@ -672,7 +2218,8 @@ function assemblePacket(manifest, options) {
     validationCommands,
     // @feature ACA17
     // @decision D-ACA-17
-    baselinePolicy: manifest.baselinePolicy
+    baselinePolicy: manifest.baselinePolicy,
+    ...manifest.viewSelection ? { viewSelection: manifest.viewSelection } : {}
   };
   return packet;
 }
@@ -698,6 +2245,16 @@ function renderPacketMarkdown(packet) {
   lines.push("");
   lines.push(`> **Context items: ${s.totalItems}** | **Missing: ${s.totalMissing}** | **Omitted: ${s.totalOmitted}**`);
   lines.push("");
+  if (packet.viewSelection) {
+    lines.push(`> **Time view:** ${packet.viewSelection.view}`);
+    for (const item of packet.viewSelection.partialSupersedes) {
+      lines.push(`> \`${item.targetUid}\` keeps its remaining content; sections ${item.sections.map((section) => `\`${section}\``).join(", ")} are superseded by \`${item.supersededBy}\` (${item.sourcePath}:${item.sourceLine}).`);
+    }
+    for (const item of packet.viewSelection.excluded) {
+      lines.push(`> Excluded \`${item.uid}\` (${item.bucket}; ${item.basis}).`);
+    }
+    lines.push("");
+  }
   lines.push("## 2. \u4E0A\u4E0B\u6587\u6E05\u5355\u6458\u8981");
   lines.push("");
   lines.push("| \u7C7B\u522B | \u6570\u91CF |");
@@ -864,8 +2421,8 @@ var init_packet_assembler = __esm({
 });
 
 // src/packet-audit.ts
-import { mkdir, writeFile } from "fs/promises";
-import { join as join2 } from "path";
+import { mkdir as mkdir2, writeFile as writeFile2 } from "fs/promises";
+import { join as join3 } from "path";
 function parseTargetsFile(content, schema) {
   const validTypes = schema ? new Set(getTargetArtifactTypes(schema)) : VALID_TYPES;
   const validTypesLabel = [...validTypes].join(", ");
@@ -956,14 +2513,14 @@ async function auditSingleTarget(target, graph, options) {
       const fmt = options.format ?? "markdown";
       const ext = fmt === "json" ? "json" : "md";
       const filename = `${target.type}-${target.id}.packet.${ext}`;
-      const outPath = join2(options.outDir, filename);
+      const outPath = join3(options.outDir, filename);
       let content;
       if (fmt === "json") {
         content = JSON.stringify(packet, null, 2) + "\n";
       } else {
         content = renderPacketMarkdown(packet);
       }
-      await writeFile(outPath, content, "utf-8");
+      await writeFile2(outPath, content, "utf-8");
       entry.outputPath = outPath;
     }
   } catch (error) {
@@ -984,7 +2541,7 @@ async function auditPackets(root, targets, options, graph) {
     }
   }
   if (options.outDir) {
-    await mkdir(options.outDir, { recursive: true });
+    await mkdir2(options.outDir, { recursive: true });
   }
   const sampleSet = options.sampleTargets ? new Set(options.sampleTargets) : null;
   const sampleOutputPaths = [];
@@ -1036,8 +2593,8 @@ async function auditPackets(root, targets, options, graph) {
     ...isCompact ? { summaryDetail: "compact", countsByType } : {}
   };
   if (options.outDir) {
-    const summaryPath = join2(options.outDir, "summary.json");
-    await writeFile(summaryPath, JSON.stringify(summary, null, 2) + "\n", "utf-8");
+    const summaryPath = join3(options.outDir, "summary.json");
+    await writeFile2(summaryPath, JSON.stringify(summary, null, 2) + "\n", "utf-8");
   }
   return summary;
 }
@@ -1404,1251 +2961,6 @@ var init_packet_prompt_validator = __esm({
   }
 });
 
-// src/versioned-traceability.ts
-import { createHash } from "crypto";
-import { existsSync } from "fs";
-import { mkdir as mkdir2, readFile, writeFile as writeFile2 } from "fs/promises";
-import { dirname, join as join3, relative as relative2 } from "path";
-async function buildVersionIndex(root, graph) {
-  const scannedGraph = graph ?? await scanArtifacts(root);
-  const hashCache = /* @__PURE__ */ new Map();
-  const nodes = await Promise.all(scannedGraph.nodes.map(async (node) => ({
-    uid: node.uid,
-    type: node.type,
-    id: node.code,
-    path: node.path,
-    title: node.title,
-    line: node.line,
-    sourceKind: classifyNode(node),
-    contentHash: await hashRelativePath(root, node.path, hashCache)
-  })));
-  const hashByUid = new Map(nodes.map((node) => [node.uid, node.contentHash]));
-  const edges = scannedGraph.edges.map((edge2) => ({
-    from: edge2.from,
-    to: edge2.to,
-    kind: normalizeVersionEdgeKind(edge2),
-    source: edge2.source,
-    sourcePath: edge2.sourcePath,
-    sourceLine: edge2.sourceLine,
-    fromHash: hashByUid.get(edge2.from),
-    toHash: hashByUid.get(edge2.to)
-  }));
-  return {
-    schemaVersion: VERSION_INDEX_SCHEMA_VERSION,
-    root,
-    graph: {
-      nodes: scannedGraph.nodes.length,
-      edges: scannedGraph.edges.length
-    },
-    nodes: sortBy(nodes, (node) => node.uid),
-    edges: sortBy(edges, (edge2) => `${edge2.from}	${edge2.to}	${edge2.kind}	${edge2.sourcePath}	${edge2.sourceLine}`)
-  };
-}
-async function auditVersionLock(root, lockPath = VERSION_LOCK_PATH, graph, config) {
-  const index = await buildVersionIndex(root, graph);
-  const schema = config ?? await loadConfig(root);
-  const safeLockPath = normalizeRelativePath(root, lockPath);
-  const lock = await readVersionLock(root, safeLockPath);
-  const nodeByArtifact = new Map(index.nodes.map((node) => [`${node.type}:${node.id}`, node]));
-  const nodeByPath = new Map(index.nodes.map((node) => [node.path, node]));
-  const currentEdges = implementationEdges(index);
-  const lockableEdges = await lockableImplementationEdges(root, index, schema);
-  const currentEdgeIds = new Set(currentEdges.map((edge2) => edge2.edgeId));
-  const issues = [];
-  let fresh = 0;
-  for (const entry of lock.locks) {
-    const artifactNode = nodeByArtifact.get(`${entry.artifact.type}:${entry.artifact.id}`);
-    const sourceNode = nodeByPath.get(entry.source.path);
-    if (!artifactNode || !sourceNode) {
-      issues.push({
-        status: "orphan_lock",
-        edgeId: entry.edgeId,
-        message: `Lock references missing ${!artifactNode ? "artifact" : "source"} node`,
-        artifact: entry.artifact,
-        source: entry.source
-      });
-      continue;
-    }
-    const entryIssues = [];
-    if (!currentEdgeIds.has(entry.edgeId)) {
-      entryIssues.push({
-        status: "orphan_lock",
-        edgeId: entry.edgeId,
-        message: `Locked traceability edge no longer exists in the current graph`,
-        artifact: entry.artifact,
-        source: entry.source
-      });
-    }
-    if (artifactNode.contentHash !== entry.artifact.contentHash) {
-      entryIssues.push({
-        status: "artifact_changed",
-        edgeId: entry.edgeId,
-        message: `${entry.artifact.type}:${entry.artifact.id} changed since the lock was written`,
-        artifact: entry.artifact,
-        source: entry.source,
-        currentArtifactHash: artifactNode.contentHash
-      });
-    }
-    if (sourceNode.contentHash !== entry.source.contentHash) {
-      entryIssues.push({
-        status: "source_changed",
-        edgeId: entry.edgeId,
-        message: `${entry.source.path} changed since the lock was written`,
-        artifact: entry.artifact,
-        source: entry.source,
-        currentSourceHash: sourceNode.contentHash
-      });
-    }
-    for (const verifiedBy of entry.verifiedBy ?? []) {
-      const verifierNode = nodeByPath.get(verifiedBy.path);
-      if (!verifierNode) {
-        entryIssues.push({
-          status: "orphan_lock",
-          edgeId: entry.edgeId,
-          message: `Verifier ${verifiedBy.path} is missing`,
-          artifact: entry.artifact,
-          source: entry.source,
-          verifiedByPath: verifiedBy.path
-        });
-        continue;
-      }
-      if (verifierNode.contentHash !== verifiedBy.contentHash) {
-        entryIssues.push({
-          status: "verified_by_changed",
-          edgeId: entry.edgeId,
-          message: `Verifier ${verifiedBy.path} changed since the lock was written`,
-          artifact: entry.artifact,
-          source: entry.source,
-          currentVerifiedByHash: verifierNode.contentHash,
-          verifiedByPath: verifiedBy.path
-        });
-      }
-      if (artifactNode && !currentEdges.some((edge2) => edge2.from === verifierNode.uid && edge2.to === artifactNode.uid)) {
-        entryIssues.push({
-          status: "orphan_lock",
-          edgeId: entry.edgeId,
-          message: `Verifier ${verifiedBy.path} no longer declares a traceability link to ${entry.artifact.type}:${entry.artifact.id}`,
-          artifact: entry.artifact,
-          source: entry.source,
-          verifiedByPath: verifiedBy.path
-        });
-      }
-    }
-    if (entryIssues.length === 0) {
-      fresh += 1;
-    } else {
-      issues.push(...entryIssues);
-    }
-  }
-  const livenessCache = /* @__PURE__ */ new Map();
-  for (const entry of lock.locks) {
-    if (entry.kind !== "verifies") continue;
-    const sourcePath = entry.source.path;
-    const fullSourcePath = join3(root, sourcePath);
-    if (!existsSync(fullSourcePath)) continue;
-    let liveness = livenessCache.get(sourcePath);
-    if (liveness === void 0) {
-      liveness = await getTestFileRunnerLiveness(root, sourcePath, schema);
-      livenessCache.set(sourcePath, liveness);
-    }
-    if (liveness === "inactive") {
-      issues.push({
-        status: "orphan_lock",
-        edgeId: entry.edgeId,
-        message: `Liveness: ${sourcePath} is not active in any configured runner \u2014 locked verifies edges may reference dead tests`,
-        severity: "warning",
-        artifact: entry.artifact,
-        source: entry.source
-      });
-    }
-  }
-  const reportedMissingLocks = /* @__PURE__ */ new Set();
-  for (const edge2 of lockableEdges) {
-    const edgeId = edge2.edgeId;
-    if (!lock.locks.some((entry) => entry.edgeId === edgeId)) {
-      if (reportedMissingLocks.has(edgeId)) {
-        continue;
-      }
-      reportedMissingLocks.add(edgeId);
-      const source = index.nodes.find((node) => node.uid === edge2.from);
-      const artifact = index.nodes.find((node) => node.uid === edge2.to);
-      issues.push({
-        status: "missing_lock",
-        edgeId,
-        message: `${edge2.from} ${edge2.kind} ${edge2.to} has no version lock`,
-        artifact: artifact ? lockRefFromNode(artifact) : void 0,
-        source: source ? sourceRefFromNode(source) : void 0
-      });
-    }
-  }
-  const currentArtifactRelationEdges = artifactRelationEdges(index);
-  const currentArtifactRelationEdgeIds = new Set(currentArtifactRelationEdges.map((edge2) => edge2.edgeId));
-  const artifactRelationLocks = lock.artifactRelations ?? [];
-  let artifactRelationFresh = 0;
-  for (const relLock of artifactRelationLocks) {
-    const relEdgeId = relLock.edgeId;
-    const sourceKey = `${relLock.source.type}:${relLock.source.id}`;
-    const targetKey = `${relLock.target.type}:${relLock.target.id}`;
-    const sourceNode = nodeByArtifact.get(sourceKey);
-    const targetNode = nodeByArtifact.get(targetKey);
-    if (!sourceNode || !targetNode) {
-      issues.push({
-        status: "orphan_lock",
-        edgeId: relEdgeId,
-        message: `Artifact relation lock references missing ${!sourceNode ? "source" : "target"} node: ${!sourceNode ? sourceKey : targetKey}`
-      });
-      continue;
-    }
-    const entryIssues = [];
-    if (!currentArtifactRelationEdgeIds.has(relEdgeId)) {
-      entryIssues.push({
-        status: "orphan_lock",
-        edgeId: relEdgeId,
-        message: `Artifact relation ${relLock.source.type}:${relLock.source.id} --[${relLock.kind}]--> ${relLock.target.type}:${relLock.target.id} no longer exists in the current graph`
-      });
-    }
-    if (sourceNode.path !== relLock.source.path) {
-      entryIssues.push({
-        status: "source_changed",
-        edgeId: relEdgeId,
-        message: `Artifact relation source ${sourceKey} moved from ${relLock.source.path} to ${sourceNode.path}`,
-        currentSourceHash: sourceNode.contentHash
-      });
-    }
-    if (targetNode.path !== relLock.target.path) {
-      entryIssues.push({
-        status: "artifact_changed",
-        edgeId: relEdgeId,
-        message: `Artifact relation target ${targetKey} moved from ${relLock.target.path} to ${targetNode.path}`,
-        currentArtifactHash: targetNode.contentHash
-      });
-    }
-    if (sourceNode.contentHash !== relLock.source.contentHash) {
-      entryIssues.push({
-        status: "source_changed",
-        edgeId: relEdgeId,
-        message: `Artifact relation source ${sourceKey} changed since the lock was written`,
-        currentSourceHash: sourceNode.contentHash
-      });
-    }
-    if (targetNode.contentHash !== relLock.target.contentHash) {
-      entryIssues.push({
-        status: "artifact_changed",
-        edgeId: relEdgeId,
-        message: `Artifact relation target ${targetKey} changed since the lock was written`,
-        currentArtifactHash: targetNode.contentHash
-      });
-    }
-    if (!existsSync(join3(root, sourceNode.path))) {
-      entryIssues.push({
-        status: "orphan_lock",
-        edgeId: relEdgeId,
-        message: `Artifact relation source file ${sourceNode.path} no longer exists`
-      });
-    }
-    if (!existsSync(join3(root, targetNode.path))) {
-      entryIssues.push({
-        status: "orphan_lock",
-        edgeId: relEdgeId,
-        message: `Artifact relation target file ${targetNode.path} no longer exists`
-      });
-    }
-    if (entryIssues.length === 0) {
-      artifactRelationFresh += 1;
-    } else {
-      issues.push(...entryIssues);
-    }
-  }
-  const reportedMissingRelationLocks = /* @__PURE__ */ new Set();
-  for (const edge2 of currentArtifactRelationEdges) {
-    const edgeId = edge2.edgeId;
-    if (!artifactRelationLocks.some((lock2) => lock2.edgeId === edgeId)) {
-      if (reportedMissingRelationLocks.has(edgeId)) {
-        continue;
-      }
-      reportedMissingRelationLocks.add(edgeId);
-      const source = index.nodes.find((node) => node.uid === edge2.from);
-      const target = index.nodes.find((node) => node.uid === edge2.to);
-      issues.push({
-        status: "missing_lock",
-        edgeId,
-        message: `Artifact relation ${edge2.from} --[${edge2.kind}]--> ${edge2.to} has no version lock`,
-        artifact: target ? lockRefFromNode(target) : void 0,
-        source: source ? lockRefFromNode(source) : void 0
-      });
-    }
-  }
-  return {
-    schemaVersion: "1.0",
-    root,
-    lockPath: safeLockPath,
-    totalLocks: lock.locks.length,
-    fresh,
-    totalArtifactRelationLocks: artifactRelationLocks.length,
-    artifactRelationFresh,
-    issues: sortBy(issues.map(enrichVersionLockIssue), (issue2) => `${issue2.status}	${issue2.edgeId}	${issue2.verifiedByPath ?? ""}`)
-  };
-}
-function isLivenessIssue(issue2) {
-  return issue2.status === "orphan_lock" && issue2.message.startsWith(LIVENESS_MESSAGE_PREFIX);
-}
-function versionLockIssueSeverity(issue2) {
-  if (issue2.severity) {
-    return issue2.severity;
-  }
-  if (issue2.status === "missing_lock") {
-    return "warning";
-  }
-  if (issue2.status === "orphan_lock" && issue2.message.startsWith(LIVENESS_MESSAGE_PREFIX)) {
-    return "warning";
-  }
-  return "error";
-}
-function isVersionLockIssueBlocking(issue2, strictMissingLock) {
-  if (issue2.status === "missing_lock") {
-    return strictMissingLock;
-  }
-  return versionLockIssueSeverity(issue2) === "error";
-}
-function versionLockIssueRemediation(issue2) {
-  switch (issue2.status) {
-    case "artifact_changed":
-      return [
-        "\u786E\u8BA4\u8FD9\u6B21\u5236\u54C1\u53D8\u66F4\uFF08\u5185\u5BB9\u6216\u8DEF\u5F84\uFF09\u662F\u6709\u610F\u7684\u3002",
-        "\u8FD0\u884C `artifact-graph version-lock refresh --changed-only --worktree --format markdown`\uFF08\u65E5\u5E38\u5F00\u53D1\uFF09\u6216 `artifact-graph version-lock refresh --changed-only --staged --format markdown`\uFF08\u63D0\u4EA4\u524D\uFF09\u5237\u65B0\u53D7\u5F71\u54CD\u7684\u9501\u3002",
-        "\u8FD0\u884C `git diff artifacts/traceability-version-lock.json` \u5BA1\u67E5\u9501\u53D8\u66F4\uFF0C\u786E\u8BA4\u540E `git add artifacts/traceability-version-lock.json` \u5E76\u91CD\u65B0\u63D0\u4EA4\u3002"
-      ];
-    case "source_changed":
-      return [
-        "\u786E\u8BA4\u8FD9\u6B21\u6E90\u7801/\u6D4B\u8BD5\u53D8\u66F4\uFF08\u5185\u5BB9\u6216\u8DEF\u5F84\uFF09\u662F\u6709\u610F\u7684\u3002",
-        "\u8FD0\u884C `artifact-graph version-lock refresh --changed-only --worktree --format markdown`\uFF08\u65E5\u5E38\u5F00\u53D1\uFF09\u6216 `artifact-graph version-lock refresh --changed-only --staged --format markdown`\uFF08\u63D0\u4EA4\u524D\uFF09\u5237\u65B0\u53D7\u5F71\u54CD\u7684\u9501\u3002",
-        "\u8FD0\u884C `git diff artifacts/traceability-version-lock.json` \u5BA1\u67E5\u9501\u53D8\u66F4\uFF0C\u786E\u8BA4\u540E `git add artifacts/traceability-version-lock.json` \u5E76\u91CD\u65B0\u63D0\u4EA4\u3002"
-      ];
-    case "verified_by_changed":
-      return [
-        "\u786E\u8BA4\u8FD9\u6B21\u9A8C\u8BC1\u6587\u4EF6\u53D8\u66F4\u662F\u6709\u610F\u7684\u3002",
-        "\u8FD0\u884C `artifact-graph version-lock refresh --changed-only --worktree --format markdown`\uFF08\u65E5\u5E38\u5F00\u53D1\uFF09\u6216 `artifact-graph version-lock refresh --changed-only --staged --format markdown`\uFF08\u63D0\u4EA4\u524D\uFF09\u5237\u65B0\u53D7\u5F71\u54CD\u7684\u9501\u3002",
-        "\u8FD0\u884C `git diff artifacts/traceability-version-lock.json` \u5BA1\u67E5\u9501\u53D8\u66F4\uFF0C\u786E\u8BA4\u540E `git add artifacts/traceability-version-lock.json` \u5E76\u91CD\u65B0\u63D0\u4EA4\u3002"
-      ];
-    case "missing_lock":
-      return [
-        "\u65B0\u589E\u8FFD\u6EAF\u8FB9\u8FD8\u6CA1\u6709\u5BF9\u5E94\u7248\u672C\u9501\uFF1B\u9ED8\u8BA4\u4E0D\u963B\u65AD\uFF0C`--strict-missing-lock` \u4E0B\u4F1A\u963B\u65AD\u3002",
-        "\u8FD0\u884C `artifact-graph version-lock refresh --changed-only --worktree --format markdown` \u4E3A\u53D7\u5F71\u54CD\u8FB9\u8865\u9501\uFF1B\u9996\u6B21\u5EFA\u7ACB\u57FA\u7EBF\u6216\u914D\u7F6E\u53D8\u66F4\u65F6\u7528 `artifact-graph version-lock refresh --all --format markdown`\u3002",
-        "\u8FD0\u884C `git diff artifacts/traceability-version-lock.json` \u5BA1\u67E5\u540E `git add artifacts/traceability-version-lock.json` \u6682\u5B58\u3002"
-      ];
-    case "orphan_lock":
-      if (isLivenessIssue(issue2)) {
-        return [
-          "\u8FD9\u662F liveness \u8B66\u544A\uFF0C\u4E0D\u662F\u6821\u9A8C\u5931\u8D25\uFF1A\u9501\u4ECD\u7136\u4FDD\u7559\uFF0C\u9ED8\u8BA4\u4E0D\u963B\u65AD\u3002",
-          "\u5982\u679C\u6D4B\u8BD5\u5DF2\u5E9F\u5F03\uFF1A\u5220\u9664\u8BE5\u6587\u4EF6\u6216\u79FB\u9664\u5176\u4E2D\u7684\u8FFD\u6EAF\u6CE8\u91CA\uFF0C\u7136\u540E\u8FD0\u884C `artifact-graph version-lock refresh --all --remove-orphans --format markdown` \u6E05\u7406\u5BF9\u5E94\u7684\u9501\u3002",
-          "\u5982\u679C\u6D4B\u8BD5\u4ECD\u7136\u6709\u6548\uFF1A\u628A\u5B83\u52A0\u5165 artifact-graph.config.yaml \u4E2D\u67D0\u4E2A e2e runner \u7684 include\uFF0C\u6216\u68C0\u67E5 exclude/testIgnore \u662F\u5426\u8BEF\u4F24\u3002"
-        ];
-      }
-      return [
-        "\u9501\u5F15\u7528\u7684\u5236\u54C1\u3001\u6E90\u7801\u6216\u8FFD\u6EAF\u8FB9\u5728\u5F53\u524D\u56FE\u4E2D\u5DF2\u4E0D\u5B58\u5728\uFF0C\u5E38\u89C1\u4E8E\u5236\u54C1\u5220\u9664\u6216\u62C6\u5206\u4E4B\u540E\u3002",
-        "\u786E\u8BA4\u5220\u9664\u662F\u6709\u610F\u7684\u540E\uFF0C\u8FD0\u884C `artifact-graph version-lock refresh --all --remove-orphans --format markdown` \u6E05\u7406\u5B64\u7ACB\u9501\u3002",
-        "\u8FD0\u884C `git diff artifacts/traceability-version-lock.json` \u5BA1\u67E5\u88AB\u79FB\u9664\u7684\u9501\u6761\u76EE\uFF0C\u786E\u8BA4\u540E `git add artifacts/traceability-version-lock.json` \u6682\u5B58\u3002",
-        "\u5982\u679C\u5220\u9664\u662F\u8BEF\u64CD\u4F5C\uFF0C\u5148\u6062\u590D\u5BF9\u5E94\u5236\u54C1\u6216\u6E90\u7801\u6587\u4EF6\uFF0C\u518D\u8FD0\u884C\u4E0D\u5E26 `--remove-orphans` \u7684 refresh \u5237\u65B0\u54C8\u5E0C\u3002"
-      ];
-    case "target_not_found":
-      return [
-        "\u68C0\u67E5 `--target` \u7684 `type:id` \u662F\u5426\u62FC\u5199\u6B63\u786E\u3002",
-        "\u5982\u679C\u8BE5\u5236\u54C1\u5DF2\u88AB\u5220\u9664\u6216\u6539\u540D\uFF0C\u6539\u7528\u5F53\u524D\u5B58\u5728\u7684\u5236\u54C1\u6807\u8BC6\u91CD\u8BD5\u3002"
-      ];
-    default:
-      return [];
-  }
-}
-function enrichVersionLockIssue(issue2) {
-  return {
-    ...issue2,
-    severity: versionLockIssueSeverity(issue2),
-    remediation: issue2.remediation ?? versionLockIssueRemediation(issue2)
-  };
-}
-async function updateVersionLock(root, options) {
-  const index = await buildVersionIndex(root);
-  const currentEdges = implementationEdges(index);
-  const targetUid = parseTarget(options.target);
-  const sourcePath = normalizeRelativePath(root, options.source);
-  const source = index.nodes.find((node) => node.path === sourcePath);
-  const artifact = index.nodes.find((node) => node.uid === targetUid);
-  if (!artifact) {
-    throw new Error(`Target artifact not found: ${options.target}`);
-  }
-  if (!source) {
-    throw new Error(`Source node not found or has no traceability comment: ${sourcePath}`);
-  }
-  if (source.sourceKind !== "code" && source.sourceKind !== "test") {
-    throw new Error(`Source must be code or test, got ${source.sourceKind}: ${sourcePath}`);
-  }
-  const matchingEdge = currentEdges.find((edge2) => edge2.from === source.uid && edge2.to === artifact.uid);
-  if (!matchingEdge) {
-    throw new Error(`Source ${sourcePath} does not declare a traceability link to ${options.target}`);
-  }
-  const verifiedBy = (options.verifiedBy ?? []).map((path) => {
-    const verifierPath = normalizeRelativePath(root, path);
-    const verifier = index.nodes.find((node) => node.path === verifierPath);
-    if (!verifier) {
-      throw new Error(`Verifier node not found or has no traceability comment: ${verifierPath}`);
-    }
-    if (verifier.sourceKind !== "code" && verifier.sourceKind !== "test") {
-      throw new Error(`Verifier must be code or test, got ${verifier.sourceKind}: ${verifierPath}`);
-    }
-    const verifierEdge = currentEdges.find((edge2) => edge2.from === verifier.uid && edge2.to === artifact.uid);
-    if (!verifierEdge) {
-      throw new Error(`Verifier ${verifierPath} does not declare a traceability link to ${options.target}`);
-    }
-    return sourceRefFromNode(verifier);
-  });
-  const kind = source.sourceKind === "test" ? "verifies" : "implements";
-  const entry = {
-    edgeId: lockEdgeIdFor(source, artifact, kind),
-    kind,
-    artifact: lockRefFromNode(artifact),
-    source: sourceRefFromNode(source),
-    verifiedBy: verifiedBy.length > 0 ? sortBy(verifiedBy, (item) => item.path) : void 0
-  };
-  const lockPath = normalizeRelativePath(root, options.lockPath ?? VERSION_LOCK_PATH);
-  const lock = await readVersionLock(root, lockPath);
-  const filtered = lock.locks.filter((item) => item.edgeId !== entry.edgeId);
-  const next = {
-    schemaVersion: VERSION_LOCK_SCHEMA_VERSION,
-    locks: sortBy([...filtered, entry], (item) => item.edgeId),
-    artifactRelations: lock.artifactRelations
-  };
-  await writeVersionLock(root, lockPath, next);
-  return next;
-}
-async function bootstrapVersionLock(root, options = {}) {
-  const index = await buildVersionIndex(root);
-  const config = await loadConfig(root);
-  const lockPath = normalizeRelativePath(root, options.lockPath ?? VERSION_LOCK_PATH);
-  if (!options.force) {
-    const existing = await readVersionLock(root, lockPath);
-    if (existing.locks.length > 0) {
-      throw new Error(`Version lock already contains ${existing.locks.length} locks. Use --force to overwrite.`);
-    }
-  }
-  const nodeByUid = new Map(index.nodes.map((node) => [node.uid, node]));
-  const entries = /* @__PURE__ */ new Map();
-  for (const edge2 of await lockableImplementationEdges(root, index, config)) {
-    const source = nodeByUid.get(edge2.from);
-    const artifact = nodeByUid.get(edge2.to);
-    if (!source || !artifact) {
-      continue;
-    }
-    const kind = source.sourceKind === "test" ? "verifies" : "implements";
-    const edgeId = edge2.edgeId;
-    if (entries.has(edgeId)) {
-      continue;
-    }
-    entries.set(edgeId, {
-      edgeId,
-      kind,
-      artifact: lockRefFromNode(artifact),
-      source: sourceRefFromNode(source)
-    });
-  }
-  const artifactRelationEntries = [];
-  for (const edge2 of artifactRelationEdges(index)) {
-    const source = nodeByUid.get(edge2.from);
-    const target = nodeByUid.get(edge2.to);
-    if (!source || !target) continue;
-    artifactRelationEntries.push(artifactRelationLockFromEdge(edge2, source, target));
-  }
-  const next = {
-    schemaVersion: VERSION_LOCK_SCHEMA_VERSION,
-    locks: sortBy([...entries.values()], (item) => item.edgeId),
-    artifactRelations: sortBy(artifactRelationEntries, artifactRelationLockSortKey)
-  };
-  await writeVersionLock(root, lockPath, next);
-  return next;
-}
-async function refreshVersionLock(root, options = {}) {
-  const lockPath = normalizeRelativePath(root, options.lockPath ?? VERSION_LOCK_PATH);
-  const changedPaths = sortUnique((options.changedPaths ?? []).map((path) => normalizeRelativePath(root, path)));
-  const all = options.all === true || options.changedOnly !== true;
-  const mode = all ? "all" : "changed-only";
-  const warnings = [];
-  if (!all && changedPaths.includes("artifact-graph.config.yaml")) {
-    throw new Error("Changed-only version-lock refresh includes artifact-graph.config.yaml and requires --all");
-  }
-  const index = await buildVersionIndex(root);
-  const config = await loadConfig(root);
-  const lock = await readVersionLock(root, lockPath);
-  const nodeByUid = new Map(index.nodes.map((node) => [node.uid, node]));
-  const nodeByPath = new Map(index.nodes.map((node) => [node.path, node]));
-  const currentImplementationEdges = await lockableImplementationEdges(root, index, config);
-  const currentEdgePairs = new Set(currentImplementationEdges.map((edge2) => `${edge2.from}	${edge2.to}`));
-  const currentEntries = /* @__PURE__ */ new Map();
-  const changedPathSet = new Set(changedPaths);
-  const affectedEdges = /* @__PURE__ */ new Set();
-  const addedLocks = [];
-  const updatedLocks = [];
-  const retainedOrphans = [];
-  const removedOrphans = [];
-  const nextLocks = /* @__PURE__ */ new Map();
-  for (const edge2 of currentImplementationEdges) {
-    const source = nodeByUid.get(edge2.from);
-    const artifact = nodeByUid.get(edge2.to);
-    if (!source || !artifact || currentEntries.has(edge2.edgeId)) {
-      continue;
-    }
-    const existing = lock.locks.find((entry) => entry.edgeId === edge2.edgeId);
-    currentEntries.set(edge2.edgeId, lockEntryFromCurrentEdge(
-      edge2.edgeId,
-      source,
-      artifact,
-      existing,
-      nodeByPath,
-      currentEdgePairs,
-      options.removeOrphans === true,
-      removedOrphans
-    ));
-  }
-  for (const existing of lock.locks) {
-    const current = currentEntries.get(existing.edgeId);
-    const affected = all || lockEntryTouchesAnyPath(existing, changedPathSet);
-    if (affected) {
-      affectedEdges.add(existing.edgeId);
-    }
-    if (!current) {
-      if (affected && options.removeOrphans === true) {
-        removedOrphans.push(existing.edgeId);
-      } else {
-        if (affected) {
-          retainedOrphans.push(existing.edgeId);
-        }
-        nextLocks.set(existing.edgeId, existing);
-      }
-      continue;
-    }
-    if (affected || currentEdgeTouchesAnyPath(current, changedPathSet)) {
-      affectedEdges.add(existing.edgeId);
-      if (stableEntryJson(existing) !== stableEntryJson(current)) {
-        updatedLocks.push(existing.edgeId);
-      }
-      nextLocks.set(existing.edgeId, current);
-    } else {
-      nextLocks.set(existing.edgeId, existing);
-    }
-  }
-  for (const [edgeId, current] of currentEntries) {
-    if (nextLocks.has(edgeId)) {
-      continue;
-    }
-    const affected = all || currentEdgeTouchesAnyPath(current, changedPathSet);
-    if (!affected) {
-      continue;
-    }
-    affectedEdges.add(edgeId);
-    addedLocks.push(edgeId);
-    nextLocks.set(edgeId, current);
-  }
-  if (mode === "changed-only" && changedPaths.length === 0) {
-    warnings.push("No changed paths were provided; no locks were refreshed.");
-  }
-  const currentArtifactRelationEdgeList = artifactRelationEdges(index);
-  const existingArtifactRelationLocks = lock.artifactRelations ?? [];
-  const addedArtifactRelationLocks = [];
-  const updatedArtifactRelationLocks = [];
-  const retainedArtifactRelationOrphans = [];
-  const removedArtifactRelationLocks = [];
-  const nextArtifactRelationLocks = [];
-  const processedRelationEdgeIds = /* @__PURE__ */ new Set();
-  for (const edge2 of currentArtifactRelationEdgeList) {
-    const source = nodeByUid.get(edge2.from);
-    const target = nodeByUid.get(edge2.to);
-    if (!source || !target || processedRelationEdgeIds.has(edge2.edgeId)) {
-      continue;
-    }
-    processedRelationEdgeIds.add(edge2.edgeId);
-    const existingLock = existingArtifactRelationLocks.find(
-      (lock2) => lock2.edgeId === edge2.edgeId
-    );
-    const affected = all || existingLock && artifactRelationLockTouchesPaths(existingLock, changedPathSet) || changedPathSet.has(source.path) || changedPathSet.has(target.path);
-    if (!affected) {
-      if (existingLock) {
-        nextArtifactRelationLocks.push(existingLock);
-      }
-      continue;
-    }
-    affectedEdges.add(edge2.edgeId);
-    const newLock = artifactRelationLockFromEdge(edge2, source, target);
-    if (existingLock) {
-      if (stableArtifactRelationLockJson(existingLock) === stableArtifactRelationLockJson(newLock)) {
-        nextArtifactRelationLocks.push(existingLock);
-      } else {
-        updatedArtifactRelationLocks.push(edge2.edgeId);
-        nextArtifactRelationLocks.push(newLock);
-      }
-    } else {
-      addedArtifactRelationLocks.push(edge2.edgeId);
-      nextArtifactRelationLocks.push(newLock);
-    }
-  }
-  for (const existingLock of existingArtifactRelationLocks) {
-    const relEdgeId = existingLock.edgeId;
-    if (processedRelationEdgeIds.has(relEdgeId)) {
-      continue;
-    }
-    const affected = all || artifactRelationLockTouchesPaths(existingLock, changedPathSet);
-    if (affected) {
-      affectedEdges.add(relEdgeId);
-      if (options.removeOrphans === true) {
-        removedArtifactRelationLocks.push(relEdgeId);
-      } else {
-        retainedArtifactRelationOrphans.push(relEdgeId);
-        nextArtifactRelationLocks.push(existingLock);
-      }
-    } else {
-      nextArtifactRelationLocks.push(existingLock);
-    }
-  }
-  const next = {
-    schemaVersion: VERSION_LOCK_SCHEMA_VERSION,
-    locks: sortBy([...nextLocks.values()], (item) => item.edgeId),
-    artifactRelations: sortBy(nextArtifactRelationLocks, artifactRelationLockSortKey)
-  };
-  await writeVersionLock(root, lockPath, next);
-  const postAudit = await auditVersionLock(root, lockPath, void 0, config);
-  return {
-    schemaVersion: "1.0",
-    root,
-    lockPath,
-    mode,
-    changedPaths,
-    affectedEdges: sortUnique([...affectedEdges]),
-    addedLocks: sortUnique(addedLocks),
-    updatedLocks: sortUnique(updatedLocks),
-    retainedOrphans: sortUnique(retainedOrphans),
-    removedOrphans: sortUnique(removedOrphans),
-    addedArtifactRelationLocks: sortUnique(addedArtifactRelationLocks),
-    updatedArtifactRelationLocks: sortUnique(updatedArtifactRelationLocks),
-    retainedArtifactRelationOrphans: sortUnique(retainedArtifactRelationOrphans),
-    removedArtifactRelationLocks: sortUnique(removedArtifactRelationLocks),
-    postAudit,
-    warnings
-  };
-}
-async function traceVersion(root, target, lockPath = VERSION_LOCK_PATH) {
-  const index = await buildVersionIndex(root);
-  const safeLockPath = normalizeRelativePath(root, lockPath);
-  const config = await loadConfig(root);
-  const audit = await auditVersionLock(root, safeLockPath, void 0, config);
-  const targetUid = parseTarget(target);
-  const lock = await readVersionLock(root, safeLockPath);
-  const targetNode = index.nodes.find((node) => node.uid === targetUid);
-  const targetIssues = targetNode ? [] : [{
-    status: "target_not_found",
-    edgeId: targetUid,
-    message: `Target artifact not found: ${target}`
-  }];
-  const targetArtifactRelations = (lock.artifactRelations ?? []).filter((rel) => {
-    const sourceKey = `${rel.source.type}:${rel.source.id}`;
-    const targetKey = `${rel.target.type}:${rel.target.id}`;
-    return sourceKey === targetUid || targetKey === targetUid;
-  });
-  return {
-    schemaVersion: "1.0",
-    root,
-    lockPath: safeLockPath,
-    target: {
-      uid: targetUid,
-      node: targetNode
-    },
-    currentEdges: index.edges.filter((edge2) => edge2.from === targetUid || edge2.to === targetUid),
-    locks: lock.locks.filter((entry) => `${entry.artifact.type}:${entry.artifact.id}` === targetUid),
-    artifactRelations: targetArtifactRelations,
-    issues: [...targetIssues.map(enrichVersionLockIssue), ...audit.issues.filter((issue2) => `${issue2.artifact?.type}:${issue2.artifact?.id}` === targetUid || issue2.edgeId.includes(`#${targetUid}`))]
-  };
-}
-function renderIssueBlockingTag(issue2, strictMissingLock) {
-  return isVersionLockIssueBlocking(issue2, strictMissingLock) ? "\u963B\u65AD" : "\u8B66\u544A";
-}
-function renderIssueBlockingExplanation(issue2, strictMissingLock) {
-  if (!isVersionLockIssueBlocking(issue2, strictMissingLock)) {
-    return "\u5426\uFF08\u4EC5\u63D0\u9192\uFF0C\u4E0D\u963B\u65AD\uFF09";
-  }
-  if (issue2.status === "missing_lock" && versionLockIssueSeverity(issue2) !== "error") {
-    return "\u662F\uFF08\u5DF2\u7531 --strict-missing-lock \u5347\u7EA7\u4E3A\u963B\u65AD\uFF09";
-  }
-  return "\u662F\uFF08\u4F1A\u4F7F\u547D\u4EE4\u4EE5\u975E\u96F6\u9000\u51FA\u7801\u7ED3\u675F\uFF09";
-}
-function appendIssueDetails(lines, issues, strictMissingLock) {
-  issues.forEach((issue2, index) => {
-    const label = VERSION_LOCK_STATUS_LABELS[issue2.status] ?? issue2.status;
-    lines.push(`### ${index + 1}. [${renderIssueBlockingTag(issue2, strictMissingLock)}] ${label}\uFF08\`${issue2.status}\`\uFF09`);
-    lines.push("");
-    lines.push(`- \u8FB9: \`${issue2.edgeId}\``);
-    lines.push(`- \u8BE6\u60C5: ${issue2.message}`);
-    lines.push(`- \u662F\u5426\u963B\u65AD: ${renderIssueBlockingExplanation(issue2, strictMissingLock)}`);
-    const remediation = issue2.remediation ?? [];
-    if (remediation.length > 0) {
-      lines.push("- \u89E3\u51B3\u6B65\u9AA4:");
-      remediation.forEach((step, stepIndex) => {
-        lines.push(`  ${stepIndex + 1}. ${step}`);
-      });
-    }
-    lines.push("");
-  });
-}
-function renderVersionLockAuditMarkdown(result, options = {}) {
-  const strictMissingLock = options.strictMissingLock === true;
-  const blockingCount = result.issues.filter((issue2) => isVersionLockIssueBlocking(issue2, strictMissingLock)).length;
-  const nonBlockingCount = result.issues.length - blockingCount;
-  const lines = [
-    "# \u7248\u672C\u9501\u5BA1\u8BA1\uFF08version-lock audit\uFF09",
-    "",
-    `- \u6839\u76EE\u5F55: \`${result.root}\``,
-    `- \u9501\u6587\u4EF6: \`${result.lockPath}\``,
-    `- \u5B9E\u73B0/\u9A8C\u8BC1\u9501: ${result.totalLocks}\uFF08\u65B0\u9C9C ${result.fresh}\uFF09`,
-    `- \u5236\u54C1\u5173\u7CFB\u9501: ${result.totalArtifactRelationLocks}\uFF08\u65B0\u9C9C ${result.artifactRelationFresh}\uFF09`,
-    `- \u963B\u65AD\u7B56\u7565: ${strictMissingLock ? "--strict-missing-lock\uFF08missing_lock \u5347\u7EA7\u4E3A\u963B\u65AD\uFF09" : "\u9ED8\u8BA4\uFF08missing_lock \u4E0D\u963B\u65AD\uFF09"}`,
-    `- \u95EE\u9898: ${result.issues.length}\uFF08\u963B\u65AD ${blockingCount}\uFF0C\u4E0D\u963B\u65AD ${nonBlockingCount}\uFF09`,
-    ""
-  ];
-  if (result.issues.length === 0) {
-    lines.push("\u672A\u53D1\u73B0\u7248\u672C\u9501\u95EE\u9898\u3002");
-    return `${lines.join("\n")}
-`;
-  }
-  if (blockingCount > 0) {
-    lines.push(`\u5F53\u524D\u7B56\u7565\u4E0B\u5B58\u5728 ${blockingCount} \u4E2A\u963B\u65AD\u95EE\u9898\uFF0C\u547D\u4EE4\u5C06\u4EE5\u975E\u96F6\u9000\u51FA\u7801\u7ED3\u675F\uFF1B\u8BF7\u6309\u4E0B\u65B9\u6B65\u9AA4\u9010\u9879\u5904\u7406\u3002`);
-  } else {
-    lines.push("\u5F53\u524D\u7B56\u7565\u4E0B\u6CA1\u6709\u963B\u65AD\u95EE\u9898\uFF0C\u4EE5\u4E0B\u4EC5\u4E3A\u63D0\u9192\uFF0C\u547D\u4EE4\u4EE5\u96F6\u9000\u51FA\u7801\u7ED3\u675F\u3002");
-  }
-  lines.push("");
-  lines.push("## \u95EE\u9898\u6E05\u5355");
-  lines.push("");
-  appendIssueDetails(lines, result.issues, strictMissingLock);
-  return `${lines.join("\n")}
-`;
-}
-function renderVersionLockRefreshMarkdown(result) {
-  const strictMissingLock = true;
-  const blockingCount = result.postAudit.issues.filter((issue2) => isVersionLockIssueBlocking(issue2, strictMissingLock)).length;
-  const nonBlockingCount = result.postAudit.issues.length - blockingCount;
-  const lines = [
-    "# \u7248\u672C\u9501\u5237\u65B0\uFF08version-lock refresh\uFF09",
-    "",
-    `- \u6839\u76EE\u5F55: \`${result.root}\``,
-    `- \u9501\u6587\u4EF6: \`${result.lockPath}\``,
-    `- \u6A21\u5F0F: \`${result.mode}\`\uFF08\u53D8\u66F4\u8DEF\u5F84 ${result.changedPaths.length} \u4E2A\uFF0C\u53D7\u5F71\u54CD\u8FB9 ${result.affectedEdges.length} \u6761\uFF09`,
-    `- \u5B9E\u73B0/\u9A8C\u8BC1\u9501: \u65B0\u589E ${result.addedLocks.length} | \u66F4\u65B0 ${result.updatedLocks.length} | \u4FDD\u7559\u5B64\u7ACB ${result.retainedOrphans.length} | \u5220\u9664\u5B64\u7ACB ${result.removedOrphans.length}`,
-    `- \u5236\u54C1\u5173\u7CFB\u9501: \u65B0\u589E ${result.addedArtifactRelationLocks.length} | \u66F4\u65B0 ${result.updatedArtifactRelationLocks.length} | \u4FDD\u7559\u5B64\u7ACB ${result.retainedArtifactRelationOrphans.length} | \u5220\u9664 ${result.removedArtifactRelationLocks.length}`,
-    `- \u963B\u65AD\u7B56\u7565: refresh \u56FA\u5B9A\u6309 --strict-missing-lock \u5224\u5B9A\uFF0Cmissing_lock \u4E5F\u4F1A\u963B\u65AD`,
-    `- \u5237\u65B0\u540E\u5BA1\u8BA1\u95EE\u9898: ${result.postAudit.issues.length}\uFF08\u963B\u65AD ${blockingCount}\uFF0C\u4E0D\u963B\u65AD ${nonBlockingCount}\uFF09`,
-    "",
-    "\u9501\u6587\u4EF6\u5DF2\u5199\u5165\u3002\u82E5\u9501\u6587\u4EF6\u76F8\u5BF9\u6682\u5B58\u533A\u6709\u53D8\u5316\uFF08\u4F8B\u5982 pre-commit \u573A\u666F\uFF09\uFF0C\u8BF7\u5148\u5BA1\u67E5\u5E76\u6682\u5B58\uFF1A",
-    "",
-    "1. `git diff artifacts/traceability-version-lock.json`",
-    "2. `git add artifacts/traceability-version-lock.json`",
-    "3. \u91CD\u65B0\u6267\u884C `git commit`",
-    ""
-  ];
-  appendList(lines, "\u65B0\u589E\u7684\u9501", result.addedLocks);
-  appendList(lines, "\u66F4\u65B0\u7684\u9501", result.updatedLocks);
-  appendList(lines, "\u4FDD\u7559\u7684\u5B64\u7ACB\u9501", result.retainedOrphans);
-  if (result.retainedOrphans.length > 0) {
-    lines.push("> \u4EE5\u4E0A\u662F\u5DF2\u5220\u9664/\u62C6\u5206\u5236\u54C1\u6216\u5931\u6548\u8FFD\u6EAF\u8FB9\u9057\u7559\u7684\u9501\u3002\u786E\u8BA4\u4E0D\u518D\u9700\u8981\u540E\u8FD0\u884C `artifact-graph version-lock refresh --all --remove-orphans --format markdown` \u6E05\u7406\uFF0C\u5BA1\u67E5 `git diff artifacts/traceability-version-lock.json` \u540E\u518D\u6682\u5B58\u3002");
-    lines.push("");
-  }
-  appendList(lines, "\u5220\u9664\u7684\u5B64\u7ACB\u9501", result.removedOrphans);
-  appendList(lines, "\u65B0\u589E\u7684\u5236\u54C1\u5173\u7CFB\u9501", result.addedArtifactRelationLocks);
-  appendList(lines, "\u66F4\u65B0\u7684\u5236\u54C1\u5173\u7CFB\u9501", result.updatedArtifactRelationLocks);
-  appendList(lines, "\u4FDD\u7559\u7684\u5B64\u7ACB\u5236\u54C1\u5173\u7CFB\u9501", result.retainedArtifactRelationOrphans);
-  if (result.retainedArtifactRelationOrphans.length > 0) {
-    lines.push("> \u4EE5\u4E0A\u662F\u5931\u6548\u5236\u54C1\u5173\u7CFB\u9057\u7559\u7684\u9501\u3002\u786E\u8BA4\u540E\u8FD0\u884C `artifact-graph version-lock refresh --all --remove-orphans --format markdown` \u6E05\u7406\uFF0C\u5BA1\u67E5\u9501 diff \u540E\u518D\u6682\u5B58\u3002");
-    lines.push("");
-  }
-  appendList(lines, "\u5220\u9664\u7684\u5236\u54C1\u5173\u7CFB\u9501", result.removedArtifactRelationLocks);
-  appendList(lines, "\u63D0\u9192", result.warnings);
-  if (result.postAudit.issues.length > 0) {
-    if (blockingCount > 0) {
-      lines.push(`## \u5237\u65B0\u540E\u5BA1\u8BA1\u95EE\u9898\uFF08\u963B\u65AD ${blockingCount}\uFF0C\u4E0D\u963B\u65AD ${nonBlockingCount}\uFF09`);
-    } else {
-      lines.push(`## \u5237\u65B0\u540E\u5BA1\u8BA1\u95EE\u9898\uFF08\u5F53\u524D\u7B56\u7565\u4E0B\u5168\u90E8\u4E0D\u963B\u65AD\uFF09`);
-    }
-    lines.push("");
-    appendIssueDetails(lines, result.postAudit.issues, strictMissingLock);
-  }
-  return `${lines.join("\n")}
-`;
-}
-function renderTraceVersionMarkdown(result) {
-  const lines = [
-    "# Trace Version",
-    "",
-    `Target: \`${result.target.uid}\``,
-    result.target.node ? `Current hash: \`${result.target.node.contentHash}\`` : "Current hash: target not found",
-    `Edges: ${result.currentEdges.length} | Locks: ${result.locks.length} | Artifact Relations: ${result.artifactRelations.length} | Issues: ${result.issues.length}`,
-    ""
-  ];
-  if (result.locks.length > 0) {
-    lines.push("## Locks");
-    for (const lock of result.locks) {
-      lines.push(`- \`${lock.edgeId}\` source=\`${lock.source.path}\` sourceHash=\`${lock.source.contentHash}\` artifactHash=\`${lock.artifact.contentHash}\``);
-    }
-    lines.push("");
-  }
-  if (result.artifactRelations.length > 0) {
-    lines.push("## Artifact Relations");
-    for (const rel of result.artifactRelations) {
-      lines.push(`- \`${rel.edgeId}\` kind=\`${rel.kind}\` source=\`${rel.source.type}:${rel.source.id}\` target=\`${rel.target.type}:${rel.target.id}\``);
-    }
-    lines.push("");
-  }
-  if (result.currentEdges.length > 0) {
-    lines.push("## Current Edges");
-    for (const edge2 of result.currentEdges) {
-      lines.push(`- \`${edge2.from}\` ${edge2.kind} \`${edge2.to}\` fromHash=\`${edge2.fromHash ?? "unknown"}\` toHash=\`${edge2.toHash ?? "unknown"}\``);
-    }
-    lines.push("");
-  }
-  if (result.issues.length > 0) {
-    lines.push("## Issues");
-    for (const issue2 of result.issues) {
-      lines.push(`- [${issue2.status}] \`${issue2.edgeId}\` \u2014 ${issue2.message}`);
-    }
-  }
-  return `${lines.join("\n")}
-`;
-}
-async function readVersionLock(root, lockPath) {
-  const safeLockPath = normalizeRelativePath(root, lockPath);
-  try {
-    const raw = await readFile(join3(root, safeLockPath), "utf-8");
-    let parsed;
-    try {
-      parsed = JSON.parse(raw);
-    } catch (error) {
-      throw new Error(`Version lock ${safeLockPath} is not valid JSON: ${error.message}`);
-    }
-    return validateVersionLockFile(parsed, safeLockPath);
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      return { schemaVersion: VERSION_LOCK_SCHEMA_VERSION, locks: [], artifactRelations: [] };
-    }
-    throw error;
-  }
-}
-function validateVersionLockFile(value, lockPath) {
-  if (!value || typeof value !== "object") {
-    throw new Error(`Invalid version lock schema in ${lockPath}: root must be an object`);
-  }
-  const record = value;
-  if (record.schemaVersion !== VERSION_LOCK_SCHEMA_VERSION || !Array.isArray(record.locks)) {
-    throw new Error(`Invalid version lock schema in ${lockPath}`);
-  }
-  const seen = /* @__PURE__ */ new Set();
-  const locks = record.locks.map((entry, index) => validateVersionLockEntry(entry, index, seen));
-  const artifactRelations = record.artifactRelations !== void 0 ? validateArtifactRelationLocks(record.artifactRelations, lockPath) : [];
-  return {
-    schemaVersion: VERSION_LOCK_SCHEMA_VERSION,
-    locks,
-    artifactRelations
-  };
-}
-function validateVersionLockEntry(value, index, seen) {
-  if (!value || typeof value !== "object") {
-    throw new Error(`Invalid version lock entry at locks[${index}]: entry must be an object`);
-  }
-  const entry = value;
-  const edgeId = requireString(entry.edgeId, `locks[${index}].edgeId`);
-  if (seen.has(edgeId)) {
-    throw new Error(`Invalid version lock entry at locks[${index}]: duplicate edgeId ${edgeId}`);
-  }
-  seen.add(edgeId);
-  const kind = requireString(entry.kind, `locks[${index}].kind`);
-  if (kind !== "implements" && kind !== "verifies") {
-    throw new Error(`Invalid version lock entry at locks[${index}]: kind must be implements or verifies`);
-  }
-  const artifact = validateVersionLockRef(entry.artifact, `locks[${index}].artifact`);
-  const source = validateVersionLockSourceRef(entry.source, `locks[${index}].source`);
-  const verifiedBy = entry.verifiedBy === void 0 ? void 0 : validateVerifiedBy(entry.verifiedBy, `locks[${index}].verifiedBy`);
-  return {
-    edgeId,
-    kind,
-    artifact,
-    source,
-    verifiedBy
-  };
-}
-function validateVersionLockRef(value, path) {
-  if (!value || typeof value !== "object") {
-    throw new Error(`Invalid version lock entry at ${path}: ref must be an object`);
-  }
-  const record = value;
-  return {
-    type: requireString(record.type, `${path}.type`),
-    id: requireString(record.id, `${path}.id`),
-    path: requireSafeRelativePath(requireString(record.path, `${path}.path`), `${path}.path`),
-    contentHash: requireHash(record.contentHash, `${path}.contentHash`)
-  };
-}
-function validateVersionLockSourceRef(value, path) {
-  if (!value || typeof value !== "object") {
-    throw new Error(`Invalid version lock entry at ${path}: source must be an object`);
-  }
-  const record = value;
-  const type = requireString(record.type, `${path}.type`);
-  if (type !== "code" && type !== "test") {
-    throw new Error(`Invalid version lock entry at ${path}.type: source type must be code or test`);
-  }
-  return {
-    type,
-    path: requireSafeRelativePath(requireString(record.path, `${path}.path`), `${path}.path`),
-    contentHash: requireHash(record.contentHash, `${path}.contentHash`)
-  };
-}
-function validateVerifiedBy(value, path) {
-  if (!Array.isArray(value)) {
-    throw new Error(`Invalid version lock entry at ${path}: verifiedBy must be an array`);
-  }
-  return value.map((item, index) => validateVersionLockSourceRef(item, `${path}[${index}]`));
-}
-function validateArtifactRelationLocks(value, lockPath) {
-  if (!Array.isArray(value)) {
-    throw new Error(`Invalid version lock schema in ${lockPath}: artifactRelations must be an array`);
-  }
-  const seen = /* @__PURE__ */ new Set();
-  const result = value.map((entry, index) => {
-    const lock = validateArtifactRelationLockEntry(entry, index, lockPath);
-    const key = artifactRelationLockSortKey(lock);
-    if (seen.has(key)) {
-      throw new Error(`Invalid artifactRelations[${index}] in ${lockPath}: duplicate relation ${key}`);
-    }
-    seen.add(key);
-    return lock;
-  });
-  return sortBy(result, artifactRelationLockSortKey);
-}
-function validateArtifactRelationLockEntry(value, index, lockPath) {
-  if (!value || typeof value !== "object") {
-    throw new Error(`Invalid artifactRelations[${index}] in ${lockPath}: entry must be an object`);
-  }
-  const entry = value;
-  const kind = requireString(entry.kind, `artifactRelations[${index}].kind`);
-  const source = validateArtifactRelationEndpoint(entry.source, `artifactRelations[${index}].source`);
-  const target = validateArtifactRelationEndpoint(entry.target, `artifactRelations[${index}].target`);
-  const edgeId = requireString(entry.edgeId, `artifactRelations[${index}].edgeId`);
-  return { edgeId, kind, source, target };
-}
-function validateArtifactRelationEndpoint(value, path) {
-  if (!value || typeof value !== "object") {
-    throw new Error(`Invalid ${path}: endpoint must be an object`);
-  }
-  const record = value;
-  const type = requireString(record.type, `${path}.type`);
-  const id = requireString(record.id, `${path}.id`);
-  return {
-    type,
-    id,
-    path: requireSafeRelativePath(requireString(record.path, `${path}.path`), `${path}.path`),
-    contentHash: requireHash(record.contentHash, `${path}.contentHash`)
-  };
-}
-function artifactRelationLockSortKey(lock) {
-  return `${lock.kind}	${lock.source.type}	${lock.source.id}	${lock.target.type}	${lock.target.id}`;
-}
-function artifactRelationLockTouchesPaths(lock, paths) {
-  return paths.has(lock.source.path) || paths.has(lock.target.path);
-}
-function requireString(value, path) {
-  if (typeof value !== "string" || value.trim().length === 0) {
-    throw new Error(`Invalid version lock entry at ${path}: expected non-empty string`);
-  }
-  return value;
-}
-function requireHash(value, path) {
-  const hash = requireString(value, path);
-  if (!/^sha256:[a-f0-9]{64}$/.test(hash)) {
-    throw new Error(`Invalid version lock entry at ${path}: expected sha256 hash`);
-  }
-  return hash;
-}
-function requireSafeRelativePath(value, path) {
-  const normalized = value.replace(/\\/g, "/").replace(/^\.\//, "");
-  if (normalized.startsWith("/") || normalized === ".." || normalized.startsWith("../")) {
-    throw new Error(`Invalid version lock entry at ${path}: path must stay within root`);
-  }
-  return normalized;
-}
-async function writeVersionLock(root, lockPath, lock) {
-  const safeLockPath = normalizeRelativePath(root, lockPath);
-  const fullPath = join3(root, safeLockPath);
-  await mkdir2(dirname(fullPath), { recursive: true });
-  await writeFile2(fullPath, `${JSON.stringify(lock, null, 2)}
-`);
-}
-function implementationEdges(index) {
-  const nodesByUid = new Map(index.nodes.map((node) => [node.uid, node]));
-  return index.edges.filter((edge2) => {
-    const source = nodesByUid.get(edge2.from);
-    return source?.sourceKind === "code" || source?.sourceKind === "test";
-  }).map((edge2) => {
-    const source = nodesByUid.get(edge2.from);
-    const artifact = nodesByUid.get(edge2.to);
-    const kind = source.sourceKind === "test" ? "verifies" : "implements";
-    return {
-      ...edge2,
-      kind,
-      edgeId: artifact ? lockEdgeIdFor(source, artifact, kind) : `${source.sourceKind}:${source.path}#${kind}#${edge2.to}`
-    };
-  });
-}
-async function lockableImplementationEdges(root, index, config) {
-  const edges = implementationEdges(index);
-  const nodesByUid = new Map(index.nodes.map((node) => [node.uid, node]));
-  const livenessByPath = /* @__PURE__ */ new Map();
-  const result = [];
-  for (const edge2 of edges) {
-    const source = nodesByUid.get(edge2.from);
-    if (source?.sourceKind !== "test") {
-      result.push(edge2);
-      continue;
-    }
-    let liveness = livenessByPath.get(source.path);
-    if (liveness === void 0) {
-      liveness = await getTestFileRunnerLiveness(root, source.path, config);
-      livenessByPath.set(source.path, liveness);
-    }
-    if (liveness !== "inactive") {
-      result.push(edge2);
-    }
-  }
-  return result;
-}
-function lockRefFromNode(node) {
-  return {
-    type: node.type,
-    id: node.id,
-    path: node.path,
-    contentHash: node.contentHash
-  };
-}
-function artifactRelationEdges(index) {
-  const nodesByUid = new Map(index.nodes.map((node) => [node.uid, node]));
-  return index.edges.filter((edge2) => {
-    const source = nodesByUid.get(edge2.from);
-    const target = nodesByUid.get(edge2.to);
-    return source?.sourceKind === "artifact" && target?.sourceKind === "artifact";
-  }).map((edge2) => {
-    const source = nodesByUid.get(edge2.from);
-    const target = nodesByUid.get(edge2.to);
-    return {
-      ...edge2,
-      edgeId: artifactRelationEdgeId(source, target, edge2.kind)
-    };
-  });
-}
-function artifactRelationEdgeId(source, target, kind) {
-  return `relation:${source.type}:${source.id}#${kind}#${target.type}:${target.id}`;
-}
-function artifactRelationLockFromEdge(edge2, source, target) {
-  return {
-    edgeId: edge2.edgeId,
-    kind: edge2.kind,
-    source: {
-      type: source.type,
-      id: source.id,
-      path: source.path,
-      contentHash: source.contentHash
-    },
-    target: {
-      type: target.type,
-      id: target.id,
-      path: target.path,
-      contentHash: target.contentHash
-    }
-  };
-}
-function sourceRefFromNode(node) {
-  return {
-    type: node.sourceKind === "test" ? "test" : "code",
-    path: node.path,
-    contentHash: node.contentHash
-  };
-}
-function appendList(lines, title, items) {
-  if (items.length === 0) {
-    return;
-  }
-  lines.push(`## ${title}`);
-  for (const item of items) {
-    lines.push(`- \`${item}\``);
-  }
-  lines.push("");
-}
-function lockEntryFromCurrentEdge(edgeId, source, artifact, existing, nodeByPath, currentEdgePairs, removeOrphans, removedOrphans) {
-  const verifiedBy = (existing?.verifiedBy ?? []).flatMap((item) => {
-    const verifier = nodeByPath.get(item.path);
-    if (!verifier || verifier.sourceKind !== "code" && verifier.sourceKind !== "test") {
-      if (removeOrphans) {
-        removedOrphans.push(`${edgeId}#verifiedBy:${item.path}`);
-        return [];
-      }
-      return [item];
-    }
-    if (!currentEdgePairs.has(`${verifier.uid}	${artifact.uid}`)) {
-      if (removeOrphans) {
-        removedOrphans.push(`${edgeId}#verifiedBy:${item.path}`);
-        return [];
-      }
-      return [sourceRefFromNode(verifier)];
-    }
-    return [sourceRefFromNode(verifier)];
-  });
-  return {
-    edgeId,
-    kind: source.sourceKind === "test" ? "verifies" : "implements",
-    artifact: lockRefFromNode(artifact),
-    source: sourceRefFromNode(source),
-    verifiedBy: verifiedBy.length > 0 ? sortBy(verifiedBy, (item) => item.path) : void 0
-  };
-}
-function currentEdgeTouchesAnyPath(entry, paths) {
-  return paths.has(entry.artifact.path) || paths.has(entry.source.path) || (entry.verifiedBy ?? []).some((item) => paths.has(item.path));
-}
-function lockEntryTouchesAnyPath(entry, paths) {
-  return currentEdgeTouchesAnyPath(entry, paths);
-}
-function stableEntryJson(entry) {
-  return JSON.stringify({
-    edgeId: entry.edgeId,
-    kind: entry.kind,
-    artifact: entry.artifact,
-    source: entry.source,
-    verifiedBy: entry.verifiedBy ?? []
-  });
-}
-function stableArtifactRelationLockJson(lock) {
-  return JSON.stringify({
-    edgeId: lock.edgeId,
-    kind: lock.kind,
-    source: lock.source,
-    target: lock.target
-  });
-}
-function normalizeVersionEdgeKind(edge2) {
-  if (edge2.source === "test-comment") {
-    return edge2.kind === "verifies" ? "verifies" : "implements";
-  }
-  return edge2.kind;
-}
-function classifyNode(node) {
-  if (node.type === "implementation") {
-    return "code";
-  }
-  if (node.type === "test") {
-    return "test";
-  }
-  return "artifact";
-}
-function parseTarget(target) {
-  const separator = target.indexOf(":");
-  if (separator < 1 || separator === target.length - 1) {
-    throw new Error(`Invalid target "${target}". Expected type:id`);
-  }
-  return `${target.slice(0, separator)}:${target.slice(separator + 1)}`;
-}
-function lockEdgeIdFor(source, artifact, kind) {
-  return `${source.sourceKind}:${source.path}#${kind}#${artifact.type}:${artifact.id}`;
-}
-async function hashRelativePath(root, path, cache) {
-  const normalized = normalizeRelativePath(root, path);
-  const cached = cache.get(normalized);
-  if (cached) return cached;
-  const content = await readFile(join3(root, normalized));
-  const hash = `sha256:${createHash("sha256").update(content).digest("hex")}`;
-  cache.set(normalized, hash);
-  return hash;
-}
-function normalizeRelativePath(root, path) {
-  const normalized = path.replace(/\\/g, "/");
-  const relativePath = normalized.startsWith("/") ? relative2(root, normalized).replace(/\\/g, "/") : normalized.replace(/^\.\//, "");
-  if (relativePath === ".." || relativePath.startsWith("../")) {
-    throw new Error(`Path is outside root: ${path}`);
-  }
-  return relativePath;
-}
-function sortBy(items, keyFn) {
-  return [...items].sort((left, right) => keyFn(left).localeCompare(keyFn(right)));
-}
-async function getTestFileRunnerLiveness(root, filePath, config) {
-  const schema = config ?? await loadConfig(root);
-  const runners = schema.e2e?.runners ?? [];
-  if (runners.length === 0) {
-    if (!/e2e/i.test(filePath) && !/\.e2e\./i.test(filePath)) {
-      return "active";
-    }
-    const fullSourcePath = join3(root, filePath);
-    if (!existsSync(fullSourcePath)) return "inactive";
-    try {
-      const content = await readFile(fullSourcePath, "utf-8");
-      return /\/\/!?\s*@(?:e2e_test|tc)\s+/.test(content) ? "active" : "inactive";
-    } catch {
-      return "inactive";
-    }
-  }
-  let inRunnerScope = false;
-  for (const runner of runners) {
-    if (!isFileIncludedByRunner(filePath, runner)) continue;
-    inRunnerScope = true;
-    const isActive = await isFileActiveInRunner(root, filePath, runner);
-    if (isActive) return "active";
-  }
-  return inRunnerScope ? "inactive" : "unscoped";
-}
-function isFileIncludedByRunner(filePath, runner) {
-  const normalizedPath = filePath.replace(/\\/g, "/");
-  const runnerRoot = runner.root.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/$/, "") || ".";
-  if (runnerRoot !== "." && !normalizedPath.startsWith(`${runnerRoot}/`)) return false;
-  const relativePath = runnerRoot === "." ? normalizedPath : normalizedPath.slice(runnerRoot.length + 1);
-  return runner.include.some((pattern) => matchesRunnerGlob(relativePath, pattern));
-}
-async function isFileActiveInRunner(root, filePath, runner) {
-  if (!isFileIncludedByRunner(filePath, runner)) return false;
-  const normalizedPath = filePath.replace(/\\/g, "/");
-  const runnerRoot = runner.root.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/$/, "") || ".";
-  const relativePath = runnerRoot === "." ? normalizedPath : normalizedPath.slice(runnerRoot.length).replace(/^\//, "");
-  const matchesExclude = (runner.exclude ?? []).some(
-    (pattern) => matchesRunnerGlob(relativePath, pattern)
-  );
-  if (matchesExclude) return false;
-  const matchesTestIgnore = (runner.testIgnore ?? []).some(
-    (pattern) => matchesRunnerGlob(relativePath, pattern)
-  );
-  if (matchesTestIgnore) return false;
-  return true;
-}
-function sortUnique(items) {
-  return [...new Set(items)].sort((left, right) => left.localeCompare(right));
-}
-var VERSION_LOCK_PATH, VERSION_INDEX_SCHEMA_VERSION, VERSION_LOCK_SCHEMA_VERSION, LIVENESS_MESSAGE_PREFIX, VERSION_LOCK_STATUS_LABELS;
-var init_versioned_traceability = __esm({
-  "src/versioned-traceability.ts"() {
-    "use strict";
-    init_index();
-    init_glob_matcher();
-    VERSION_LOCK_PATH = "artifacts/traceability-version-lock.json";
-    VERSION_INDEX_SCHEMA_VERSION = "1.0";
-    VERSION_LOCK_SCHEMA_VERSION = "1.0";
-    LIVENESS_MESSAGE_PREFIX = "Liveness:";
-    VERSION_LOCK_STATUS_LABELS = {
-      fresh: "\u65B0\u9C9C",
-      target_not_found: "\u76EE\u6807\u5236\u54C1\u4E0D\u5B58\u5728",
-      artifact_changed: "\u5236\u54C1\u5DF2\u53D8\u5316",
-      source_changed: "\u6E90\u7801/\u6D4B\u8BD5\u5DF2\u53D8\u5316",
-      verified_by_changed: "\u9A8C\u8BC1\u6587\u4EF6\u5DF2\u53D8\u5316",
-      missing_lock: "\u7F3A\u5C11\u7248\u672C\u9501",
-      orphan_lock: "\u5B64\u7ACB\u9501"
-    };
-  }
-});
-
 // src/native-binding-diagnostics.ts
 import { existsSync as existsSync2, readdirSync } from "fs";
 import { createRequire } from "module";
@@ -2854,11 +3166,11 @@ var init_native_binding_diagnostics = __esm({
 });
 
 // src/cli-resolver.ts
-import { execFile } from "child_process";
+import { execFile as execFile2 } from "child_process";
 import { constants, readFileSync, realpathSync } from "fs";
 import { access } from "fs/promises";
-import { basename, dirname as dirname3, isAbsolute, join as join5, resolve } from "path";
-import { promisify } from "util";
+import { basename, dirname as dirname3, isAbsolute as isAbsolute2, join as join5, resolve as resolve3 } from "path";
+import { promisify as promisify2 } from "util";
 async function resolveArtifactGraphCli(root, options = {}) {
   const pathCli = await findCommandOnPath("artifact-graph");
   const legacyCliPath = options.projectCliPath ?? process.env.ARTIFACT_GRAPH_LEGACY_CLI;
@@ -3006,7 +3318,7 @@ async function detectSupportedCommands(cliPath) {
   const args = cliPath.endsWith(".js") ? [cliPath, "--help"] : ["--help"];
   let help = "";
   try {
-    const result = await execFileAsync(command, args);
+    const result = await execFileAsync2(command, args);
     help = `${result.stdout}
 ${result.stderr}`;
   } catch (error) {
@@ -3026,7 +3338,7 @@ async function pathExists(path) {
 }
 async function findCommandOnPath(command) {
   try {
-    const result = await execFileAsync("sh", ["-c", `command -v ${command}`]);
+    const result = await execFileAsync2("sh", ["-c", `command -v ${command}`]);
     const resolved = result.stdout.trim().split("\n")[0];
     return resolved.length > 0 ? resolved : void 0;
   } catch {
@@ -3034,7 +3346,7 @@ async function findCommandOnPath(command) {
   }
 }
 function resolveCandidatePath(root, candidatePath) {
-  return isAbsolute(candidatePath) ? candidatePath : resolve(root, candidatePath);
+  return isAbsolute2(candidatePath) ? candidatePath : resolve3(root, candidatePath);
 }
 function isNodeCompatible(version) {
   const major = Number(version.split(".")[0]);
@@ -3042,7 +3354,7 @@ function isNodeCompatible(version) {
 }
 async function detectPnpmVersion() {
   try {
-    const result = await execFileAsync("pnpm", ["--version"]);
+    const result = await execFileAsync2("pnpm", ["--version"]);
     return parsePnpmVersion(result.stdout);
   } catch {
     return void 0;
@@ -3090,7 +3402,7 @@ function readBinShimTarget(shimPath) {
   if (!content.startsWith("#!")) return void 0;
   const match = /\$basedir\/(\.\.(?:\/[^"'\s]+)+\.js)/.exec(content);
   if (!match) return void 0;
-  return resolve(dirname3(shimPath), match[1]);
+  return resolve3(dirname3(shimPath), match[1]);
 }
 function safeRealpath(path) {
   try {
@@ -3099,18 +3411,20 @@ function safeRealpath(path) {
     return path;
   }
 }
-var execFileAsync, KNOWN_COMMANDS;
+var execFileAsync2, KNOWN_COMMANDS;
 var init_cli_resolver = __esm({
   "src/cli-resolver.ts"() {
     "use strict";
     init_versioned_traceability();
     init_native_binding_diagnostics();
-    execFileAsync = promisify(execFile);
+    execFileAsync2 = promisify2(execFile2);
     KNOWN_COMMANDS = [
       "init",
       "scan",
       "validate",
       "query",
+      "impact",
+      "coverage",
       "context",
       "packet",
       "packet-prompt",
@@ -3130,82 +3444,9 @@ var init_cli_resolver = __esm({
   }
 });
 
-// src/git-changes.ts
-import { execFile as execFile2 } from "child_process";
-import { promisify as promisify2 } from "util";
-async function collectChangedPaths(root, options) {
-  const args = gitDiffArgs(options);
-  let stdout;
-  try {
-    ({ stdout } = await execFileAsync2("git", args, { cwd: root }));
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`Unable to collect git changed paths (${options.mode}): ${message}`);
-  }
-  const trackedChangedPaths = normalizeGitPathList(stdout);
-  const untrackedPaths = options.mode === "worktree" || options.mode === "staged" ? await collectUntrackedPaths(root) : [];
-  const changedPaths = options.mode === "worktree" ? sortUnique2([...trackedChangedPaths, ...untrackedPaths]) : trackedChangedPaths;
-  const unstagedPaths = options.mode === "staged" ? sortUnique2([...await collectUnstagedPaths(root), ...untrackedPaths]) : [];
-  const stagedUnstagedConflictPaths = options.mode === "staged" ? intersect(changedPaths, unstagedPaths) : [];
-  return {
-    root,
-    mode: options.mode,
-    base: options.base,
-    changedPaths,
-    unstagedPaths,
-    stagedUnstagedConflictPaths
-  };
-}
-function gitDiffArgs(options) {
-  const common = ["diff", "--name-only", "--diff-filter=ACDMRT"];
-  if (options.mode === "staged") {
-    return [...common, "--cached"];
-  }
-  if (options.mode === "worktree") {
-    return common;
-  }
-  if (!options.base) {
-    throw new Error("--base requires a ref when collecting base changed paths");
-  }
-  return [...common, `${options.base}...HEAD`];
-}
-async function collectUnstagedPaths(root) {
-  try {
-    const { stdout } = await execFileAsync2("git", ["diff", "--name-only", "--diff-filter=ACDMRT"], { cwd: root });
-    return normalizeGitPathList(stdout);
-  } catch {
-    return [];
-  }
-}
-async function collectUntrackedPaths(root) {
-  try {
-    const { stdout } = await execFileAsync2("git", ["ls-files", "--others", "--exclude-standard"], { cwd: root });
-    return normalizeGitPathList(stdout);
-  } catch {
-    return [];
-  }
-}
-function normalizeGitPathList(stdout) {
-  return sortUnique2(stdout.split(/\r?\n/).map((line) => line.trim().replace(/\\/g, "/").replace(/^\.\//, "")).filter((line) => line.length > 0 && !line.startsWith("../") && !line.startsWith("/")));
-}
-function intersect(left, right) {
-  const rightSet = new Set(right);
-  return left.filter((item) => rightSet.has(item));
-}
-function sortUnique2(items) {
-  return [...new Set(items)].sort((left, right) => left.localeCompare(right));
-}
-var execFileAsync2;
-var init_git_changes = __esm({
-  "src/git-changes.ts"() {
-    "use strict";
-    execFileAsync2 = promisify2(execFile2);
-  }
-});
-
 // src/git-hook-path.ts
 import { execFile as execFile3 } from "child_process";
-import { isAbsolute as isAbsolute2, resolve as resolve2 } from "path";
+import { isAbsolute as isAbsolute3, resolve as resolve4 } from "path";
 import { promisify as promisify3 } from "util";
 async function resolveGitHookPath(root, hookName) {
   const { stdout } = await execFileAsync3("git", [
@@ -3217,7 +3458,7 @@ async function resolveGitHookPath(root, hookName) {
   ]);
   const value = stdout.trim();
   if (!value) throw new Error(`Git returned an empty hook path for ${hookName}`);
-  return isAbsolute2(value) ? resolve2(value) : resolve2(root, value);
+  return isAbsolute3(value) ? resolve4(value) : resolve4(root, value);
 }
 var execFileAsync3;
 var init_git_hook_path = __esm({
@@ -4910,7 +5151,7 @@ import matter from "gray-matter";
 import yaml from "js-yaml";
 import { accessSync, constants as fsConstants, existsSync as existsSync3, statSync } from "fs";
 import { mkdir as mkdir4, readFile as readFile3, readdir as readdir3, writeFile as writeFile3 } from "fs/promises";
-import { basename as basename4, dirname as dirname5, extname, isAbsolute as isAbsolute3, join as join8, relative as relative3, resolve as resolve3 } from "path";
+import { basename as basename4, dirname as dirname5, extname, isAbsolute as isAbsolute4, join as join8, relative as relative4, resolve as resolve5 } from "path";
 function isTargetArtifactType(type) {
   return isPacketTargetType(type);
 }
@@ -4974,6 +5215,8 @@ async function loadConfig(root) {
     }
     validateE2eConfig(parsed.e2e);
   }
+  validateRelationSemanticsConfig(parsed.relationSemantics);
+  validateStatusViewsConfig(parsed.statusViews);
   const mergedE2e = parsed.e2e === void 0 ? DEFAULT_SCHEMA.e2e : {
     ...DEFAULT_SCHEMA.e2e,
     ...parsed.e2e,
@@ -4995,6 +5238,40 @@ async function loadConfig(root) {
     e2e: mergedE2e
   };
   return merged;
+}
+function validateRelationSemanticsConfig(value) {
+  if (value === void 0) return;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("Invalid relationSemantics: must be an object keyed by relation kind.");
+  }
+  for (const [kind, spec] of Object.entries(value)) {
+    if (!kind.trim() || typeof spec !== "object" || spec === null || Array.isArray(spec)) {
+      throw new Error(`Invalid relationSemantics.${kind}: must be an object.`);
+    }
+    if (typeof spec.label !== "string" || !spec.label.trim()) {
+      throw new Error(`Invalid relationSemantics.${kind}.label: must be a non-empty string.`);
+    }
+    if (!Array.isArray(spec.targetTypes) || spec.targetTypes.some((item) => typeof item !== "string" || !item.trim())) {
+      throw new Error(`Invalid relationSemantics.${kind}.targetTypes: must be an array of non-empty strings.`);
+    }
+    if (!Array.isArray(spec.fields) || spec.fields.length === 0 || spec.fields.some((item) => typeof item !== "string" || !item.trim())) {
+      throw new Error(`Invalid relationSemantics.${kind}.fields: must be a non-empty array of strings.`);
+    }
+    if (spec.partial !== void 0 && (typeof spec.partial !== "object" || spec.partial === null || typeof spec.partial.sectionField !== "string" || !spec.partial.sectionField.trim())) {
+      throw new Error(`Invalid relationSemantics.${kind}.partial.sectionField: must be a non-empty string.`);
+    }
+  }
+}
+function validateStatusViewsConfig(value) {
+  if (value === void 0) return;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("Invalid statusViews: must be an object keyed by status.");
+  }
+  for (const [status, bucket] of Object.entries(value)) {
+    if (!status.trim() || !["current", "planned", "history"].includes(bucket)) {
+      throw new Error(`Invalid statusViews.${status}: expected current, planned, or history.`);
+    }
+  }
 }
 function validateE2eConfig(e2e) {
   for (const field of ["report_uncovered_scenarios", "report_uncovered_features"]) {
@@ -5045,7 +5322,7 @@ function validateE2eConfig(e2e) {
       if (typeof runner.root !== "string" || !runner.root.trim()) {
         throw new Error(`Invalid e2e.runners[${runner.name}].root: must be a non-empty string.`);
       }
-      if (isAbsolute3(runner.root)) {
+      if (isAbsolute4(runner.root)) {
         throw new Error(`Invalid e2e.runners[${runner.name}].root: "${runner.root}" must not be an absolute path.`);
       }
       if (runner.root.replace(/\\/g, "/").split("/").includes("..")) {
@@ -5094,7 +5371,7 @@ function buildGraph(nodes, edges, diagnostics = [], root) {
   const seen = /* @__PURE__ */ new Set();
   const dedupedEdges = [];
   for (const e of edges) {
-    const key = `${e.from}	${e.to}	${e.kind}	${e.source}	${e.sourcePath}	${e.sourceLine}`;
+    const key = `${e.from}	${e.to}	${e.kind}	${e.source}	${e.sourcePath}	${e.sourceLine}	${JSON.stringify(e.attrs ?? {})}`;
     if (!seen.has(key)) {
       seen.add(key);
       dedupedEdges.push(e);
@@ -5131,12 +5408,13 @@ async function scanArtifacts(root, schema) {
       scannedFiles.set(file, type);
       const raw = await readFile3(join8(root, file), "utf-8");
       const parsed = parseFile(type, file, raw, config);
+      const semantic = parseConfiguredRelations(type, file, raw, parsed.nodes, config);
       nodes.push(...parsed.nodes);
-      edges.push(...parsed.edges);
-      scanDiagnostics.push(...parsed.diagnostics);
+      edges.push(...parsed.edges, ...semantic.edges);
+      scanDiagnostics.push(...parsed.diagnostics, ...semantic.diagnostics);
     }
   }
-  const absoluteRoot = isAbsolute3(root) ? root : resolve3(root);
+  const absoluteRoot = isAbsolute4(root) ? root : resolve5(root);
   const graph = buildGraph(nodes, edges, scanDiagnostics, absoluteRoot);
   return resolveMatrixEdges(graph);
 }
@@ -5173,7 +5451,7 @@ function resolveMatrixEdges(graph) {
   }
   const resolved = [];
   for (const e of graph.edges) {
-    if (e.to.startsWith("resolve:")) {
+    if (e.to.startsWith("resolve:") && e.from.startsWith("traceability-matrix-v2:")) {
       const bareId = e.to.slice("resolve:".length);
       if (/^ADR-\d+$/i.test(bareId)) continue;
       if (/\.\w+$/.test(bareId)) continue;
@@ -5230,9 +5508,33 @@ function validateGraph(graph, schema = DEFAULT_SCHEMA) {
         { node: node.uid }
       ));
     }
+    const external = getExternalEntryInfo(node);
+    if (external.external && (!external.targetProject || !external.targetRef)) {
+      issues.push(issue(
+        "EXTERNAL_REFERENCE_INCOMPLETE",
+        `External artifact ${node.uid} must declare target_project and target_ref`,
+        node.path,
+        node.line,
+        { node: node.uid }
+      ));
+    }
   }
+  const builtInRelationKinds = /* @__PURE__ */ new Set([
+    "references",
+    "covers",
+    "depends_on",
+    "implements",
+    "verifies",
+    "tests",
+    "contains",
+    "maps_to",
+    "external-reference"
+  ]);
   for (const edge2 of graph.edges) {
-    if (!byUid.has(edge2.to)) {
+    const sourceNode = byUid.get(edge2.from)?.[0];
+    const external = sourceNode ? getExternalEntryInfo(sourceNode) : { external: false };
+    const isExternalIdentityReference = edge2.kind === "external-reference" && external.external && external.targetProject && external.targetRef && edge2.to === `external:${external.targetProject}:${external.targetRef}`;
+    if (!byUid.has(edge2.to) && !isExternalIdentityReference) {
       issues.push(issue("DANGLING_REFERENCE", `Reference target ${edge2.to} does not exist`, edge2.sourcePath, edge2.sourceLine, {
         edge: edge2,
         severity: edge2.from.startsWith("e2e_test:") ? "warning" : "error"
@@ -5240,6 +5542,25 @@ function validateGraph(graph, schema = DEFAULT_SCHEMA) {
     }
     const fromType = edge2.from.split(":", 1)[0] ?? "";
     const toType = edge2.to.split(":", 1)[0] ?? "";
+    const semantics = schema.relationSemantics?.[edge2.kind];
+    if (!semantics && !builtInRelationKinds.has(edge2.kind)) {
+      issues.push(issue(
+        "UNKNOWN_RELATION_KIND",
+        `Relation kind ${edge2.kind} is not declared in relationSemantics`,
+        edge2.sourcePath,
+        edge2.sourceLine,
+        { edge: edge2, severity: "warning" }
+      ));
+    }
+    if (semantics && semantics.targetTypes.length > 0 && !edge2.to.startsWith("resolve:") && !semantics.targetTypes.includes(toType)) {
+      issues.push(issue(
+        "RELATION_KIND_TYPE_MISMATCH",
+        `Relation ${edge2.kind} from ${edge2.from} targets ${toType}, expected one of ${semantics.targetTypes.join(", ")}`,
+        edge2.sourcePath,
+        edge2.sourceLine,
+        { edge: edge2 }
+      ));
+    }
     if (schema.forbiddenEdges.some((rule) => rule.from === fromType && rule.to === toType && rule.kind === edge2.kind)) {
       issues.push(issue("FORBIDDEN_EDGE", `Forbidden ${fromType} -> ${toType} ${edge2.kind} relation`, edge2.sourcePath, edge2.sourceLine, { edge: edge2 }));
     }
@@ -5347,6 +5668,20 @@ function validateGraph(graph, schema = DEFAULT_SCHEMA) {
   issues.push(...graph.diagnostics ?? []);
   issues.sort((left, right) => left.code.localeCompare(right.code) || left.path.localeCompare(right.path) || left.line - right.line);
   return issues;
+}
+function getExternalEntryInfo(node) {
+  const attrs = node.attrs ?? {};
+  const data = typeof attrs.rawFrontmatter === "object" && attrs.rawFrontmatter !== null && !Array.isArray(attrs.rawFrontmatter) ? attrs.rawFrontmatter : attrs;
+  const external = data.external === true;
+  const targetProject = typeof data.target_project === "string" && data.target_project.trim() ? data.target_project.trim() : void 0;
+  const targetRef = typeof data.target_ref === "string" && data.target_ref.trim() ? data.target_ref.trim() : void 0;
+  const targetVersion = typeof data.target_version === "string" && data.target_version.trim() ? data.target_version.trim() : void 0;
+  return {
+    external,
+    ...targetProject ? { targetProject } : {},
+    ...targetRef ? { targetRef } : {},
+    ...targetVersion ? { targetVersion } : {}
+  };
 }
 function validateScenarioPrdLinksInternal(graph, schema, includeScanDiagnosedInvalid) {
   if (!schema.relationFields.scenario?.includes("\u5173\u8054\u529F\u80FD") || !schema.relationFields.feature?.includes("scenarios")) {
@@ -5577,6 +5912,54 @@ function validateCodeCommentScenarioFeatureConsistency(graph) {
   }
   return issues;
 }
+function statusTimeBucket(node, schema) {
+  return node?.status ? schema.statusViews?.[node.status] : void 0;
+}
+function resolveNodeTimeView(node, graph, schema = DEFAULT_SCHEMA) {
+  for (const candidate of graph.edges) {
+    if (candidate.kind !== "supersedes" || candidate.to !== node.uid) continue;
+    const supersedingNode = graph.nodes.find((item) => item.uid === candidate.from);
+    if (statusTimeBucket(supersedingNode, schema) === "current") {
+      return { bucket: "history", basis: `full-supersede-target:${candidate.from}` };
+    }
+  }
+  if (!node.status) return { bucket: "uncategorized", basis: "no-status" };
+  const bucket = schema.statusViews?.[node.status];
+  return bucket ? { bucket, basis: `status:${node.status}` } : { bucket: "uncategorized", basis: `status-not-mapped:${node.status}` };
+}
+function filterGraphByView(graph, view, schema = DEFAULT_SCHEMA) {
+  return filterSubgraphByView(graph, view, schema, graph);
+}
+function filterSubgraphByView(graph, view, schema, basisGraph) {
+  if (view === void 0 || view === "all") {
+    return { graph, excluded: [], partialSupersedes: [] };
+  }
+  const excluded = [];
+  const included = /* @__PURE__ */ new Set();
+  for (const node of graph.nodes) {
+    const resolved = resolveNodeTimeView(node, basisGraph, schema);
+    if (resolved.bucket === view) included.add(node.uid);
+    else excluded.push({ uid: node.uid, ...resolved });
+  }
+  const nodes = graph.nodes.filter((node) => included.has(node.uid));
+  const edges = graph.edges.filter((candidate) => included.has(candidate.from) && included.has(candidate.to));
+  const partialSupersedes = basisGraph.edges.flatMap((candidate) => {
+    if (candidate.kind !== "partial-supersedes" || !included.has(candidate.to)) return [];
+    const supersedingNode = basisGraph.nodes.find((node) => node.uid === candidate.from);
+    if (statusTimeBucket(supersedingNode, schema) !== "current") return [];
+    const sections = toArray(candidate.attrs?.sections).map((item) => String(item).trim()).filter(Boolean);
+    if (sections.length === 0) return [];
+    return [{
+      targetUid: candidate.to,
+      supersededBy: candidate.from,
+      sections,
+      sourcePath: candidate.sourcePath,
+      sourceLine: candidate.sourceLine
+    }];
+  }).sort((left, right) => left.targetUid.localeCompare(right.targetUid) || left.supersededBy.localeCompare(right.supersededBy));
+  excluded.sort((left, right) => left.uid.localeCompare(right.uid));
+  return { graph: { ...graph, nodes, edges }, excluded, partialSupersedes };
+}
 function queryGraph(graph, options) {
   const depth = options.depth ?? 1;
   const start = resolveQueryStartUid(graph, options.from ?? options.to ?? "");
@@ -5603,7 +5986,17 @@ function queryGraph(graph, options) {
   }
   const nodes = graph.nodes.filter((node) => selected.has(node.uid));
   const edges = graph.edges.filter((edge2) => selected.has(edge2.from) && selected.has(edge2.to));
-  return { ...graph, nodes, edges };
+  const result = { ...graph, nodes, edges };
+  const filtered = filterSubgraphByView(result, options.view, options.schema ?? DEFAULT_SCHEMA, graph);
+  if (options.view === void 0 || options.view === "all") return filtered.graph;
+  return {
+    ...filtered.graph,
+    viewSelection: {
+      view: options.view,
+      excluded: filtered.excluded,
+      partialSupersedes: filtered.partialSupersedes
+    }
+  };
 }
 function renderMermaid(graph) {
   const lines = ["graph LR"];
@@ -5659,17 +6052,18 @@ async function writeGraphCache(root, graph) {
         kind TEXT NOT NULL,
         source TEXT NOT NULL,
         source_path TEXT NOT NULL,
-        source_line INTEGER NOT NULL
+        source_line INTEGER NOT NULL,
+        attrs TEXT
       );
     `);
     const insertNode = db.prepare("INSERT INTO nodes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
-    const insertEdge = db.prepare("INSERT INTO edges VALUES (?, ?, ?, ?, ?, ?)");
+    const insertEdge = db.prepare("INSERT INTO edges VALUES (?, ?, ?, ?, ?, ?, ?)");
     const tx = db.transaction(() => {
       for (const node of graph.nodes) {
         insertNode.run(node.uid, node.type, node.code, node.title, node.path, node.line, node.status ?? null, JSON.stringify(node.attrs ?? {}), JSON.stringify(node.aliases ?? []));
       }
       for (const edge2 of graph.edges) {
-        insertEdge.run(edge2.from, edge2.to, edge2.kind, edge2.source, edge2.sourcePath, edge2.sourceLine);
+        insertEdge.run(edge2.from, edge2.to, edge2.kind, edge2.source, edge2.sourcePath, edge2.sourceLine, JSON.stringify(edge2.attrs ?? {}));
       }
     });
     tx();
@@ -5854,6 +6248,117 @@ function parseGenericMarkdown(type, path, raw, schema) {
   };
   return { nodes: [node], edges, diagnostics };
 }
+function parseConfiguredRelations(type, path, raw, nodes, schema) {
+  const data = matter(raw).data;
+  const frontmatterCode = typeof data.id === "string" ? data.id.trim() : "";
+  const sourceNode = nodes.find((node) => node.code === frontmatterCode) ?? (nodes.length === 1 ? nodes[0] : void 0);
+  if (!sourceNode) return { edges: [], diagnostics: [] };
+  const sourceUid = toUid(type, sourceNode.code);
+  const edges = [];
+  const diagnostics = [];
+  for (const [kind, spec] of Object.entries(schema.relationSemantics ?? {})) {
+    for (const field of spec.fields) {
+      for (const value of toArray(data[field])) {
+        const parsed = parseConfiguredRelationTarget(value, spec, schema);
+        if (!parsed?.code) continue;
+        const matchingTargetTypes = parsed.targetType ? [] : relationTargetTypeMatches(parsed.code, spec.targetTypes, schema);
+        const targetType = parsed.targetType ?? inferRelationTargetType(parsed.code, spec.targetTypes, schema);
+        if (!parsed.targetType && matchingTargetTypes.length > 1) {
+          diagnostics.push(issue(
+            "AMBIGUOUS_RELATION_TARGET",
+            `${sourceUid} relation ${kind} target "${parsed.code}" matches ${matchingTargetTypes.join(", ")}; use a qualified type:id reference`,
+            path,
+            1,
+            { node: sourceUid }
+          ));
+        }
+        const targetUid = targetType ? toUid(targetType, parsed.code) : `resolve:${parsed.code}`;
+        if (targetType) {
+          const pattern = schema.idPatterns[targetType];
+          if (pattern && !new RegExp(pattern).test(parsed.code)) {
+            diagnostics.push(issue(
+              "FORMAT_ERROR",
+              `${sourceUid} has invalid ${targetType} reference "${parsed.code}" in field ${field} (expected ${pattern})`,
+              path,
+              1,
+              { node: sourceUid }
+            ));
+          }
+        }
+        edges.push({
+          ...edge(sourceUid, targetUid, kind, "frontmatter", path, 1),
+          ...parsed.sections.length > 0 ? { attrs: { sections: parsed.sections } } : {}
+        });
+      }
+    }
+  }
+  const external = getExternalEntryInfo({
+    ...sourceNode,
+    uid: sourceUid
+  });
+  if (external.external && external.targetProject && external.targetRef) {
+    edges.push({
+      ...edge(sourceUid, `external:${external.targetProject}:${external.targetRef}`, "external-reference", "frontmatter", path, 1),
+      attrs: {
+        targetProject: external.targetProject,
+        targetRef: external.targetRef,
+        ...external.targetVersion ? { targetVersion: external.targetVersion } : {}
+      }
+    });
+  }
+  return { edges, diagnostics };
+}
+function parseConfiguredRelationTarget(value, spec, schema) {
+  if (typeof value === "string" || typeof value === "number") {
+    const raw = String(value).trim();
+    if (!raw) return void 0;
+    const qualified = splitQualifiedTarget(raw, schema);
+    return { code: qualified?.code ?? raw, targetType: qualified?.type, sections: [] };
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return void 0;
+  const record = value;
+  const sections = spec.partial ? toArray(record[spec.partial.sectionField]).map((item) => String(item).trim()).filter(Boolean) : [];
+  const directTarget = record.target;
+  if (typeof directTarget === "string" || typeof directTarget === "number") {
+    const raw = String(directTarget).trim();
+    const qualified = splitQualifiedTarget(raw, schema);
+    return raw ? { code: qualified?.code ?? raw, targetType: qualified?.type, sections } : void 0;
+  }
+  for (const [key, target] of Object.entries(record)) {
+    if (key === spec.partial?.sectionField) continue;
+    const targetType = resolveArtifactTypeName(schema, key);
+    if (!targetType || spec.targetTypes.length > 0 && !spec.targetTypes.includes(targetType)) continue;
+    if (typeof target === "string" || typeof target === "number") {
+      const code = String(target).trim();
+      if (code) return { code, targetType, sections };
+    }
+    if (typeof target === "object" && target !== null && !Array.isArray(target)) {
+      const nested = target;
+      const code = String(nested.id ?? nested.target ?? "").trim();
+      const nestedSections = spec.partial ? toArray(nested[spec.partial.sectionField]).map((item) => String(item).trim()).filter(Boolean) : [];
+      if (code) return { code, targetType, sections: nestedSections.length > 0 ? nestedSections : sections };
+    }
+  }
+  return void 0;
+}
+function splitQualifiedTarget(value, schema) {
+  const separator = value.indexOf(":");
+  if (separator <= 0) return void 0;
+  const type = resolveArtifactTypeName(schema, value.slice(0, separator));
+  const code = value.slice(separator + 1).trim();
+  return type && code ? { type, code } : void 0;
+}
+function inferRelationTargetType(code, targetTypes, schema) {
+  const matches = relationTargetTypeMatches(code, targetTypes, schema);
+  if (matches.length === 1) return matches[0];
+  return matches.length === 0 && targetTypes.length === 1 ? targetTypes[0] : void 0;
+}
+function relationTargetTypeMatches(code, targetTypes, schema) {
+  return targetTypes.filter((targetType) => {
+    const pattern = schema.idPatterns[targetType];
+    return pattern ? new RegExp(pattern).test(code) : false;
+  });
+}
 function parseFeature(path, raw) {
   const parsed = matter(raw);
   const data = parsed.data;
@@ -5888,14 +6393,16 @@ function parseFeature(path, raw) {
 function parseScenarios(path, raw, schema = DEFAULT_SCHEMA) {
   const lines = raw.split(/\r?\n/);
   const codeLines = markdownCodeLineMask(lines);
+  const scenarioIdPattern = new RegExp(schema.idPatterns.scenario ?? DEFAULT_SCHEMA.idPatterns.scenario);
   const starts = [];
   lines.forEach((line, index) => {
     if (codeLines[index]) {
       return;
     }
-    const match = /^#{2,3}\s+(S-\d+[a-z]?)\s*[:：]\s*(.+?)\s*$/.exec(line);
-    if (match) {
-      starts.push({ code: match[1], title: match[2], line: index + 1, index });
+    const match = /^#{2,3}\s+(.+?)\s*[:：]\s*(.+?)\s*$/.exec(line);
+    const code = match?.[1].trim();
+    if (match && code && scenarioIdPattern.test(code)) {
+      starts.push({ code, title: match[2], line: index + 1, index });
     }
   });
   const nodes = [];
@@ -7112,9 +7619,9 @@ function parseImplementationBlueprint(path, raw) {
   }
   return { nodes, edges };
 }
-function frontmatterEdges(path, featureCode, value, targetType, kind, normalize = (target) => String(target).trim()) {
+function frontmatterEdges(path, featureCode, value, targetType, kind, normalize2 = (target) => String(target).trim()) {
   return toArray(value).flatMap((target) => {
-    const code = normalize(target);
+    const code = normalize2(target);
     if (!code) {
       return [];
     }
@@ -7424,7 +7931,7 @@ async function validateExecutableTraceability(root, config) {
   const mdBatches = /* @__PURE__ */ new Set();
   for (const filePath of e2eFiles) {
     const raw = await readFile3(filePath, "utf-8");
-    const relPath = relative3(root, filePath).split("\\").join("/");
+    const relPath = relative4(root, filePath).split("\\").join("/");
     const parsed = matter(raw);
     const data = parsed.data;
     const batch = String(data.test_batch ?? basename4(filePath, extname(filePath))).trim();
@@ -8095,7 +8602,7 @@ function detectTestLevel(specFile, content) {
 }
 function resolveExecutableRefFile(refFile, allFiles) {
   const normalized = refFile.replace(/\\/g, "/").replace(/^\.\//, "");
-  if (!normalized || isAbsolute3(refFile) || normalized.split("/").includes("..")) {
+  if (!normalized || isAbsolute4(refFile) || normalized.split("/").includes("..")) {
     return void 0;
   }
   if (allFiles.includes(normalized)) {
@@ -8505,6 +9012,13 @@ function resolveArtifactContext(graph, opts) {
   const maxPerCategory = opts.maxPerCategory ?? 20;
   const universalBaseline = opts.universalBaseline ?? true;
   const root = opts.root ?? graph.root;
+  const selectedView = opts.view === void 0 || opts.view === "all" ? void 0 : filterGraphByView(graph, opts.view, opts.schema ?? DEFAULT_SCHEMA);
+  if (selectedView) graph = selectedView.graph;
+  const viewSelection = selectedView ? {
+    view: opts.view,
+    excluded: selectedView.excluded,
+    partialSupersedes: selectedView.partialSupersedes
+  } : void 0;
   const legacyCount = [opts.feature, opts.scenario, opts.decision, opts.design, opts.e2e_test].filter(Boolean).length;
   if (opts.target && legacyCount > 0) {
     return {
@@ -8519,7 +9033,8 @@ function resolveArtifactContext(graph, opts) {
         message: "\u4E92\u65A5\uFF1Atarget \u4E0E --feature/--scenario/--decision/--design/--e2e-test \u4E0D\u80FD\u540C\u65F6\u4F7F\u7528",
         suggestedAction: "\u53EA\u6307\u5B9A\u4E00\u79CD target \u5F62\u5F0F"
       }],
-      omitted: []
+      omitted: [],
+      ...viewSelection ? { viewSelection } : {}
     };
   }
   if (legacyCount > 1) {
@@ -8535,7 +9050,8 @@ function resolveArtifactContext(graph, opts) {
         message: "Only one of --feature, --scenario, --decision, --design, or --e2e-test may be specified",
         suggestedAction: "\u53EA\u6307\u5B9A\u4E00\u4E2A --feature/--scenario/--decision/--design/--e2e-test"
       }],
-      omitted: []
+      omitted: [],
+      ...viewSelection ? { viewSelection } : {}
     };
   }
   let targetType;
@@ -8572,7 +9088,8 @@ function resolveArtifactContext(graph, opts) {
         message: "No target specified (use --feature, --scenario, --decision, --design, or --e2e-test)",
         suggestedAction: "\u521B\u5EFA\u6587\u4EF6\u6216\u68C0\u67E5 ID \u62FC\u5199"
       }],
-      omitted: []
+      omitted: [],
+      ...viewSelection ? { viewSelection } : {}
     };
   }
   const targetUid = toUid(targetType, targetId);
@@ -8590,7 +9107,8 @@ function resolveArtifactContext(graph, opts) {
         message: `Target artifact ${targetUid} not found in graph`,
         suggestedAction: "\u521B\u5EFA\u6587\u4EF6\u6216\u68C0\u67E5 ID \u62FC\u5199"
       }],
-      omitted: []
+      omitted: [],
+      ...viewSelection ? { viewSelection } : {}
     };
   }
   const related = /* @__PURE__ */ new Map();
@@ -8604,7 +9122,7 @@ function resolveArtifactContext(graph, opts) {
           related.set(n.uid, { node: n, reason: `${e.kind} \u2192 ${n.uid}` });
         }
       }
-      if (!graph.nodes.some((n) => n.uid === e.to) && !related.has(e.to)) {
+      if (e.kind !== "external-reference" && !graph.nodes.some((n) => n.uid === e.to) && !related.has(e.to)) {
         const msg = `Unresolved reference from ${e.from}: ${e.to}`;
         if (!missing.includes(msg)) {
           missing.push(msg);
@@ -8832,7 +9350,8 @@ function resolveArtifactContext(graph, opts) {
     missing,
     missingDetails,
     omitted,
-    baselinePolicy: universalBaseline
+    baselinePolicy: universalBaseline,
+    ...viewSelection ? { viewSelection } : {}
   };
 }
 function formatContextMarkdown(manifest) {
@@ -8896,6 +9415,17 @@ function formatContextMarkdown(manifest) {
     }
     lines.push("");
   }
+  if (manifest.viewSelection) {
+    lines.push(`## Time view: ${manifest.viewSelection.view}`);
+    lines.push("");
+    for (const item of manifest.viewSelection.excluded) {
+      lines.push(`- Excluded \`${item.uid}\` (${item.bucket}; ${item.basis})`);
+    }
+    for (const item of manifest.viewSelection.partialSupersedes) {
+      lines.push(`- \`${item.targetUid}\`: sections ${item.sections.map((section) => `\`${section}\``).join(", ")} are superseded by \`${item.supersededBy}\` (${item.sourcePath}:${item.sourceLine})`);
+    }
+    lines.push("");
+  }
   return lines.join("\n");
 }
 var TARGET_ARTIFACT_TYPES, NON_TARGET_ROLES, DEFAULT_SCHEMA, EMPTY_RELATION_FIELD_VALUES, VALID_TC_STATUSES, VALID_CHAIN_TYPES, DEPRECATED_CHAIN_TYPE_ALIASES, CONTEXT_CATEGORIES, TIER_ORDER;
@@ -8908,6 +9438,8 @@ var init_index = __esm({
     init_file_walker();
     init_packet_constants();
     init_target_selector();
+    init_impact();
+    init_coverage();
     init_packet_assembler();
     init_packet_audit();
     init_packet_validator();
@@ -8951,7 +9483,7 @@ var init_index = __esm({
       },
       relationFields: {
         feature: ["scenarios", "decisions", "depends_on", "design_docs"],
-        scenario: ["\u5173\u8054\u529F\u80FD", "\u5173\u8054\u51B3\u7B56"],
+        scenario: ["\u5173\u8054\u529F\u80FD", "\u5173\u8054\u51B3\u7B56", "\u5173\u8054\u5B9E\u4F53"],
         design: ["related_features", "related_scenarios", "related_decisions"],
         test: ["@scenario", "@feature", "@entity", "@decision"],
         e2e_test: ["test_batch", "scope", "ac_coverage", "related_scenarios", "related_decisions", "related_entities", "\u8986\u76D6\u573A\u666F", "\u8986\u76D6\u529F\u80FD"],
@@ -9213,7 +9745,7 @@ __export(refactor_id_exports, {
 });
 import { chmod, readFile as readFile4, rename as rename2, rm, readdir as readdir4, stat, writeFile as writeFile5 } from "fs/promises";
 import { randomBytes } from "crypto";
-import { basename as basename5, dirname as dirname6, join as join10, relative as relative4 } from "path";
+import { basename as basename5, dirname as dirname6, join as join10, relative as relative5 } from "path";
 import yaml2 from "js-yaml";
 function escapeRegExp2(value) {
   return value.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&");
@@ -9397,7 +9929,7 @@ async function walkTextFiles(root) {
       } else if (entry.isFile()) {
         const ext = entry.name.includes(".") ? `.${entry.name.split(".").slice(-1)[0]}` : "";
         if (TEXT_EXTENSIONS.has(ext.toLowerCase())) {
-          found.push(relative4(root, full).replace(/\\/g, "/"));
+          found.push(relative5(root, full).replace(/\\/g, "/"));
         }
       }
     }
@@ -9829,7 +10361,7 @@ __export(cli_exports, {
 import yaml3 from "js-yaml";
 import { realpathSync as realpathSync2 } from "fs";
 import { access as access2, mkdir as mkdir6, readFile as readFile5, writeFile as writeFile6 } from "fs/promises";
-import { dirname as dirname7, isAbsolute as isAbsolute4, join as join11 } from "path";
+import { dirname as dirname7, isAbsolute as isAbsolute5, join as join11 } from "path";
 import { fileURLToPath as fileURLToPath2 } from "url";
 async function runCli(argv, io = {}) {
   const parsed = parseArgs(argv);
@@ -9987,18 +10519,73 @@ async function runCli(argv, io = {}) {
       case "query": {
         const gate = sqliteBindingGate();
         if (gate !== void 0) return gate;
-        const graph = await scanArtifacts(root);
+        const config = await loadConfig(root);
+        const view = parseTimeViewFlag(parsed.flags.view, err);
+        if (view === null) return 2;
+        const graph = await scanArtifacts(root, config);
         const result = queryGraph(graph, {
-          from: typeof parsed.flags.from === "string" ? parsed.flags.from : void 0,
+          from: typeof parsed.flags.from === "string" ? parsed.flags.from : parsed.positional[0],
           to: typeof parsed.flags.to === "string" ? parsed.flags.to : void 0,
-          depth: typeof parsed.flags.depth === "string" ? Number(parsed.flags.depth) : void 0
+          depth: typeof parsed.flags.depth === "string" ? Number(parsed.flags.depth) : void 0,
+          view,
+          schema: config
         });
         if (parsed.flags.format === "json") {
           out(`${JSON.stringify(result, null, 2)}
 `);
         } else {
-          out(result.nodes.map((node) => `${node.uid} ${node.path}:${node.line}`).join("\n") + "\n");
+          const lines = result.nodes.map((node) => `${node.uid} ${node.path}:${node.line}`);
+          if (result.viewSelection) {
+            lines.push(...result.viewSelection.excluded.map((item) => `excluded ${item.uid} ${item.bucket} ${item.basis}`));
+            lines.push(...result.viewSelection.partialSupersedes.map((item) => `partial-supersede ${item.targetUid} sections=${item.sections.join(",")} by=${item.supersededBy} ${item.sourcePath}:${item.sourceLine}`));
+          }
+          out(`${lines.join("\n")}
+`);
         }
+        return 0;
+      }
+      case "impact": {
+        if (parsed.flags.base === true || parsed.flags.paths === true || parsed.flags.worktree !== void 0 && parsed.flags.worktree !== true || parsed.flags.staged !== void 0 && parsed.flags.staged !== true) {
+          err("Impact mode flags --base and --paths require values; --worktree and --staged do not accept values.\n");
+          return 2;
+        }
+        const modeFlags = [
+          parsed.flags.worktree === true ? "worktree" : void 0,
+          parsed.flags.staged === true ? "staged" : void 0,
+          typeof parsed.flags.base === "string" ? "base" : void 0,
+          typeof parsed.flags.paths === "string" ? "paths" : void 0
+        ].filter((value) => value !== void 0);
+        if (modeFlags.length > 1) {
+          err("Choose only one impact mode: --worktree, --staged, --base <ref>, or --paths <p1,p2>.\n");
+          return 2;
+        }
+        const mode = modeFlags[0] ?? "worktree";
+        const format = typeof parsed.flags.format === "string" ? parsed.flags.format : "markdown";
+        if (!["json", "markdown"].includes(format)) {
+          err(`Invalid --format: "${format}". Allowed values: json, markdown
+`);
+          return 2;
+        }
+        const report = await computeImpact(root, {
+          mode,
+          ...mode === "base" ? { base: parsed.flags.base } : {},
+          ...mode === "paths" ? { paths: parsed.flags.paths.split(",") } : {}
+        });
+        out(format === "json" ? `${JSON.stringify(report, null, 2)}
+` : renderImpactMarkdown(report));
+        return 0;
+      }
+      case "coverage": {
+        const format = typeof parsed.flags.format === "string" ? parsed.flags.format : "markdown";
+        if (!["json", "markdown"].includes(format)) {
+          err(`Invalid --format: "${format}". Allowed values: json, markdown
+`);
+          return 2;
+        }
+        const releaseInput = typeof parsed.flags["release-input"] === "string" ? await readReleaseInput(root, parsed.flags["release-input"]) : void 0;
+        const report = await computeCoverageBoundary(root, { releaseInput });
+        out(format === "json" ? `${JSON.stringify(report, null, 2)}
+` : renderCoverageBoundaryMarkdown(report));
         return 0;
       }
       case "render": {
@@ -10037,6 +10624,8 @@ async function runCli(argv, io = {}) {
           return 1;
         }
         const contextMode = typeof parsed.flags.mode === "string" ? parsed.flags.mode : "implementation";
+        const view = parseTimeViewFlag(parsed.flags.view, err);
+        if (view === null) return 2;
         if (contextMode !== "implementation" && contextMode !== "full") {
           err(`Invalid --mode: "${parsed.flags.mode}". Allowed values: implementation, full
 `);
@@ -10052,13 +10641,15 @@ async function runCli(argv, io = {}) {
             return 1;
           }
         }
-        const graph = await scanArtifacts(root);
+        const graph = await scanArtifacts(root, config);
         const manifest = resolveArtifactContext(graph, {
           target: resolvedTarget,
           mode: contextMode,
           maxPerCategory,
           universalBaseline: config.context?.universal_baseline,
-          root
+          root,
+          view,
+          schema: config
         });
         if (parsed.flags.format === "json") {
           out(`${JSON.stringify(manifest, null, 2)}
@@ -10080,6 +10671,8 @@ async function runCli(argv, io = {}) {
           return 1;
         }
         const packetMode = typeof parsed.flags.mode === "string" ? parsed.flags.mode : "implementation";
+        const view = parseTimeViewFlag(parsed.flags.view, err);
+        if (view === null) return 2;
         if (packetMode !== "implementation" && packetMode !== "full") {
           err(`Invalid --mode: "${parsed.flags.mode}". Allowed values: implementation, full
 `);
@@ -10095,13 +10688,15 @@ async function runCli(argv, io = {}) {
             return 1;
           }
         }
-        const graph = await scanArtifacts(root);
+        const graph = await scanArtifacts(root, config);
         const manifest = resolveArtifactContext(graph, {
           target: resolvedTarget,
           mode: packetMode,
           maxPerCategory: packetMaxPerCategory,
           universalBaseline: config.context?.universal_baseline,
-          root
+          root,
+          view,
+          schema: config
         });
         if (manifest.missing.length > 0) {
           err("Missing artifacts detected \u2014 cannot generate packet:\n");
@@ -10803,7 +11398,7 @@ async function runCli(argv, io = {}) {
           err("Usage: artifact-graph validate-review-result --file <path> [--format json]\n");
           return 1;
         }
-        const resolvedPath = isAbsolute4(filePath) ? filePath : join11(root, filePath);
+        const resolvedPath = isAbsolute5(filePath) ? filePath : join11(root, filePath);
         let content;
         try {
           content = await readFile5(resolvedPath, "utf-8");
@@ -11230,6 +11825,31 @@ function parseArgs(argv) {
   }
   return { command, positional, flags };
 }
+function parseTimeViewFlag(value, err) {
+  if (value === void 0) return void 0;
+  if (typeof value !== "string" || !["current", "planned", "history", "all"].includes(value)) {
+    err(`Invalid --view: "${String(value)}". Allowed values: current, planned, history, all
+`);
+    return null;
+  }
+  return value;
+}
+async function readReleaseInput(root, value) {
+  if (value.includes(",")) return value.split(",");
+  const candidate = isAbsolute5(value) ? value : join11(root, value);
+  try {
+    await access2(candidate);
+  } catch {
+    return [value];
+  }
+  const raw = await readFile5(candidate, "utf-8");
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed) && parsed.every((item) => typeof item === "string")) return parsed;
+  } catch {
+  }
+  return raw.split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !line.startsWith("#"));
+}
 function helpText() {
   return `artifact-graph <command>
 
@@ -11237,14 +11857,21 @@ Commands:
   init
   scan
   validate [--format json] [--warning-only] [--include scenario-prd-links,e2e-coverage]
-  query --from <code> [--format json]
-  context (--target <type>:<id> | --feature <id> | --scenario <id> | --decision <id> | --design <id> | --e2e-test <id>) [--mode full|implementation] [--max-per-category <n>] [--format json]
-  packet (--target <type>:<id> | --feature <id> | --scenario <id> | --decision <id> | --design <id> | --e2e-test <id>) [--mode full|implementation] [--max-per-category <n>] [--format json|markdown] [--out <path>] [--no-validate]
+  query [<target> | --from <code>] [--to <code>] [--depth <n>] [--view current|planned|history|all] [--format json]
+  context (--target <type>:<id> | --feature <id> | --scenario <id> | --decision <id> | --design <id> | --e2e-test <id>) [--mode full|implementation] [--max-per-category <n>] [--view current|planned|history|all] [--format json]
+  packet (--target <type>:<id> | --feature <id> | --scenario <id> | --decision <id> | --design <id> | --e2e-test <id>) [--mode full|implementation] [--max-per-category <n>] [--view current|planned|history|all] [--format json|markdown] [--out <path>] [--no-validate]
+  impact [--worktree|--staged|--base <ref>|--paths <p1,p2>] [--format json|markdown]
+      Read-only impact report with direct/related artifacts and explicit unmapped path categories.
+  coverage [--release-input <file-or-comma-list>] [--format json|markdown]
+      Reports graph and scan boundaries. Declarations and file lists never imply behavior or release success.
   packet-prompt (--target <type>:<id> | --feature <id> | --scenario <id> | --decision <id> | --design <id> | --e2e-test <id> | --packet <path>) [--max-chars <n>] [--format markdown] [--out <path>]
   packet-audit (--targets-file <path> | --discover) [--out-dir <path>] [--limit <n>] [--format json|markdown] [--mode full|implementation] [--max-per-category <n>] [--summary-only] [--sample-targets <type:id,...>] [--summary-detail full|compact]
   packet-prompt-audit (--targets-file <path> | --discover) [--out-dir <path>] [--format json|markdown] [--max-chars <n>] [--limit <n>] [--summary-only] [--summary-detail full|compact]
   version-index [--format json] [--out <path>]
   version-lock audit [--format json|markdown] [--warning-only] [--strict-missing-lock] [--lock-path <path>]
+      Checks declared relationships, not complete release-file or artifact coverage.
+      Source annotations: standalone // @feature A1 or <!-- @feature A1 -->;
+      configure types.test.paths. See INSTALL.md: Code Traceability And Coverage Boundaries.
   version-lock update --target <type:id> --source <path> [--verified-by <path,path>] [--lock-path <path>]
   version-lock bootstrap [--force] [--lock-path <path>]
   version-lock refresh (--all | --changed-only (--staged | --worktree | --base <ref>)) [--remove-orphans] [--format json|markdown] [--lock-path <path>]
@@ -11286,6 +11913,8 @@ function isCliEntrypoint(argvPath) {
 var init_cli = __esm({
   "src/cli.ts"() {
     init_index();
+    init_impact();
+    init_coverage();
     init_contract_kernel();
     init_target_selector();
     init_packet_audit();

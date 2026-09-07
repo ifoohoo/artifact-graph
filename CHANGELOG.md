@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+## 0.11.0
+
+### Added
+
+- Added configuration-driven relation semantics and current/planned/history graph views, including
+  partial-replacement section annotations and protection against planned replacements invalidating
+  the current baseline.
+- Added read-only `impact` and `coverage` reports. Coverage exposes graph and scan boundaries plus
+  raw behavior/release references without inferring successful verification or publication.
+
+### Fixed
+
+- Clarified source annotation syntax, scan scope, missing-lock counting and release-coverage
+  limits in the installation guide and README. CLI help and Markdown version-lock audits now
+  explain that passing a strict audit, including a zero-lock result, does not prove full
+  implementation coverage. Lock semantics, JSON output and exit-code policies are unchanged.
+
+### Changed
+
+- Version lockstep with `artifact-chain-assistant` 0.11.0.
+
 ## 0.10.0
 
 ### Added

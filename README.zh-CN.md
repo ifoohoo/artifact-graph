@@ -60,10 +60,32 @@ npx artifact-graph version-lock audit --root . --strict-missing-lock
 
 ## 常见工作流
 
+### 代码与制品追溯：先确认扫描范围
+
+源码可用独占一行的 `// @feature A1` 声明实现关系；技能 Markdown 可用
+`<!-- @feature A1 -->`。`A1` 是制品 ID，命令行的 `feature:A1` 写法不能直接放在注释值中。
+文件必须纳入 `types.test.paths`；该字段也用于实现文件，默认不会扫描所有 `src/` 或 `skills/`。
+Python 的 `#` 注释目前不受支持。
+
+> `version-lock audit --strict-missing-lock` 只检查已发现关系的锁与新鲜度。
+> 没有注释的文件、没有关系的制品可能不产生缺锁问题；零锁也可能审计通过。
+> 它不能证明“每个发布文件都有制品来源、每个制品都有实现或豁免”。
+
+详细语法、扫描配置、`implements`（实现）与 `verifies`（验证）的分类、豁免边界及多项目隔离，
+见 [代码追溯接入说明](INSTALL.md#code-traceability-and-coverage-boundaries)。先确认索引中确有预期节点和关系，
+再运行 `refresh --all` 建立锁；不存在 `version-lock update --all` 操作。
+
+### 日常命令
+
 - 用 `artifact-graph init` 生成或检查项目制品图配置。
 - 用 `artifact-graph validate` 校验制品之间的链接。
 - 用 `artifact-graph validate-review-result --file <path>` 校验 Review Result Protocol v1.0 文档。
 - 用 `artifact-graph context` 或 `artifact-graph packet` 构建实现上下文。
+- 项目通过 `statusViews` 映射状态后，可在 `query`、`context` 或 `packet` 上增加
+  `--view current|planned|history|all`；不传参数时仍返回兼容旧版的未过滤图。
+- 用 `artifact-graph impact --worktree` 只读查看变更影响，不刷新版本锁。
+- 用 `artifact-graph coverage` 报告图健康、扫描映射以及行为与发布证据的评估边界；
+  该命令不推断验证成功或已经发布。
 - 用 `artifact-graph version-lock refresh` 和 `audit` 保持追溯关系及时更新。
 - 版本锁覆盖实现/验证边（`locks`）和制品间关系（`artifactRelations`）。旧版 1.0 锁文件缺少
   `artifactRelations` 时视为空数组；首次启用时执行一次 `refresh --all` 建立完整关系基线。

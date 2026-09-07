@@ -48,6 +48,95 @@ declare function parseTargetSelector(value: string): ArtifactTarget;
  */
 declare function resolveCliTarget(flags: Record<string, string | boolean>, schema: ArtifactSchema): ArtifactTarget;
 
+type ImpactMode = 'worktree' | 'staged' | 'base' | 'paths';
+interface ImpactOptions {
+    mode?: ImpactMode;
+    base?: string;
+    paths?: string[];
+    schema?: ArtifactSchema;
+}
+interface ImpactNodeRef {
+    uid: string;
+    type: string;
+    code: string;
+    title: string;
+    path: string;
+}
+interface ImpactEdgeRef {
+    from: string;
+    to: string;
+    kind: string;
+    sourcePath: string;
+    sourceLine?: number;
+    attrs?: Record<string, unknown>;
+}
+interface ImpactReport {
+    schemaVersion: '1.0';
+    root: string;
+    mode: ImpactMode;
+    base?: string;
+    changedPaths: string[];
+    directNodes: ImpactNodeRef[];
+    relatedNodes: ImpactNodeRef[];
+    affectedEdges: ImpactEdgeRef[];
+    scopedUnresolvedPaths: string[];
+    graphControlPaths: string[];
+    unmappedPaths: string[];
+    writes: 'none';
+}
+declare function computeImpact(root: string, options?: ImpactOptions): Promise<ImpactReport>;
+declare function renderImpactMarkdown(report: ImpactReport): string;
+
+interface DeclaredVerificationReference {
+    from: string;
+    to: string;
+    kind: string;
+    sourcePath: string;
+    sourceLine: number;
+}
+interface CoverageBoundaryReport {
+    schemaVersion: '1.0';
+    root: string;
+    graphHealth: {
+        validateIssues: number;
+        errorCount: number;
+        lockIssues: number;
+        relationLocks: {
+            declared: number;
+            locked: number;
+            fresh: number;
+        };
+        assessment: 'healthy-with-declarations' | 'healthy-no-declarations' | 'issues';
+    };
+    scanCoverage: {
+        configuredTypes: string[];
+        scannedFiles: number;
+        mappedFiles: number;
+        changedPathScope: 'worktree' | 'unavailable';
+        scopedUnresolved: string[];
+        unmapped: string[];
+    };
+    behaviorVerification: {
+        status: 'not-evaluated';
+        declaredReferences: DeclaredVerificationReference[];
+        note: string;
+    };
+    releaseCoverage: {
+        source: 'caller' | 'none';
+        inputList?: string[];
+        mappedPaths: string[];
+        unmappedPaths: string[];
+        status: 'not-requested' | 'unknown';
+        evidence: [];
+        note: string;
+    };
+}
+declare function computeCoverageBoundary(root: string, opts?: {
+    schema?: ArtifactSchema;
+    releaseInput?: string[];
+}): Promise<CoverageBoundaryReport>;
+declare function renderCoverageBoundaryMarkdown(report: CoverageBoundaryReport): string;
+
 /**
  * packet-assembler.ts
  *
@@ -167,6 +256,8 @@ interface ImplementationPacket {
     validationCommands: string[];
     /** Explicit universal baseline policy: true=enabled, false=disabled. Absent=legacy (pre-0.5) packet. */
     baselinePolicy?: boolean;
+    /** Present only when context resolution used an explicit time view. */
+    viewSelection?: ViewSelection;
 }
 /**
  * Assemble an implementation packet from a context manifest.
@@ -1235,6 +1326,7 @@ interface ArtifactEdge {
     source: string;
     sourcePath: string;
     sourceLine: number;
+    attrs?: Record<string, unknown>;
 }
 interface ValidationIssue {
     code: string;
@@ -1269,6 +1361,16 @@ interface ArtifactEdgeRule {
     to: string;
     kind: string;
 }
+type TimeBucket = 'current' | 'planned' | 'history';
+type TimeView = TimeBucket | 'all';
+interface RelationSemanticsSpec {
+    label: string;
+    targetTypes: string[];
+    fields: string[];
+    partial?: {
+        sectionField: string;
+    };
+}
 /** E2E test runner configuration */
 interface E2eRunnerConfig {
     /** Runner name (e.g., 'playwright', 'vitest', 'jest') */
@@ -1301,6 +1403,10 @@ interface ArtifactSchema {
         start: number;
         end: number;
     }>>;
+    /** Optional, domain-configured relation kinds and their frontmatter fields. */
+    relationSemantics?: Record<string, RelationSemanticsSpec>;
+    /** Optional mapping from domain status words to time-view buckets. */
+    statusViews?: Record<string, TimeBucket>;
     /** Context resolution overrides */
     context?: {
         /** When false, skip universal baseline injection. Default: true. */
@@ -1353,11 +1459,36 @@ interface ArtifactGraph {
     root?: string;
     /** Scan-time diagnostics. Optional for backward compatibility with consumers that build graph literals without this field. */
     diagnostics?: ValidationIssue[];
+    /** Present only for an explicit time-view query. */
+    viewSelection?: ViewSelection;
 }
 interface QueryOptions {
     from?: string;
     to?: string;
     depth?: number;
+    view?: TimeView;
+    schema?: ArtifactSchema;
+}
+interface NodeTimeView {
+    bucket: TimeBucket | 'uncategorized';
+    basis: string;
+}
+interface ViewExcludedNode {
+    uid: string;
+    bucket: TimeBucket | 'uncategorized';
+    basis: string;
+}
+interface PartialSupersedeAnnotation {
+    targetUid: string;
+    supersededBy: string;
+    sections: string[];
+    sourcePath: string;
+    sourceLine: number;
+}
+interface ViewSelection {
+    view: TimeBucket;
+    excluded: ViewExcludedNode[];
+    partialSupersedes: PartialSupersedeAnnotation[];
 }
 type ContextTier = 'baseline' | 'target' | 'direct' | 'matrix' | 'transitive';
 interface ContextItem {
@@ -1390,6 +1521,8 @@ interface ContextManifest {
     omitted?: ContextItem[];
     /** Explicit universal baseline policy: true=enabled, false=disabled. Used by validatePacket to prevent inferring opt-out from total=0. */
     baselinePolicy?: boolean;
+    /** Present only when the caller explicitly selects a time view. */
+    viewSelection?: ViewSelection;
 }
 type ContextMode = 'full' | 'implementation';
 interface ContextOptions {
@@ -1410,6 +1543,8 @@ interface ContextOptions {
     universalBaseline?: boolean;
     /** Project root for baseline file existence checks. Required when universalBaseline is true. */
     root?: string;
+    view?: TimeView;
+    schema?: ArtifactSchema;
 }
 declare const DEFAULT_SCHEMA: ArtifactSchema;
 declare function loadConfig(root: string): Promise<ArtifactSchema>;
@@ -1423,8 +1558,21 @@ declare function scanArtifacts(root: string, schema?: ArtifactSchema): Promise<A
  */
 declare function resolveMatrixEdges(graph: ArtifactGraph): ArtifactGraph;
 declare function validateGraph(graph: ArtifactGraph, schema?: ArtifactSchema): ValidationIssue[];
+interface ExternalEntryInfo {
+    external: boolean;
+    targetProject?: string;
+    targetRef?: string;
+    targetVersion?: string;
+}
+declare function getExternalEntryInfo(node: ArtifactNode): ExternalEntryInfo;
 declare function validateScenarioPrdLinks(graph: ArtifactGraph, schema?: ArtifactSchema): ValidationIssue[];
 declare function validateScenarioPrdLinkIndex(root: string, graph: ArtifactGraph): Promise<ValidationIssue[]>;
+declare function resolveNodeTimeView(node: ArtifactNode, graph: ArtifactGraph, schema?: ArtifactSchema): NodeTimeView;
+declare function filterGraphByView(graph: ArtifactGraph, view: TimeView | undefined, schema?: ArtifactSchema): {
+    graph: ArtifactGraph;
+    excluded: ViewExcludedNode[];
+    partialSupersedes: PartialSupersedeAnnotation[];
+};
 declare function queryGraph(graph: ArtifactGraph, options: QueryOptions): ArtifactGraph;
 declare function renderMermaid(graph: ArtifactGraph): string;
 declare function nextId(graph: ArtifactGraph, schema: ArtifactSchema, type: string, rangeName: string): string;
@@ -1530,4 +1678,4 @@ declare function discoverTargets(graph: ArtifactGraph, options?: DiscoverOptions
 declare function resolveArtifactContext(graph: ArtifactGraph, opts: ContextOptions): ContextManifest;
 declare function formatContextMarkdown(manifest: ContextManifest): string;
 
-export { ALWAYS_PRESENT_ITEMS as ALWAYS_PRESENT, type ArtifactChainDoctorReport, type ArtifactEdge, type ArtifactEdgeRule, type ArtifactExtraFieldSchema, type ArtifactGraph, type ArtifactGraphCliCandidate, type ArtifactGraphCliResolution, type ArtifactGraphCliSource, type ArtifactNode, type ArtifactSchema, type ArtifactTarget, type ArtifactTypeMetadata, type ArtifactTypeRole, type ArtifactTypeSchema, BASELINE_CONSTRAINTS, BASELINE_CONSTRAINTS_COUNT, BASELINE_ITEMS_COUNT, type BatchDefinition, CONTRACT_ERROR_CODES, type CanonicalIR, type CollectChangedPathsOptions, type ContextItem, type ContextManifest, type ContextMode, type ContextOptions, type ContextTier, ContractCatalog, type ContractCatalogEntry, type ContractDefinition, ContractError, type ContractErrorCode, type ContractIdentity, ContractRegistry, type ContractRegistryEntry, type ContractSchema, DEFAULT_MAX_CHARS, DEFAULT_SCHEMA, type DiscoverOptions, E2E_NORMALIZER_CONFIG, type E2eCoverageStats, type E2eCoverageThresholds, type E2eRegistry, type E2eRegistryBatch, type E2eRunnerConfig, type E2eWaiver, type Evidence, type EvidenceObject, type ExecutorType, type Finding, type FindingLocation, type FindingSeverity, type FindingStatus, type GitChangeMode, type GitChangeResult, type GitHookName, type HookInstallResult, type ImplementationBlueprintDraft, type ImplementationPacket, type LegacyFieldMapping, type LoadContractOptions, MIN_PROMPT_CHARS, type ManagedHookBlockOptions, type MissingDetail, type NormalizationResult, type NormalizerConfig, type PacketAuditEntry, type PacketAuditSummary, type PacketCategory, type PacketItem, type PacketOmittedItem, type PacketOptions, type PacketPromptError, type PacketPromptOptions, type PacketTarget, type PacketTargetType, type PacketValidationIssue, type PacketValidationResult, type PolicyCompatibilityResult, type PreparedManagedHookBlock, type Producer, type ProjectPolicy, type PromptValidationIssue, type PromptValidationResult, type QueryOptions, type RepairData, type RepairValidation, type ResolveArtifactGraphCliOptions, type ReviewData, type ReviewDecision, type ReviewMetrics, type ReviewOrderStep, type ReviewResult, type ReviewStatus, type RiskChecklistItem, type SchemaValidationResult, TARGET_ARTIFACT_TYPES, type TargetArtifactType, type TraceVersionResult, VALID_PACKET_TARGET_TYPES, VERSION_INDEX_SCHEMA_VERSION, VERSION_LOCK_PATH, VERSION_LOCK_SCHEMA_VERSION, type ValidationError, type ValidationIssue, type VersionEdgeKind, type VersionIndex, type VersionLockAuditMarkdownOptions, type VersionLockAuditResult, type VersionLockBootstrapOptions, type VersionLockEntry, type VersionLockFile, type VersionLockIssue, type VersionLockIssueSeverity, type VersionLockRef, type VersionLockRefreshOptions, type VersionLockRefreshResult, type VersionLockSourceRef, type VersionLockStatus, type VersionLockUpdateOptions, type VersionSourceKind, type VersionedEdge, type VersionedNode, applyPreparedManagedHookBlocks, assemblePacket, auditPackets, auditVersionLock, bootstrapVersionLock, buildGraph, buildVersionIndex, collectChangedPaths, computeE2eCoverageStats, computeRevisionDigest, discoverAndAuditPackets, discoverTargets, doctorArtifactChain, formatContextMarkdown, generateE2eRegistry, getArtifactTypeMetadata, getTargetArtifactTypes, installManagedHookBlock, isOfficialNamespace, isPacketTargetType, isPacketTargetTypeDynamic, isTargetArtifactType, isVersionLockIssueBlocking, loadConfig, loadContract, loadContractCatalog, loadContractsFromDirectory, matchesConfiguredArtifactPath, nextId, normalizeE2eLegacyArtifact, normalizeToCanonical, parseTargetSelector, parseTargetsFile, prepareManagedHookBlock, queryGraph, refreshVersionLock, renderDoctorMarkdown, renderMermaid, renderPacketMarkdown, renderPacketPrompt, renderTraceVersionMarkdown, renderVersionLockAuditMarkdown, renderVersionLockRefreshMarkdown, resolveArtifactContext, resolveArtifactGraphCli, resolveArtifactTypeName, resolveCliTarget, resolveGitHookPath, resolveMatrixEdges, scanArtifacts, traceVersion, updateVersionLock, validateContractAgainstSchema, validateExecutableTraceability, validateGraph, validateNamespaceAuthority, validatePacket, validatePacketMarkdown, validatePacketPrompt, validatePolicyCompatibility, validateReviewResult, validateScenarioPrdLinkIndex, validateScenarioPrdLinks, verifyDigest, versionLockIssueSeverity, writeGraphCache };
+export { ALWAYS_PRESENT_ITEMS as ALWAYS_PRESENT, type ArtifactChainDoctorReport, type ArtifactEdge, type ArtifactEdgeRule, type ArtifactExtraFieldSchema, type ArtifactGraph, type ArtifactGraphCliCandidate, type ArtifactGraphCliResolution, type ArtifactGraphCliSource, type ArtifactNode, type ArtifactSchema, type ArtifactTarget, type ArtifactTypeMetadata, type ArtifactTypeRole, type ArtifactTypeSchema, BASELINE_CONSTRAINTS, BASELINE_CONSTRAINTS_COUNT, BASELINE_ITEMS_COUNT, type BatchDefinition, CONTRACT_ERROR_CODES, type CanonicalIR, type CollectChangedPathsOptions, type ContextItem, type ContextManifest, type ContextMode, type ContextOptions, type ContextTier, ContractCatalog, type ContractCatalogEntry, type ContractDefinition, ContractError, type ContractErrorCode, type ContractIdentity, ContractRegistry, type ContractRegistryEntry, type ContractSchema, type CoverageBoundaryReport, DEFAULT_MAX_CHARS, DEFAULT_SCHEMA, type DeclaredVerificationReference, type DiscoverOptions, E2E_NORMALIZER_CONFIG, type E2eCoverageStats, type E2eCoverageThresholds, type E2eRegistry, type E2eRegistryBatch, type E2eRunnerConfig, type E2eWaiver, type Evidence, type EvidenceObject, type ExecutorType, type ExternalEntryInfo, type Finding, type FindingLocation, type FindingSeverity, type FindingStatus, type GitChangeMode, type GitChangeResult, type GitHookName, type HookInstallResult, type ImpactEdgeRef, type ImpactMode, type ImpactNodeRef, type ImpactOptions, type ImpactReport, type ImplementationBlueprintDraft, type ImplementationPacket, type LegacyFieldMapping, type LoadContractOptions, MIN_PROMPT_CHARS, type ManagedHookBlockOptions, type MissingDetail, type NodeTimeView, type NormalizationResult, type NormalizerConfig, type PacketAuditEntry, type PacketAuditSummary, type PacketCategory, type PacketItem, type PacketOmittedItem, type PacketOptions, type PacketPromptError, type PacketPromptOptions, type PacketTarget, type PacketTargetType, type PacketValidationIssue, type PacketValidationResult, type PartialSupersedeAnnotation, type PolicyCompatibilityResult, type PreparedManagedHookBlock, type Producer, type ProjectPolicy, type PromptValidationIssue, type PromptValidationResult, type QueryOptions, type RelationSemanticsSpec, type RepairData, type RepairValidation, type ResolveArtifactGraphCliOptions, type ReviewData, type ReviewDecision, type ReviewMetrics, type ReviewOrderStep, type ReviewResult, type ReviewStatus, type RiskChecklistItem, type SchemaValidationResult, TARGET_ARTIFACT_TYPES, type TargetArtifactType, type TimeBucket, type TimeView, type TraceVersionResult, VALID_PACKET_TARGET_TYPES, VERSION_INDEX_SCHEMA_VERSION, VERSION_LOCK_PATH, VERSION_LOCK_SCHEMA_VERSION, type ValidationError, type ValidationIssue, type VersionEdgeKind, type VersionIndex, type VersionLockAuditMarkdownOptions, type VersionLockAuditResult, type VersionLockBootstrapOptions, type VersionLockEntry, type VersionLockFile, type VersionLockIssue, type VersionLockIssueSeverity, type VersionLockRef, type VersionLockRefreshOptions, type VersionLockRefreshResult, type VersionLockSourceRef, type VersionLockStatus, type VersionLockUpdateOptions, type VersionSourceKind, type VersionedEdge, type VersionedNode, type ViewExcludedNode, type ViewSelection, applyPreparedManagedHookBlocks, assemblePacket, auditPackets, auditVersionLock, bootstrapVersionLock, buildGraph, buildVersionIndex, collectChangedPaths, computeCoverageBoundary, computeE2eCoverageStats, computeImpact, computeRevisionDigest, discoverAndAuditPackets, discoverTargets, doctorArtifactChain, filterGraphByView, formatContextMarkdown, generateE2eRegistry, getArtifactTypeMetadata, getExternalEntryInfo, getTargetArtifactTypes, installManagedHookBlock, isOfficialNamespace, isPacketTargetType, isPacketTargetTypeDynamic, isTargetArtifactType, isVersionLockIssueBlocking, loadConfig, loadContract, loadContractCatalog, loadContractsFromDirectory, matchesConfiguredArtifactPath, nextId, normalizeE2eLegacyArtifact, normalizeToCanonical, parseTargetSelector, parseTargetsFile, prepareManagedHookBlock, queryGraph, refreshVersionLock, renderCoverageBoundaryMarkdown, renderDoctorMarkdown, renderImpactMarkdown, renderMermaid, renderPacketMarkdown, renderPacketPrompt, renderTraceVersionMarkdown, renderVersionLockAuditMarkdown, renderVersionLockRefreshMarkdown, resolveArtifactContext, resolveArtifactGraphCli, resolveArtifactTypeName, resolveCliTarget, resolveGitHookPath, resolveMatrixEdges, resolveNodeTimeView, scanArtifacts, traceVersion, updateVersionLock, validateContractAgainstSchema, validateExecutableTraceability, validateGraph, validateNamespaceAuthority, validatePacket, validatePacketMarkdown, validatePacketPrompt, validatePolicyCompatibility, validateReviewResult, validateScenarioPrdLinkIndex, validateScenarioPrdLinks, verifyDigest, versionLockIssueSeverity, writeGraphCache };

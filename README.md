@@ -63,10 +63,32 @@ npx artifact-graph version-lock audit --root . --strict-missing-lock
 
 ## Common Workflows
 
+### Code traceability starts with scan scope
+
+Declare links with standalone `// @feature A1` source comments or `<!-- @feature A1 -->`
+in skill Markdown. Include those files in `types.test.paths`, which also handles implementation
+sources; the default does not scan every `src/` or `skills/` tree. Native Python `#` comments
+are not supported.
+
+> `version-lock audit --strict-missing-lock` checks locks for discovered relationships. Files
+> without annotations and artifacts without relationships can remain invisible to missing-lock
+> checks; even zero locks can pass. It does not prove complete release-file or artifact coverage.
+
+See [Code Traceability And Coverage Boundaries](INSTALL.md#code-traceability-and-coverage-boundaries)
+for syntax, scan configuration, classification, exemptions and project isolation. Inspect the
+index before `refresh --all`; there is no `version-lock update --all` operation.
+
+### Daily commands
+
 - Generate or inspect project artifact graph configuration with `artifact-graph init`.
 - Validate artifact links with `artifact-graph validate`.
 - Validate Review Result Protocol v1.0 documents with `artifact-graph validate-review-result --file <path>`.
 - Build implementation context with `artifact-graph context` or `artifact-graph packet`.
+- Add `--view current|planned|history|all` to `query`, `context`, or `packet` when a project maps
+  statuses through `statusViews`. The default stays compatible with the unfiltered graph.
+- Inspect change impact without refreshing locks with `artifact-graph impact --worktree`.
+- Report graph health, scan mapping, and the limits of behavior/release evidence with
+  `artifact-graph coverage`. The command does not infer successful verification or publication.
 - Keep traceability freshness with `artifact-graph version-lock refresh` and `audit`.
 - Version lock covers both implementation/verification edges (`locks`) and artifact-to-artifact
   relations (`artifactRelations`). Old 1.0 lock files without `artifactRelations` are treated as
