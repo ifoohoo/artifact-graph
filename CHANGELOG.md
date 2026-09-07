@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.12.0
+
+### Changed
+
+- Declared pnpm `10.30.0` for source development.
+- Version lockstep with `artifact-chain-assistant` 0.12.0. Runtime behavior is unchanged.
+
 ## 0.11.0
 
 ### Added

@@ -1,10 +1,10 @@
 {
   "name": "artifact-graph",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "description": "Git-native Markdown artifact graph scanner and validator",
   "license": "Apache-2.0",
   "type": "module",
-  "packageManager": "pnpm@10.17.1",
+  "packageManager": "pnpm@10.30.0",
   "keywords": [
     "artifact-graph",
     "traceability",
