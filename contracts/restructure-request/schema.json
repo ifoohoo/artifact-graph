@@ -1,0 +1,48 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "artifact.restructure-request@1",
+  "title": "Artifact Contract: Restructure Request",
+  "version": "1.0.0",
+  "contractIdentity": {
+    "major": "artifact.restructure-request@1",
+    "authority": "artifact",
+    "namespace": "artifact",
+    "revisionDigest": "sha256:a8daeb76c2107a5516f8900b57f28425ecf89b4e76d95a64e7b705c773fed7bd"
+  },
+  "type": "object",
+  "required": ["schema_version", "operation", "sources", "allowed_output_paths"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "operation": { "enum": ["record-split", "identity-split", "move-renumber"] },
+    "sources": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["type", "id"],
+        "properties": {
+          "type": { "type": "string", "minLength": 1 },
+          "id": { "type": "string", "minLength": 1 },
+          "path": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "allowed_output_paths": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "numbering_policy": {
+      "type": "object",
+      "required": ["mode"],
+      "properties": {
+        "mode": { "enum": ["explicit", "configured-next-available"] },
+        "range": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

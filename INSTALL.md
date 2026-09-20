@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Node.js `>=22.0.0`.
+- Node.js `>=22.22.2 <23`.
 
 ## Install
 

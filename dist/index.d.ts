@@ -1,4 +1,6 @@
 export { dirname, extname } from 'node:path';
+import * as skill_family_harness_node from 'skill-family-harness-node';
+import { FoundationFileSetResult, FoundationFileSetOutcome, FoundationFileSetValidation, FoundationFileSetPathResult, FoundationFileSetErrorKind, FoundationFileSetApplyRequest, FoundationFilesystemRootBinding, FoundationStateStoreRecoveryObservation } from 'skill-family-harness-node';
 
 /**
  * packet-constants.ts
@@ -660,6 +662,7 @@ interface VersionLockRefreshOptions {
     changedPaths?: string[];
     all?: boolean;
     removeOrphans?: boolean;
+    removeOrphanEdges?: string[];
 }
 interface VersionLockRefreshResult {
     schemaVersion: '1.0';
@@ -746,6 +749,7 @@ interface NativeBindingSuccessDiagnostic {
 }
 type BindingLoader = () => unknown;
 
+declare const REQUIRED_NODE_VERSION: ">=22.22.2 <23";
 type ArtifactGraphCliSource = 'node_modules' | 'path' | 'legacy' | 'plugin-bundled';
 interface ArtifactGraphCliCandidate {
     source: ArtifactGraphCliSource;
@@ -770,7 +774,7 @@ interface ArtifactChainDoctorReport {
     node: {
         version: string;
         compatible: boolean;
-        required: '>=22.0.0';
+        required: typeof REQUIRED_NODE_VERSION;
     };
     config: {
         path: string;
@@ -1308,6 +1312,471 @@ declare class ContractCatalog {
  */
 declare function loadContractCatalog(contractsDir: string, options?: LoadContractOptions): Promise<ContractCatalog>;
 
+/**
+ * Mechanism-only boundary for the adopted `foundation.harness.file-set-recovery`
+ * capability. This file builds the frozen Foundation request from a plan 1.1 and
+ * projects the closed mechanism result back into domain language. It owns no
+ * plan semantics: every field it sends is a value the planner already froze.
+ */
+/** Fixed in-root recovery directory; Foundation never creates it. */
+declare const RESTRUCTURE_RECOVERY_REL_PATH = ".foundation-file-apply";
+/** Journal directory the maintenance observation must describe. */
+declare const RESTRUCTURE_RECOVERY_JOURNAL_REL_PATH = ".foundation-file-apply/journal";
+/** Real-directory mode Foundation requires for the mechanism root. */
+declare const RESTRUCTURE_RECOVERY_ROOT_MODE = 448;
+/** Runtime the qualification below is restricted to. */
+declare const RESTRUCTURE_QUALIFIED_PLATFORM = "darwin";
+declare const RESTRUCTURE_QUALIFIED_ARCH = "arm64";
+declare const RESTRUCTURE_QUALIFIED_FILESYSTEM = "apfs";
+declare const FOUNDATION_PACKAGE_NAME = "skill-family-harness-node";
+/** Published contracts package; the mechanism result is judged against it. */
+declare const CONTRACTS_PACKAGE_NAME = "skill-family-contracts";
+/** Published result object this adapter judges every returned document with. */
+declare const FILE_SET_RESULT_OBJECT = "file-set-result";
+type FoundationModule = typeof skill_family_harness_node;
+/**
+ * Loaded through native asynchronous `import()` because the adopted package is
+ * ESM-only. The module is never bundled into this project.
+ */
+declare function loadFoundationModule(): Promise<FoundationModule>;
+/**
+ * Every mechanism result is judged against the published `file-set-result`
+ * schema before it is read. The local declaration file only fixes the compile
+ * boundary; this runtime check is what keeps it from becoming a second contract
+ * or from silently widening what counts as a usable result.
+ */
+declare function verifyMechanismResult(result: unknown): Promise<RestructureResult<FoundationFileSetResult>>;
+/** Raw digest of a candidate's exact UTF-8 bytes; never a string substitution. */
+declare function candidateByteDigest(content: string | null): string;
+interface RestructureMechanismQualification {
+    /** Canonical absolute real root used for both the binding and the request. */
+    root: string;
+    filesystem: typeof RESTRUCTURE_QUALIFIED_FILESYSTEM;
+}
+/** Canonical absolute real path of an existing real directory. */
+declare function resolveRealRoot(root: string): Promise<RestructureResult<string>>;
+/**
+ * Real-apply qualification. `inspect` and `plan` never call this, so an
+ * unsupported host keeps its read-only capability.
+ */
+declare function qualifyRestructureMechanism(root: string): Promise<RestructureResult<RestructureMechanismQualification>>;
+interface RestructureMechanismRootOptions {
+    /** `apply` may create the mechanism root; `recover`/`prune-recovery` only read it. */
+    create: boolean;
+}
+/**
+ * The mechanism root is a real directory with mode 0700 that Foundation never
+ * creates itself. An existing symlink, non-directory or differently masked
+ * entry is refused instead of repaired.
+ */
+declare function ensureRestructureMechanismRoot(canonicalRoot: string, options: RestructureMechanismRootOptions): Promise<RestructureResult<string>>;
+declare function createRestructureRootBinding(canonicalRoot: string): Promise<RestructureResult<FoundationFilesystemRootBinding>>;
+/**
+ * Builds the frozen `applyFileSet` request from a plan 1.1. Fixed fields are
+ * literal: the in-root recovery directory, adjacent staging, the APFS
+ * filesystem, and the cooperative-writer premise.
+ */
+declare function buildFileSetApplyRequest(canonicalRoot: string, plan: RestructurePlan): Promise<RestructureResult<FoundationFileSetApplyRequest>>;
+/** Closed validation callback input; only `root`, `operationId` and `signal` are read. */
+type RestructureValidationCallback = (input: {
+    root: string;
+    operationId: string;
+    signal: AbortSignal;
+}) => Promise<{
+    passed: boolean;
+}> | {
+    passed: boolean;
+};
+interface RestructureFileSetApplyOptions {
+    validate: RestructureValidationCallback;
+}
+declare function applyRestructureFileSet(canonicalRoot: string, plan: RestructurePlan, options: RestructureFileSetApplyOptions): Promise<RestructureResult<FoundationFileSetResult>>;
+/**
+ * Reads the maintenance observation of the fixed in-root journal. The program
+ * never assumes other participants have stopped: the operator's confirmations
+ * are inputs, and this call only records what the journal currently shows.
+ */
+declare function observeRestructureJournal(canonicalRoot: string): Promise<RestructureResult<FoundationStateStoreRecoveryObservation>>;
+interface RestructureMaintenanceOptions {
+    /** Stronger than the cooperative-writer premise; both are operator statements. */
+    allParticipantsStopped: boolean;
+    exclusiveMaintenance: boolean;
+}
+declare function recoverRestructureFileSet(canonicalRoot: string, plan: RestructurePlan, options: RestructureMaintenanceOptions): Promise<RestructureResult<FoundationFileSetResult>>;
+declare function pruneRestructureFileSet(canonicalRoot: string, plan: RestructurePlan, options: RestructureMaintenanceOptions): Promise<RestructureResult<FoundationFileSetResult>>;
+interface RestructureMechanismProjection {
+    /** The mechanism result, reproduced field for field. */
+    foundation: FoundationFileSetResult;
+    /** Canonical absolute path of the persisted plan document this call consumed. */
+    planPath: string;
+    /** Digest of the exact plan document bytes; the document is never deleted here. */
+    planDigest: string;
+    operation: FoundationFileSetResult['operation'];
+    outcome: FoundationFileSetOutcome;
+    preflight: FoundationFileSetResult['preflight'];
+    businessWrite: FoundationFileSetResult['businessWrite'];
+    validation: FoundationFileSetValidation;
+    /** Rendered exactly as the contract names it, e.g. `validation.incomplete/invalid-result`. */
+    validationState: string;
+    recovery: FoundationFileSetResult['recovery'];
+    paths: FoundationFileSetPathResult[];
+    errors: FoundationFileSetResult['errors'];
+    materialPath: string;
+    errorKinds: FoundationFileSetErrorKind[];
+    /** Domain reading of the mechanism facts, added next to them. */
+    code: string;
+    message: string;
+    /** Only the unconditional success described by the migration contract is `true`. */
+    ok: boolean;
+    /** Whether the same plan may still be sent to `apply`. */
+    rerunApplyPermitted: boolean;
+}
+/**
+ * Adds the domain reading to an untouched mechanism result. `commit-unconfirmed`,
+ * `recovery-required` and per-path `unknown` are never flattened into success.
+ */
+declare function projectRestructureFileSetResult(result: FoundationFileSetResult, planPath?: string, planDigest?: string): RestructureMechanismProjection;
+
+interface RestructureFinding {
+    code: string;
+    message: string;
+    path?: string;
+    line?: number;
+}
+/**
+ * Plan document version accepted by apply, recover, and prune-recovery.
+ * An older plan document is refused before any mechanism call.
+ */
+declare const RESTRUCTURE_PLAN_SCHEMA_VERSION = "1.1";
+/** Fixed write-then-verify budget that apply hands to the adopted mechanism. */
+declare const RESTRUCTURE_VALIDATION_TIMEOUT_MS = 30000;
+/** Maximum number of file operations in one plan. */
+declare const RESTRUCTURE_MAX_OPERATIONS = 1024;
+/** Maximum combined original and new bytes in one plan (256 MiB). */
+declare const RESTRUCTURE_MAX_TOTAL_BYTES: number;
+interface FileSnapshot {
+    path: string;
+    exists: boolean;
+    sha256: string | null;
+    size: number;
+    /** POSIX permission bits of a regular file; null when the path does not exist. */
+    mode: number | null;
+}
+interface RestructureRequestSource {
+    type: string;
+    id: string;
+    path?: string;
+}
+interface RestructureRequest {
+    schema_version: '1.0';
+    operation: 'record-split' | 'identity-split' | 'move-renumber';
+    sources: RestructureRequestSource[];
+    allowed_output_paths: string[];
+    numbering_policy?: {
+        mode: 'explicit' | 'configured-next-available';
+        range?: string;
+    };
+}
+interface SourceSpan {
+    path: string;
+    start_byte: number;
+    end_byte: number;
+    sha256: string;
+}
+interface RelationOccurrence {
+    from: string;
+    to: string;
+    kind: string;
+    source: string;
+    source_path: string;
+    source_line: number;
+    occurrence: number;
+}
+interface RestructureInspectionSource {
+    type: string;
+    id: string;
+    uid: string;
+    path: string;
+    title: string;
+    snapshot: FileSnapshot;
+    record_span?: SourceSpan;
+    content?: string;
+    surrounding_spans: Array<SourceSpan & {
+        content: string;
+    }>;
+    acceptance_criteria: string[];
+    incoming_relations: RelationOccurrence[];
+    outgoing_relations: RelationOccurrence[];
+}
+interface RestructureInspection {
+    schema_version: '1.0';
+    request: RestructureRequest;
+    request_digest: string;
+    config_snapshot: FileSnapshot;
+    sources: RestructureInspectionSource[];
+    affected_files: FileSnapshot[];
+    relation_occurrences: RelationOccurrence[];
+    blockers: RestructureFinding[];
+    unresolved: RestructureFinding[];
+    mapping_template: Record<string, unknown>;
+}
+interface MappingSource {
+    type: string;
+    id: string;
+    path: string;
+    snapshot: FileSnapshot;
+    disposition: 'preserved' | 'retired';
+}
+interface MappingTarget {
+    key: string;
+    type: string;
+    id: string;
+    path: string;
+    snapshot: FileSnapshot;
+}
+interface ContentMove {
+    id: string;
+    source: SourceSpan;
+    target: {
+        path: string;
+        order: number;
+        mode: 'move' | 'copy';
+        separator?: string;
+    };
+}
+interface IdentityMapEntry {
+    source_type: string;
+    source_id: string;
+    target_keys: string[];
+    source_disposition: 'preserved' | 'retired';
+}
+interface CriterionMapEntry {
+    source_feature: string;
+    source_criterion: string;
+    targets: Array<{
+        feature: string;
+        criterion: string;
+    }>;
+}
+interface RelationMapEntry {
+    occurrence: RelationOccurrence;
+    targets: Array<{
+        from: string;
+        to: string;
+        kind: string;
+    }>;
+    basis: string;
+}
+interface ProseEdit {
+    source: SourceSpan;
+    target_path: string;
+    old_text: string;
+    new_text: string;
+    reason: string;
+}
+interface FileHeader {
+    path: string;
+    content: string;
+    affected_records: string[];
+}
+interface RestructureMapping {
+    schema_version: '1.0';
+    request: RestructureRequest;
+    request_digest: string;
+    config_snapshot: FileSnapshot;
+    sources: MappingSource[];
+    targets: MappingTarget[];
+    content_moves: ContentMove[];
+    identity_map: IdentityMapEntry[];
+    criterion_map: CriterionMapEntry[];
+    relation_map: RelationMapEntry[];
+    prose_edits: ProseEdit[];
+    file_headers: FileHeader[];
+    unresolved: RestructureFinding[];
+}
+interface RestructureCandidate {
+    path: string;
+    action: 'create' | 'replace' | 'delete';
+    content: string | null;
+    sha256: string | null;
+    /** replace keeps the original mode, delete is null, create uses the planning umask. */
+    mode: number | null;
+    original: FileSnapshot;
+    diff: string;
+}
+interface RestructurePlan {
+    schema_version: '1.1';
+    /** Fresh UUID v4 for this planning run; one plan, one mechanism operation identity. */
+    operation_id: string;
+    /** Fixed domain validation budget forwarded by apply. */
+    validation_timeout_ms: number;
+    request_digest: string;
+    mapping_digest: string;
+    config_snapshot: FileSnapshot;
+    input_snapshots: FileSnapshot[];
+    candidates: RestructureCandidate[];
+    graph_diff: {
+        added_nodes: string[];
+        removed_nodes: string[];
+        added_edges: string[];
+        removed_edges: string[];
+    };
+    validation: {
+        blockers: RestructureFinding[];
+        unresolved: RestructureFinding[];
+        candidate_issues: ValidationIssue[];
+        consumer_candidates: Array<{
+            path: string;
+            line: number;
+            reference: string;
+        }>;
+    };
+    applicable: boolean;
+}
+type RestructureResult<T> = {
+    ok: true;
+    data: T;
+} | {
+    ok: false;
+    error: {
+        code: string;
+        message: string;
+        details?: unknown;
+    };
+};
+declare function digestRestructureValue(value: unknown): string;
+declare function inspectRestructure(root: string, input: unknown): Promise<RestructureResult<RestructureInspection>>;
+/** Mode that a create operation freezes from the planning process umask. */
+declare function createModeForUmask(umask: number): number;
+/** Current planning process umask, limited to the POSIX permission bits. */
+declare function planningUmask(): number;
+/**
+ * One file operation as the adopted mechanism sees it. Every field is a fact
+ * already derived by the planner; the boundary rules below are their only
+ * definition.
+ */
+interface RestructureOperationBoundary {
+    path: string;
+    action: 'create' | 'replace' | 'delete';
+    original_exists: boolean;
+    original_mode: number | null;
+    original_bytes: number;
+    new_bytes: number;
+    mode: number | null;
+    parent_exists: boolean;
+    parent_device: number | null;
+    root_device: number;
+}
+interface RestructureBoundaryLimits {
+    max_operations: number;
+    max_total_bytes: number;
+    umask: number;
+    /**
+     * `plan` (default) checks the planning rule that a create carries exactly the
+     * mode derived from the planning umask. `apply` checks the runtime rule
+     * instead: the mode already frozen in the plan must stay usable by the
+     * applying process, so it can only be required to keep the owner-read bit,
+     * carry no setuid/setgid/sticky bits, and survive the current umask.
+     */
+    mode_contract?: 'plan' | 'apply';
+}
+/**
+ * Foundation preconditions that a plan must satisfy before apply/recover/prune:
+ * operation count, combined capacity, parent directory presence and filesystem,
+ * and the frozen POSIX modes. Zero operations is a no-op plan and is blocked.
+ */
+declare function restructureBoundaryFindings(operations: RestructureOperationBoundary[], limits: RestructureBoundaryLimits): RestructureFinding[];
+declare function planRestructure(root: string, input: unknown): Promise<RestructureResult<RestructurePlan>>;
+type RestructurePlanOperation = 'apply' | 'recover' | 'prune-recovery';
+/**
+ * Single acceptance gate for a persisted plan document. apply, recover, and
+ * prune-recovery all consume the same plan contract, so a plan written before
+ * 1.1 is refused here before any mechanism call.
+ */
+declare function gateRestructureOperationPlan(operation: RestructurePlanOperation, plan: unknown): Promise<RestructureResult<RestructurePlan>>;
+/**
+ * A plan document that already exists on disk. Apply, recover, and
+ * prune-recovery all read this same document, so one plan keeps one mechanism
+ * operation identity. The document is never written, copied or deleted here.
+ */
+interface RestructurePlanDocument {
+    /** Absolute path the operator supplied. */
+    path: string;
+    /** Canonical absolute real path of that document. */
+    realPath: string;
+    /** Digest of the exact bytes read from the document. */
+    digest: string;
+    root: string;
+    plan: RestructurePlan;
+}
+/**
+ * Read-only revalidation of the file set that Foundation has just written. The
+ * callback consumes only `{ root, operationId, signal }` and returns only the
+ * closed object `{ passed: true }` or `{ passed: false }`. It re-scans the
+ * graph, compares the plan's frozen identity and edge differences, refuses any
+ * graph error the reviewed candidate issues did not already contain, and
+ * refuses consumer candidates the plan never listed. An unexpected failure is
+ * left to propagate so Foundation keeps the original incomplete/exception
+ * reason instead of reporting a plain validation failure.
+ *
+ * `excludedConsumerPaths` carries the root-relative path of the operation's own
+ * persisted plan document. That document names the candidate paths verbatim, so
+ * without this exclusion it would be counted as an unplanned consumer of every
+ * reference the reviewed plan already carries, and a plan persisted anywhere
+ * inside the project root except a scan-skipped directory would roll its own
+ * apply back. The exclusion is exact: it removes that one path and no other.
+ */
+declare function createRestructureValidationCallback(plan: RestructurePlan, excludedConsumerPaths?: Iterable<string>): RestructureValidationCallback;
+interface RestructureApplyInput {
+    root: string;
+    /** Path of the plan document the operator already persisted. */
+    planPath: string;
+    /** Explicit cooperative-writer premise; this program never assumes it. */
+    confirmCooperativeWriters: boolean;
+}
+declare function applyRestructure(input: RestructureApplyInput): Promise<RestructureResult<RestructureMechanismProjection>>;
+interface RestructureRecoveryInput {
+    root: string;
+    /** Path of the same plan document that the apply call consumed. */
+    planPath: string;
+    /** Operator statement that every other participant has stopped. */
+    allParticipantsStopped: boolean;
+    /** Operator statement that an exclusive maintenance interval is in force. */
+    exclusiveMaintenance: boolean;
+}
+declare function recoverRestructure(input: RestructureRecoveryInput): Promise<RestructureResult<RestructureMechanismProjection>>;
+interface RestructurePruneInput {
+    root: string;
+    /** Path of the same plan document that the apply call consumed. */
+    planPath: string;
+    /** Explicit cooperative-writer premise for the ordinary cleanup path. */
+    confirmCooperativeWriters: boolean;
+    /** Required together with `exclusiveMaintenance` for a fault takeover. */
+    allParticipantsStopped: boolean;
+    exclusiveMaintenance: boolean;
+}
+declare function pruneRestructureRecovery(input: RestructurePruneInput): Promise<RestructureResult<RestructureMechanismProjection>>;
+
+interface ByteRange {
+    startByte: number;
+    endByte: number;
+}
+interface RecordBoundaryResult {
+    range?: ByteRange;
+    blockers: Array<{
+        code: string;
+        message: string;
+        path: string;
+        line: number;
+    }>;
+}
+declare function markdownRecordHeadings(raw: string, type: string): Array<{
+    id: string;
+    line: number;
+}>;
+declare function locateSoftwareRecord(raw: string, node: ArtifactNode, nodesInFile: ArtifactNode[]): RecordBoundaryResult;
+declare function replaceSoftwareHeader(raw: string, header: string): string;
+
 interface ArtifactNode {
     uid: string;
     type: string;
@@ -1549,7 +2018,15 @@ interface ContextOptions {
 declare const DEFAULT_SCHEMA: ArtifactSchema;
 declare function loadConfig(root: string): Promise<ArtifactSchema>;
 declare function buildGraph(nodes: Omit<ArtifactNode, 'uid'>[], edges: ArtifactEdge[], diagnostics?: ValidationIssue[], root?: string): ArtifactGraph;
-declare function scanArtifacts(root: string, schema?: ArtifactSchema): Promise<ArtifactGraph>;
+interface ScanArtifactsOptions {
+    /**
+     * Optional in-memory candidate contents keyed by project-relative path.
+     * `null` removes a path from the candidate scan. Disk scanning remains the
+     * default and is unchanged when this option is omitted.
+     */
+    contents?: ReadonlyMap<string, string | null> | Readonly<Record<string, string | null>>;
+}
+declare function scanArtifacts(root: string, schema?: ArtifactSchema, options?: ScanArtifactsOptions): Promise<ArtifactGraph>;
 /**
  * Resolve traceability-matrix-v2 edges:
  * 1. Edges pointing to matrix-row targets (traceability-matrix-v2:*) are kept as-is.
@@ -1678,4 +2155,4 @@ declare function discoverTargets(graph: ArtifactGraph, options?: DiscoverOptions
 declare function resolveArtifactContext(graph: ArtifactGraph, opts: ContextOptions): ContextManifest;
 declare function formatContextMarkdown(manifest: ContextManifest): string;
 
-export { ALWAYS_PRESENT_ITEMS as ALWAYS_PRESENT, type ArtifactChainDoctorReport, type ArtifactEdge, type ArtifactEdgeRule, type ArtifactExtraFieldSchema, type ArtifactGraph, type ArtifactGraphCliCandidate, type ArtifactGraphCliResolution, type ArtifactGraphCliSource, type ArtifactNode, type ArtifactSchema, type ArtifactTarget, type ArtifactTypeMetadata, type ArtifactTypeRole, type ArtifactTypeSchema, BASELINE_CONSTRAINTS, BASELINE_CONSTRAINTS_COUNT, BASELINE_ITEMS_COUNT, type BatchDefinition, CONTRACT_ERROR_CODES, type CanonicalIR, type CollectChangedPathsOptions, type ContextItem, type ContextManifest, type ContextMode, type ContextOptions, type ContextTier, ContractCatalog, type ContractCatalogEntry, type ContractDefinition, ContractError, type ContractErrorCode, type ContractIdentity, ContractRegistry, type ContractRegistryEntry, type ContractSchema, type CoverageBoundaryReport, DEFAULT_MAX_CHARS, DEFAULT_SCHEMA, type DeclaredVerificationReference, type DiscoverOptions, E2E_NORMALIZER_CONFIG, type E2eCoverageStats, type E2eCoverageThresholds, type E2eRegistry, type E2eRegistryBatch, type E2eRunnerConfig, type E2eWaiver, type Evidence, type EvidenceObject, type ExecutorType, type ExternalEntryInfo, type Finding, type FindingLocation, type FindingSeverity, type FindingStatus, type GitChangeMode, type GitChangeResult, type GitHookName, type HookInstallResult, type ImpactEdgeRef, type ImpactMode, type ImpactNodeRef, type ImpactOptions, type ImpactReport, type ImplementationBlueprintDraft, type ImplementationPacket, type LegacyFieldMapping, type LoadContractOptions, MIN_PROMPT_CHARS, type ManagedHookBlockOptions, type MissingDetail, type NodeTimeView, type NormalizationResult, type NormalizerConfig, type PacketAuditEntry, type PacketAuditSummary, type PacketCategory, type PacketItem, type PacketOmittedItem, type PacketOptions, type PacketPromptError, type PacketPromptOptions, type PacketTarget, type PacketTargetType, type PacketValidationIssue, type PacketValidationResult, type PartialSupersedeAnnotation, type PolicyCompatibilityResult, type PreparedManagedHookBlock, type Producer, type ProjectPolicy, type PromptValidationIssue, type PromptValidationResult, type QueryOptions, type RelationSemanticsSpec, type RepairData, type RepairValidation, type ResolveArtifactGraphCliOptions, type ReviewData, type ReviewDecision, type ReviewMetrics, type ReviewOrderStep, type ReviewResult, type ReviewStatus, type RiskChecklistItem, type SchemaValidationResult, TARGET_ARTIFACT_TYPES, type TargetArtifactType, type TimeBucket, type TimeView, type TraceVersionResult, VALID_PACKET_TARGET_TYPES, VERSION_INDEX_SCHEMA_VERSION, VERSION_LOCK_PATH, VERSION_LOCK_SCHEMA_VERSION, type ValidationError, type ValidationIssue, type VersionEdgeKind, type VersionIndex, type VersionLockAuditMarkdownOptions, type VersionLockAuditResult, type VersionLockBootstrapOptions, type VersionLockEntry, type VersionLockFile, type VersionLockIssue, type VersionLockIssueSeverity, type VersionLockRef, type VersionLockRefreshOptions, type VersionLockRefreshResult, type VersionLockSourceRef, type VersionLockStatus, type VersionLockUpdateOptions, type VersionSourceKind, type VersionedEdge, type VersionedNode, type ViewExcludedNode, type ViewSelection, applyPreparedManagedHookBlocks, assemblePacket, auditPackets, auditVersionLock, bootstrapVersionLock, buildGraph, buildVersionIndex, collectChangedPaths, computeCoverageBoundary, computeE2eCoverageStats, computeImpact, computeRevisionDigest, discoverAndAuditPackets, discoverTargets, doctorArtifactChain, filterGraphByView, formatContextMarkdown, generateE2eRegistry, getArtifactTypeMetadata, getExternalEntryInfo, getTargetArtifactTypes, installManagedHookBlock, isOfficialNamespace, isPacketTargetType, isPacketTargetTypeDynamic, isTargetArtifactType, isVersionLockIssueBlocking, loadConfig, loadContract, loadContractCatalog, loadContractsFromDirectory, matchesConfiguredArtifactPath, nextId, normalizeE2eLegacyArtifact, normalizeToCanonical, parseTargetSelector, parseTargetsFile, prepareManagedHookBlock, queryGraph, refreshVersionLock, renderCoverageBoundaryMarkdown, renderDoctorMarkdown, renderImpactMarkdown, renderMermaid, renderPacketMarkdown, renderPacketPrompt, renderTraceVersionMarkdown, renderVersionLockAuditMarkdown, renderVersionLockRefreshMarkdown, resolveArtifactContext, resolveArtifactGraphCli, resolveArtifactTypeName, resolveCliTarget, resolveGitHookPath, resolveMatrixEdges, resolveNodeTimeView, scanArtifacts, traceVersion, updateVersionLock, validateContractAgainstSchema, validateExecutableTraceability, validateGraph, validateNamespaceAuthority, validatePacket, validatePacketMarkdown, validatePacketPrompt, validatePolicyCompatibility, validateReviewResult, validateScenarioPrdLinkIndex, validateScenarioPrdLinks, verifyDigest, versionLockIssueSeverity, writeGraphCache };
+export { ALWAYS_PRESENT_ITEMS as ALWAYS_PRESENT, type ArtifactChainDoctorReport, type ArtifactEdge, type ArtifactEdgeRule, type ArtifactExtraFieldSchema, type ArtifactGraph, type ArtifactGraphCliCandidate, type ArtifactGraphCliResolution, type ArtifactGraphCliSource, type ArtifactNode, type ArtifactSchema, type ArtifactTarget, type ArtifactTypeMetadata, type ArtifactTypeRole, type ArtifactTypeSchema, BASELINE_CONSTRAINTS, BASELINE_CONSTRAINTS_COUNT, BASELINE_ITEMS_COUNT, type BatchDefinition, type ByteRange, CONTRACTS_PACKAGE_NAME, CONTRACT_ERROR_CODES, type CanonicalIR, type CollectChangedPathsOptions, type ContextItem, type ContextManifest, type ContextMode, type ContextOptions, type ContextTier, ContractCatalog, type ContractCatalogEntry, type ContractDefinition, ContractError, type ContractErrorCode, type ContractIdentity, ContractRegistry, type ContractRegistryEntry, type ContractSchema, type CoverageBoundaryReport, DEFAULT_MAX_CHARS, DEFAULT_SCHEMA, type DeclaredVerificationReference, type DiscoverOptions, E2E_NORMALIZER_CONFIG, type E2eCoverageStats, type E2eCoverageThresholds, type E2eRegistry, type E2eRegistryBatch, type E2eRunnerConfig, type E2eWaiver, type Evidence, type EvidenceObject, type ExecutorType, type ExternalEntryInfo, FILE_SET_RESULT_OBJECT, FOUNDATION_PACKAGE_NAME, type FileSnapshot, type Finding, type FindingLocation, type FindingSeverity, type FindingStatus, type FoundationModule, type GitChangeMode, type GitChangeResult, type GitHookName, type HookInstallResult, type ImpactEdgeRef, type ImpactMode, type ImpactNodeRef, type ImpactOptions, type ImpactReport, type ImplementationBlueprintDraft, type ImplementationPacket, type LegacyFieldMapping, type LoadContractOptions, MIN_PROMPT_CHARS, type ManagedHookBlockOptions, type MissingDetail, type NodeTimeView, type NormalizationResult, type NormalizerConfig, type PacketAuditEntry, type PacketAuditSummary, type PacketCategory, type PacketItem, type PacketOmittedItem, type PacketOptions, type PacketPromptError, type PacketPromptOptions, type PacketTarget, type PacketTargetType, type PacketValidationIssue, type PacketValidationResult, type PartialSupersedeAnnotation, type PolicyCompatibilityResult, type PreparedManagedHookBlock, type Producer, type ProjectPolicy, type PromptValidationIssue, type PromptValidationResult, type QueryOptions, RESTRUCTURE_MAX_OPERATIONS, RESTRUCTURE_MAX_TOTAL_BYTES, RESTRUCTURE_PLAN_SCHEMA_VERSION, RESTRUCTURE_QUALIFIED_ARCH, RESTRUCTURE_QUALIFIED_FILESYSTEM, RESTRUCTURE_QUALIFIED_PLATFORM, RESTRUCTURE_RECOVERY_JOURNAL_REL_PATH, RESTRUCTURE_RECOVERY_REL_PATH, RESTRUCTURE_RECOVERY_ROOT_MODE, RESTRUCTURE_VALIDATION_TIMEOUT_MS, type RecordBoundaryResult, type RelationSemanticsSpec, type RepairData, type RepairValidation, type ResolveArtifactGraphCliOptions, type RestructureApplyInput, type RestructureBoundaryLimits, type RestructureCandidate, type RestructureFileSetApplyOptions, type RestructureFinding, type RestructureInspection, type RestructureMaintenanceOptions, type RestructureMapping, type RestructureMechanismProjection, type RestructureMechanismQualification, type RestructureMechanismRootOptions, type RestructureOperationBoundary, type RestructurePlan, type RestructurePlanDocument, type RestructurePlanOperation, type RestructurePruneInput, type RestructureRecoveryInput, type RestructureRequest, type RestructureResult, type RestructureValidationCallback, type ReviewData, type ReviewDecision, type ReviewMetrics, type ReviewOrderStep, type ReviewResult, type ReviewStatus, type RiskChecklistItem, type ScanArtifactsOptions, type SchemaValidationResult, TARGET_ARTIFACT_TYPES, type TargetArtifactType, type TimeBucket, type TimeView, type TraceVersionResult, VALID_PACKET_TARGET_TYPES, VERSION_INDEX_SCHEMA_VERSION, VERSION_LOCK_PATH, VERSION_LOCK_SCHEMA_VERSION, type ValidationError, type ValidationIssue, type VersionEdgeKind, type VersionIndex, type VersionLockAuditMarkdownOptions, type VersionLockAuditResult, type VersionLockBootstrapOptions, type VersionLockEntry, type VersionLockFile, type VersionLockIssue, type VersionLockIssueSeverity, type VersionLockRef, type VersionLockRefreshOptions, type VersionLockRefreshResult, type VersionLockSourceRef, type VersionLockStatus, type VersionLockUpdateOptions, type VersionSourceKind, type VersionedEdge, type VersionedNode, type ViewExcludedNode, type ViewSelection, applyPreparedManagedHookBlocks, applyRestructure, applyRestructureFileSet, assemblePacket, auditPackets, auditVersionLock, bootstrapVersionLock, buildFileSetApplyRequest, buildGraph, buildVersionIndex, candidateByteDigest, collectChangedPaths, computeCoverageBoundary, computeE2eCoverageStats, computeImpact, computeRevisionDigest, createModeForUmask, createRestructureRootBinding, createRestructureValidationCallback, digestRestructureValue, discoverAndAuditPackets, discoverTargets, doctorArtifactChain, ensureRestructureMechanismRoot, filterGraphByView, formatContextMarkdown, gateRestructureOperationPlan, generateE2eRegistry, getArtifactTypeMetadata, getExternalEntryInfo, getTargetArtifactTypes, inspectRestructure, installManagedHookBlock, isOfficialNamespace, isPacketTargetType, isPacketTargetTypeDynamic, isTargetArtifactType, isVersionLockIssueBlocking, loadConfig, loadContract, loadContractCatalog, loadContractsFromDirectory, loadFoundationModule, locateSoftwareRecord, markdownRecordHeadings, matchesConfiguredArtifactPath, nextId, normalizeE2eLegacyArtifact, normalizeToCanonical, observeRestructureJournal, parseTargetSelector, parseTargetsFile, planRestructure, planningUmask, prepareManagedHookBlock, projectRestructureFileSetResult, pruneRestructureFileSet, pruneRestructureRecovery, qualifyRestructureMechanism, queryGraph, recoverRestructure, recoverRestructureFileSet, refreshVersionLock, renderCoverageBoundaryMarkdown, renderDoctorMarkdown, renderImpactMarkdown, renderMermaid, renderPacketMarkdown, renderPacketPrompt, renderTraceVersionMarkdown, renderVersionLockAuditMarkdown, renderVersionLockRefreshMarkdown, replaceSoftwareHeader, resolveArtifactContext, resolveArtifactGraphCli, resolveArtifactTypeName, resolveCliTarget, resolveGitHookPath, resolveMatrixEdges, resolveNodeTimeView, resolveRealRoot, restructureBoundaryFindings, scanArtifacts, traceVersion, updateVersionLock, validateContractAgainstSchema, validateExecutableTraceability, validateGraph, validateNamespaceAuthority, validatePacket, validatePacketMarkdown, validatePacketPrompt, validatePolicyCompatibility, validateReviewResult, validateScenarioPrdLinkIndex, validateScenarioPrdLinks, verifyDigest, verifyMechanismResult, versionLockIssueSeverity, writeGraphCache };

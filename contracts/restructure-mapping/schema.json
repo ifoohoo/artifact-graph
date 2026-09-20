@@ -1,0 +1,263 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "artifact.restructure-mapping@1",
+  "title": "Artifact Contract: Restructure Mapping",
+  "version": "1.1.0",
+  "contractIdentity": {
+    "major": "artifact.restructure-mapping@1",
+    "authority": "artifact",
+    "namespace": "artifact",
+    "revisionDigest": "sha256:b3a7a52b4ab2479c97a53e754f57e3ec6bf71e7c81385e11666c015f54d7c414"
+  },
+  "type": "object",
+  "required": ["schema_version", "request", "request_digest", "config_snapshot", "sources", "targets", "content_moves", "identity_map", "criterion_map", "relation_map", "prose_edits", "file_headers", "unresolved"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "request": { "$ref": "#/definitions/request" },
+    "request_digest": { "$ref": "#/definitions/digest" },
+    "config_snapshot": { "$ref": "#/definitions/snapshot" },
+    "sources": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["type", "id", "path", "snapshot", "disposition"],
+        "properties": {
+          "type": { "type": "string", "minLength": 1 },
+          "id": { "type": "string", "minLength": 1 },
+          "path": { "type": "string", "minLength": 1 },
+          "snapshot": { "$ref": "#/definitions/snapshot" },
+          "disposition": { "enum": ["preserved", "retired"] }
+        },
+        "additionalProperties": false
+      }
+    },
+    "targets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["key", "type", "id", "path", "snapshot"],
+        "properties": {
+          "key": { "type": "string", "minLength": 1 },
+          "type": { "type": "string", "minLength": 1 },
+          "id": { "type": "string", "minLength": 1 },
+          "path": { "type": "string", "minLength": 1 },
+          "snapshot": { "$ref": "#/definitions/snapshot" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "content_moves": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "source", "target"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "source": { "$ref": "#/definitions/span" },
+          "target": {
+            "type": "object",
+            "required": ["path", "order", "mode"],
+            "properties": {
+              "path": { "type": "string", "minLength": 1 },
+              "order": { "type": "integer", "minimum": 0 },
+              "mode": { "enum": ["move", "copy"] },
+              "separator": { "type": "string" }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "identity_map": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["source_type", "source_id", "target_keys", "source_disposition"],
+        "properties": {
+          "source_type": { "type": "string", "minLength": 1 },
+          "source_id": { "type": "string", "minLength": 1 },
+          "target_keys": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+          "source_disposition": { "enum": ["preserved", "retired"] }
+        },
+        "additionalProperties": false
+      }
+    },
+    "criterion_map": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["source_feature", "source_criterion", "targets"],
+        "properties": {
+          "source_feature": { "type": "string", "minLength": 1 },
+          "source_criterion": { "type": "string", "pattern": "^AC[0-9]+$" },
+          "targets": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": ["feature", "criterion"],
+              "properties": {
+                "feature": { "type": "string", "minLength": 1 },
+                "criterion": { "type": "string", "pattern": "^AC[0-9]+$" }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "relation_map": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["occurrence", "targets", "basis"],
+        "properties": {
+          "occurrence": { "$ref": "#/definitions/relation" },
+          "targets": { "type": "array", "items": { "$ref": "#/definitions/relationTarget" } },
+          "basis": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "prose_edits": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["source", "target_path", "old_text", "new_text", "reason"],
+        "properties": {
+          "source": { "$ref": "#/definitions/span" },
+          "target_path": { "type": "string", "minLength": 1 },
+          "old_text": { "type": "string" },
+          "new_text": { "type": "string" },
+          "reason": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "file_headers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "content", "affected_records"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "content": { "type": "string" },
+          "affected_records": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true }
+        },
+        "additionalProperties": false
+      }
+    },
+    "unresolved": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["code", "message"],
+        "properties": {
+          "code": { "type": "string", "minLength": 1 },
+          "message": { "type": "string", "minLength": 1 },
+          "path": { "type": "string" },
+          "line": { "type": "integer", "minimum": 1 }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "request": {
+      "type": "object",
+      "required": ["schema_version", "operation", "sources", "allowed_output_paths"],
+      "properties": {
+        "schema_version": { "const": "1.0" },
+        "operation": { "enum": ["record-split", "identity-split", "move-renumber"] },
+        "sources": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["type", "id"],
+            "properties": {
+              "type": { "type": "string", "minLength": 1 },
+              "id": { "type": "string", "minLength": 1 },
+              "path": { "type": "string", "minLength": 1 }
+            },
+            "additionalProperties": false
+          }
+        },
+        "allowed_output_paths": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "numbering_policy": {
+          "type": "object",
+          "required": ["mode"],
+          "properties": {
+            "mode": { "enum": ["explicit", "configured-next-available"] },
+            "range": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "mode": {
+      "anyOf": [
+        { "type": "integer", "minimum": 0, "maximum": 511 },
+        { "type": "null" }
+      ]
+    },
+    "snapshot": {
+      "type": "object",
+      "required": ["path", "exists", "sha256", "size", "mode"],
+      "properties": {
+        "path": { "type": "string" },
+        "exists": { "type": "boolean" },
+        "sha256": { "anyOf": [{ "$ref": "#/definitions/digest" }, { "type": "null" }] },
+        "size": { "type": "integer", "minimum": 0 },
+        "mode": { "$ref": "#/definitions/mode" }
+      },
+      "additionalProperties": false
+    },
+    "span": {
+      "type": "object",
+      "required": ["path", "start_byte", "end_byte", "sha256"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "start_byte": { "type": "integer", "minimum": 0 },
+        "end_byte": { "type": "integer", "minimum": 0 },
+        "sha256": { "$ref": "#/definitions/digest" }
+      },
+      "additionalProperties": false
+    },
+    "relation": {
+      "type": "object",
+      "required": ["from", "to", "kind", "source", "source_path", "source_line", "occurrence"],
+      "properties": {
+        "from": { "type": "string", "minLength": 1 },
+        "to": { "type": "string", "minLength": 1 },
+        "kind": { "type": "string", "minLength": 1 },
+        "source": { "type": "string", "minLength": 1 },
+        "source_path": { "type": "string", "minLength": 1 },
+        "source_line": { "type": "integer", "minimum": 1 },
+        "occurrence": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false
+    },
+    "relationTarget": {
+      "type": "object",
+      "required": ["from", "to", "kind"],
+      "properties": {
+        "from": { "type": "string", "minLength": 1 },
+        "to": { "type": "string", "minLength": 1 },
+        "kind": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    }
+  }
+}

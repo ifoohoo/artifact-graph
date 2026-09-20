@@ -21,7 +21,7 @@ pnpm exec artifact-graph --help
 pnpm exec artifact-graph doctor --root .
 ```
 
-如果任一只读命令失败，先确认当前 Node.js 版本不低于 `22.0.0`，再按照
+如果任一只读命令失败，先确认当前 Node.js 满足 `>=22.22.2 <23`，再按照
 [INSTALL.md](INSTALL.md) 中的精确说明重新安装；命令行工具能够正常解析且 doctor
 给出可处理的诊断前，不要运行写入命令。
 
@@ -37,7 +37,7 @@ pnpm add -D artifact-graph
 npm install --save-dev github:ifoohoo/artifact-graph
 ```
 
-需要 Node.js `>=22.0.0`。pnpm 10+ 需要配置原生构建白名单，详见 [INSTALL.md](INSTALL.md)。
+需要 Node.js `>=22.22.2 <23`。pnpm 10+ 需要配置原生构建白名单，详见 [INSTALL.md](INSTALL.md)。
 
 ## 快速开始
 
@@ -90,6 +90,38 @@ Python 的 `#` 注释目前不受支持。
 - 版本锁覆盖实现/验证边（`locks`）和制品间关系（`artifactRelations`）。旧版 1.0 锁文件缺少
   `artifactRelations` 时视为空数组；首次启用时执行一次 `refresh --all` 建立完整关系基线。
 - 用 `artifact-graph hooks install-git --hook all` 安装可选 Git hooks。
+- 用 `artifact-graph restructure inspect` 和 `artifact-graph restructure plan` 检查与规划制品重组：
+  这两步只读取入并确定性地编译你给出的映射，不写项目。
+
+### 制品重组（拆分、跨文件移动与重编号）
+
+`artifact-graph restructure` 把一份显式重组映射编译成可复核的候选计划，再以一次文件集合操作
+应用。支持三类变换：`record-split`（记录物理拆分）、`identity-split`（编号身份拆分）与
+`move-renumber`（跨文件移动与重编号）。能力边界、共同约束与每项验收标准的去向不由 CLI 决定；
+编译器只把一份完整映射编译成计划并应用。
+
+```bash
+# pnpm
+pnpm exec artifact-graph restructure inspect --root . --input request.json --format json
+pnpm exec artifact-graph restructure plan --root . --input mapping.json --format json
+pnpm exec artifact-graph restructure apply --root . --plan plan.json --confirm-cooperative-writers
+
+# npm
+npx artifact-graph restructure inspect --root . --input request.json --format json
+npx artifact-graph restructure plan --root . --input mapping.json --format json
+npx artifact-graph restructure apply --root . --plan plan.json --confirm-cooperative-writers
+```
+
+`plan` 输出阻断项、未解决项、候选内部问题与写集外的引用出现位置；只要存在阻断项或未解决项，
+`applicable` 就不为真，不可应用的计划不得进入 `apply`。计划文档要保存到写集之外的普通目录：
+恢复只依赖该文档，不依赖进程状态。
+
+> **采用边界。** 文件集合写入能力的成熟度为 `candidate`。资格环境仅为 Darwin / arm64 / APFS；
+> 其他平台返回不可用，不会降级成无事务写入。该能力以合作式写者为前提，且不自证该前提：
+> `apply` 与 `prune-recovery` 必须给出 `--confirm-cooperative-writers`，缺失即拒绝写入；
+> 恢复必须用 `recover` 并同时给出 `--confirm-all-participants-stopped` 与
+> `--confirm-exclusive-maintenance`。恢复材料默认保留，只有显式 `prune-recovery` 才清理。
+> 不承诺全平台事务保证。`inspect` 与 `plan` 不写项目。
 
 ### 制品删除或拆分后的孤立锁清理
 
@@ -107,6 +139,15 @@ npx artifact-graph version-lock refresh --all --remove-orphans --format markdown
 git diff artifacts/traceability-version-lock.json
 git add artifacts/traceability-version-lock.json
 ```
+
+只清理一次改号产生的那条边时，点名它，不要整体清扫：
+
+```bash
+pnpm exec artifact-graph version-lock refresh --changed-only --worktree --remove-orphan-edge <edgeId>
+```
+
+`--remove-orphan-edge` 可重复指定，只对当前仍是孤儿的边生效，并与 `--remove-orphans` 互斥
+（同时给出即被拒绝）。点名仍是活边的边会被拒绝且不删除；同一锁文件里既有的孤立锁保持不变。
 
 `version-lock audit` 会把结构性孤立锁和陈旧哈希标记为阻断问题，并输出上述解决步骤；
 runner liveness 发现（测试文件不再处于任何已配置 runner 的激活范围）只是警告，不会阻断。

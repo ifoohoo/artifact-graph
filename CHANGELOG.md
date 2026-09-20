@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## 0.13.0
+
+### Added
+
+- Added `artifact-graph restructure inspect`, `plan`, `apply`, `recover`, and
+  `prune-recovery` for reviewable artifact splitting, moving, renumbering, fail-closed file-set
+  application, and retained recovery-material handling.
+- Added repeatable `version-lock refresh --remove-orphan-edge <edgeId>` cleanup for explicitly
+  selected orphan implementation and artifact-relation locks.
+
+### Changed
+
+- Adopted `skill-family-contracts`, `skill-family-harness-node`, and
+  `skill-family-engineering-kit` 0.22.0 for the restructuring contracts, file-set mechanism, and
+  engineering validation.
+- Raised the supported Node.js range to `>=22.22.2 <23`.
+- Version lockstep with `artifact-chain-assistant` 0.13.0.
+
 ## 0.12.0
 
 ### Changed

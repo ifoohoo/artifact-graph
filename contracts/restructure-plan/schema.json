@@ -1,0 +1,112 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "artifact.restructure-plan@1",
+  "title": "Artifact Contract: Restructure Plan",
+  "version": "1.1.0",
+  "contractIdentity": {
+    "major": "artifact.restructure-plan@1",
+    "authority": "artifact",
+    "namespace": "artifact",
+    "revisionDigest": "sha256:afaf8c75738b4c4caf613ad4cabdb9b8423b646b2db799cf345d6de9c5869283"
+  },
+  "type": "object",
+  "required": ["schema_version", "operation_id", "validation_timeout_ms", "request_digest", "mapping_digest", "config_snapshot", "input_snapshots", "candidates", "graph_diff", "validation", "applicable"],
+  "properties": {
+    "schema_version": { "const": "1.1" },
+    "operation_id": { "$ref": "#/definitions/operationId" },
+    "validation_timeout_ms": { "const": 30000 },
+    "request_digest": { "$ref": "#/definitions/digest" },
+    "mapping_digest": { "$ref": "#/definitions/digest" },
+    "config_snapshot": { "$ref": "#/definitions/snapshot" },
+    "input_snapshots": { "type": "array", "items": { "$ref": "#/definitions/snapshot" } },
+    "candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "action", "content", "sha256", "mode", "original", "diff"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "action": { "enum": ["create", "replace", "delete"] },
+          "content": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+          "sha256": { "anyOf": [{ "$ref": "#/definitions/digest" }, { "type": "null" }] },
+          "mode": { "$ref": "#/definitions/mode" },
+          "original": { "$ref": "#/definitions/snapshot" },
+          "diff": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "graph_diff": {
+      "type": "object",
+      "required": ["added_nodes", "removed_nodes", "added_edges", "removed_edges"],
+      "properties": {
+        "added_nodes": { "type": "array", "items": { "type": "string" } },
+        "removed_nodes": { "type": "array", "items": { "type": "string" } },
+        "added_edges": { "type": "array", "items": { "type": "string" } },
+        "removed_edges": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "validation": {
+      "type": "object",
+      "required": ["blockers", "unresolved", "candidate_issues", "consumer_candidates"],
+      "properties": {
+        "blockers": { "type": "array", "items": { "$ref": "#/definitions/finding" } },
+        "unresolved": { "type": "array", "items": { "$ref": "#/definitions/finding" } },
+        "candidate_issues": { "type": "array", "items": { "type": "object" } },
+        "consumer_candidates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["path", "line", "reference"],
+            "properties": {
+              "path": { "type": "string", "minLength": 1 },
+              "line": { "type": "integer", "minimum": 1 },
+              "reference": { "type": "string", "minLength": 1 }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "applicable": { "type": "boolean" }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "operationId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "mode": {
+      "anyOf": [
+        { "type": "integer", "minimum": 0, "maximum": 511 },
+        { "type": "null" }
+      ]
+    },
+    "snapshot": {
+      "type": "object",
+      "required": ["path", "exists", "sha256", "size", "mode"],
+      "properties": {
+        "path": { "type": "string" },
+        "exists": { "type": "boolean" },
+        "sha256": { "anyOf": [{ "$ref": "#/definitions/digest" }, { "type": "null" }] },
+        "size": { "type": "integer", "minimum": 0 },
+        "mode": { "$ref": "#/definitions/mode" }
+      },
+      "additionalProperties": false
+    },
+    "finding": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "type": "string", "minLength": 1 },
+        "message": { "type": "string", "minLength": 1 },
+        "path": { "type": "string" },
+        "line": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": true
+    }
+  }
+}

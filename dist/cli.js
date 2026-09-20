@@ -944,9 +944,13 @@ async function bootstrapVersionLock(root, options = {}) {
 async function refreshVersionLock(root, options = {}) {
   const lockPath = normalizeRelativePath(root, options.lockPath ?? VERSION_LOCK_PATH);
   const changedPaths = sortUnique2((options.changedPaths ?? []).map((path) => normalizeRelativePath(root, path)));
+  const removeOrphanEdges = new Set(sortUnique2(options.removeOrphanEdges ?? []));
   const all = options.all === true || options.changedOnly !== true;
   const mode = all ? "all" : "changed-only";
   const warnings = [];
+  if (options.removeOrphans === true && removeOrphanEdges.size > 0) {
+    throw new Error("--remove-orphans and --remove-orphan-edge are mutually exclusive");
+  }
   if (!all && changedPaths.includes("artifact-graph.config.yaml")) {
     throw new Error("Changed-only version-lock refresh includes artifact-graph.config.yaml and requires --all");
   }
@@ -956,9 +960,16 @@ async function refreshVersionLock(root, options = {}) {
   const nodeByUid = new Map(index.nodes.map((node) => [node.uid, node]));
   const nodeByPath = new Map(index.nodes.map((node) => [node.path, node]));
   const currentImplementationEdges = await lockableImplementationEdges(root, index, config);
+  const currentArtifactRelationEdgeList = artifactRelationEdges(index);
   const currentEdgePairs = new Set(currentImplementationEdges.map((edge2) => `${edge2.from}	${edge2.to}`));
   const currentEntries = /* @__PURE__ */ new Map();
   const changedPathSet = new Set(changedPaths);
+  validatePreciseOrphanRemoval(
+    removeOrphanEdges,
+    lock,
+    new Set(currentImplementationEdges.map((edge2) => edge2.edgeId)),
+    new Set(currentArtifactRelationEdgeList.map((edge2) => edge2.edgeId))
+  );
   const affectedEdges = /* @__PURE__ */ new Set();
   const addedLocks = [];
   const updatedLocks = [];
@@ -985,12 +996,13 @@ async function refreshVersionLock(root, options = {}) {
   }
   for (const existing of lock.locks) {
     const current = currentEntries.get(existing.edgeId);
-    const affected = all || lockEntryTouchesAnyPath(existing, changedPathSet);
+    const removePrecisely = removeOrphanEdges.has(existing.edgeId);
+    const affected = removePrecisely || all || lockEntryTouchesAnyPath(existing, changedPathSet);
     if (affected) {
       affectedEdges.add(existing.edgeId);
     }
     if (!current) {
-      if (affected && options.removeOrphans === true) {
+      if (removePrecisely || affected && options.removeOrphans === true) {
         removedOrphans.push(existing.edgeId);
       } else {
         if (affected) {
@@ -1025,7 +1037,6 @@ async function refreshVersionLock(root, options = {}) {
   if (mode === "changed-only" && changedPaths.length === 0) {
     warnings.push("No changed paths were provided; no locks were refreshed.");
   }
-  const currentArtifactRelationEdgeList = artifactRelationEdges(index);
   const existingArtifactRelationLocks = lock.artifactRelations ?? [];
   const addedArtifactRelationLocks = [];
   const updatedArtifactRelationLocks = [];
@@ -1069,10 +1080,11 @@ async function refreshVersionLock(root, options = {}) {
     if (processedRelationEdgeIds.has(relEdgeId)) {
       continue;
     }
-    const affected = all || artifactRelationLockTouchesPaths(existingLock, changedPathSet);
+    const removePrecisely = removeOrphanEdges.has(relEdgeId);
+    const affected = removePrecisely || all || artifactRelationLockTouchesPaths(existingLock, changedPathSet);
     if (affected) {
       affectedEdges.add(relEdgeId);
-      if (options.removeOrphans === true) {
+      if (removePrecisely || options.removeOrphans === true) {
         removedArtifactRelationLocks.push(relEdgeId);
       } else {
         retainedArtifactRelationOrphans.push(relEdgeId);
@@ -1107,6 +1119,20 @@ async function refreshVersionLock(root, options = {}) {
     postAudit,
     warnings
   };
+}
+function validatePreciseOrphanRemoval(requestedEdgeIds, lock, currentImplementationEdgeIds, currentArtifactRelationEdgeIds) {
+  for (const edgeId of requestedEdgeIds) {
+    const matches = lock.locks.filter((entry) => entry.edgeId === edgeId).length + (lock.artifactRelations ?? []).filter((entry) => entry.edgeId === edgeId).length;
+    if (matches === 0) {
+      throw new Error(`Cannot remove orphan edge ${edgeId}: edgeId does not exist in the version lock`);
+    }
+    if (matches !== 1) {
+      throw new Error(`Cannot remove orphan edge ${edgeId}: edgeId does not match exactly one version lock entry`);
+    }
+    if (currentImplementationEdgeIds.has(edgeId) || currentArtifactRelationEdgeIds.has(edgeId)) {
+      throw new Error(`Cannot remove orphan edge ${edgeId}: edge is currently active`);
+    }
+  }
 }
 async function traceVersion(root, target, lockPath = VERSION_LOCK_PATH) {
   const index = await buildVersionIndex(root);
@@ -3082,16 +3108,16 @@ function probeNativeBinding(context = {}) {
   }
   return { ok: true };
 }
-function buildNativeBindingDiagnostic(failure, probeContext) {
+function buildNativeBindingDiagnostic(failure2, probeContext) {
   return {
     selectedCli: probeContext.selectedCli,
     runtime: `${process.execPath} (v${process.versions.node})`,
-    abi: `process.versions.modules=${process.versions.modules}${abiPrebuiltHint(failure.detail)}`,
+    abi: `process.versions.modules=${process.versions.modules}${abiPrebuiltHint(failure2.detail)}`,
     installSource: probeContext.installSource,
     probedFrom: probeContext.probedFrom,
-    failedStage: failure.failedStage,
-    cause: failure.cause,
-    suggestion: failure.suggestion
+    failedStage: failure2.failedStage,
+    cause: failure2.cause,
+    suggestion: failure2.suggestion
   };
 }
 function buildNativeBindingSuccessDiagnostic(probeContext) {
@@ -3115,21 +3141,21 @@ function runningArtifactGraphInstallRoot() {
   const anchor = typeof __filename === "string" ? __filename : fileURLToPath(import.meta.url);
   return findPackageRoot(anchor);
 }
-function structuredNativeBindingError(failure, context = {}) {
+function structuredNativeBindingError(failure2, context = {}) {
   return {
     error: "native_binding_unavailable",
-    stage: failure.failedStage,
-    cause: failure.cause,
-    detail: failure.detail,
-    suggestion: failure.suggestion,
+    stage: failure2.failedStage,
+    cause: failure2.cause,
+    detail: failure2.detail,
+    suggestion: failure2.suggestion,
     doctorHint: "artifact-graph doctor --format json",
     // F-10-P01/F-10-P03：机器读取错误包络也暴露实际探测来源，使 scan/query
     // 与 doctor 的分类依据（同一运行安装根）可被自动测试断言。
     probedFrom: context.probedFrom ?? "(current artifact-graph package)"
   };
 }
-function renderStructuredNativeBindingError(failure, context = {}) {
-  return `${JSON.stringify(structuredNativeBindingError(failure, context), null, 2)}
+function renderStructuredNativeBindingError(failure2, context = {}) {
+  return `${JSON.stringify(structuredNativeBindingError(failure2, context), null, 2)}
 `;
 }
 function safeClose(db) {
@@ -3233,7 +3259,7 @@ async function doctorArtifactChain(root, options = {}) {
   const nativeBinding = probe.ok ? { ok: true, ...buildNativeBindingSuccessDiagnostic(probeContext) } : { ok: false, ...buildNativeBindingDiagnostic(probe, probeContext) };
   const warnings = [
     ...cli.warnings,
-    ...nodeCompatible ? [] : [`Node.js ${process.versions.node} does not satisfy >=22.0.0.`],
+    ...nodeCompatible ? [] : [`Node.js ${process.versions.node} does not satisfy ${REQUIRED_NODE_VERSION}.`],
     ...probe.ok ? [] : [
       `better-sqlite3 binding probe FAILED at stage "${probe.failedStage}" (cause ${probe.cause}): ${probe.suggestion}`
     ]
@@ -3245,7 +3271,7 @@ async function doctorArtifactChain(root, options = {}) {
     node: {
       version: process.versions.node,
       compatible: nodeCompatible,
-      required: ">=22.0.0"
+      required: REQUIRED_NODE_VERSION
     },
     config: {
       path: configPath,
@@ -3349,8 +3375,10 @@ function resolveCandidatePath(root, candidatePath) {
   return isAbsolute2(candidatePath) ? candidatePath : resolve3(root, candidatePath);
 }
 function isNodeCompatible(version) {
-  const major = Number(version.split(".")[0]);
-  return Number.isFinite(major) && major >= 22;
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.-]+)?$/.exec(version);
+  if (!match) return false;
+  const [, major, minor, patch] = match.map(Number);
+  return major === 22 && (minor > 22 || minor === 22 && patch >= 2);
 }
 async function detectPnpmVersion() {
   try {
@@ -3411,13 +3439,14 @@ function safeRealpath(path) {
     return path;
   }
 }
-var execFileAsync2, KNOWN_COMMANDS;
+var execFileAsync2, REQUIRED_NODE_VERSION, KNOWN_COMMANDS;
 var init_cli_resolver = __esm({
   "src/cli-resolver.ts"() {
     "use strict";
     init_versioned_traceability();
     init_native_binding_diagnostics();
     execFileAsync2 = promisify2(execFile2);
+    REQUIRED_NODE_VERSION = ">=22.22.2 <23";
     KNOWN_COMMANDS = [
       "init",
       "scan",
@@ -3972,8 +4001,8 @@ function validateReviewResult(input) {
     validateReviewData(obj.review, "$.review", errors);
     if (obj.decision === "PASS" || obj.decision === "PASS_WITH_RESIDUAL_MINOR") {
       const findings = isPlainObject(obj.review) && Array.isArray(obj.review.findings) ? obj.review.findings : [];
-      findings.forEach((finding, index) => {
-        if (isPlainObject(finding) && finding.severity === "block" && (finding.status === void 0 || finding.status === "open")) {
+      findings.forEach((finding2, index) => {
+        if (isPlainObject(finding2) && finding2.severity === "block" && (finding2.status === void 0 || finding2.status === "open")) {
           errors.push({
             path: `$.review.findings[${index}]`,
             message: `${obj.decision} cannot contain an open block finding`
@@ -5146,12 +5175,1709 @@ var init_contract_kernel = __esm({
   }
 });
 
+// src/restructure-software.ts
+function lineStarts(raw) {
+  const starts = [0];
+  const buffer = Buffer.from(raw, "utf8");
+  for (let index = 0; index < buffer.length; index += 1) {
+    if (buffer[index] === 10) starts.push(index + 1);
+  }
+  return starts;
+}
+function markdownCodeLineMask(lines) {
+  const result = new Array(lines.length).fill(false);
+  let fence;
+  lines.forEach((line, index) => {
+    if (fence) {
+      result[index] = true;
+      const closing = /^ {0,3}(`+|~+)[ \t]*\r?$/.exec(line);
+      if (closing && closing[1][0] === fence.marker && closing[1].length >= fence.length) fence = void 0;
+      return;
+    }
+    const opening = /^ {0,3}(`{3,}|~{3,})(.*)\r?$/.exec(line);
+    if (opening) {
+      result[index] = true;
+      fence = { marker: opening[1][0], length: opening[1].length };
+      return;
+    }
+    if (/^(?: {4,}| {0,3}\t)/.test(line)) result[index] = true;
+  });
+  return result;
+}
+function markdownRecordHeadings(raw, type) {
+  const lines = raw.split("\n");
+  const masked = markdownCodeLineMask(lines);
+  const pattern = type === "scenario" ? /^#{2,3}\s+(S-\d+[a-z]?)\s*[:：]/ : type === "e2e_test" ? /^#{2,3}\s+(TC-\d+[a-z]?)\s*[:：]?/ : void 0;
+  if (!pattern) return [];
+  return lines.flatMap((line, index) => {
+    if (masked[index]) return [];
+    const match = pattern.exec(line.replace(/\r$/, ""));
+    return match ? [{ id: match[1], line: index + 1 }] : [];
+  });
+}
+function locateSoftwareRecord(raw, node, nodesInFile) {
+  const byteLength = Buffer.byteLength(raw, "utf8");
+  if (node.type === "feature") return { range: { startByte: 0, endByte: byteLength }, blockers: [] };
+  if (node.type !== "scenario" && node.type !== "e2e_test") {
+    return {
+      blockers: [{
+        code: "UNSUPPORTED_RECORD_BOUNDARY",
+        message: `\u9996\u8F6E\u4E0D\u652F\u6301 ${node.type} \u7684\u8BB0\u5F55\u8FB9\u754C\u7F16\u8BD1`,
+        path: node.path,
+        line: node.line
+      }]
+    };
+  }
+  const headings = markdownRecordHeadings(raw, node.type);
+  const expectedId = node.type === "e2e_test" ? String(node.attrs?.testCaseId ?? "") : node.code;
+  const heading = headings.find((item) => item.id === expectedId && item.line === node.line);
+  const graphRecords = nodesInFile.filter((item) => item.type === node.type && item.attrs?.fileLevelOnly !== true);
+  const graphLocations = new Set(graphRecords.map((item) => `${item.type === "e2e_test" ? String(item.attrs?.testCaseId ?? "") : item.code}:${item.line}`));
+  const headingLocations = new Set(headings.map((item) => `${item.id}:${item.line}`));
+  const inconsistent = graphLocations.size !== headingLocations.size || [...graphLocations].some((item) => !headingLocations.has(item));
+  if (inconsistent) {
+    return {
+      blockers: [{
+        code: node.type === "e2e_test" ? "E2E_BOUNDARY_INCONSISTENT" : "RECORD_BOUNDARY_INCONSISTENT",
+        message: "\u4EE3\u7801\u56F4\u680F\u611F\u77E5\u7684\u8BB0\u5F55\u8FB9\u754C\u4E0E\u73B0\u6709\u56FE\u89E3\u6790\u7ED3\u679C\u4E0D\u4E00\u81F4\uFF1B\u5FC5\u987B\u5148\u7EDF\u4E00\u89E3\u6790\u8D23\u4EFB",
+        path: node.path,
+        line: node.line
+      }]
+    };
+  }
+  if (!heading) {
+    return {
+      blockers: [{
+        code: "RECORD_BOUNDARY_MISSING",
+        message: `\u65E0\u6CD5\u5B9A\u4F4D ${node.uid} \u7684\u6B63\u6587\u8FB9\u754C`,
+        path: node.path,
+        line: node.line
+      }]
+    };
+  }
+  const starts = lineStarts(raw);
+  const nextLine = headings.find((item) => item.line > heading.line)?.line;
+  return {
+    range: {
+      startByte: starts[heading.line - 1] ?? 0,
+      endByte: nextLine ? starts[nextLine - 1] ?? byteLength : byteLength
+    },
+    blockers: []
+  };
+}
+function replaceSoftwareHeader(raw, header) {
+  const match = /^---(?:\r?\n)[\s\S]*?(?:\r?\n)---(?:\r?\n)?/.exec(raw);
+  const normalized = header.length > 0 && !/\r?\n$/.test(header) ? `${header}
+` : header;
+  return match ? `${normalized}${raw.slice(match[0].length)}` : `${normalized}${raw}`;
+}
+var init_restructure_software = __esm({
+  "src/restructure-software.ts"() {
+    "use strict";
+  }
+});
+
+// src/restructure-file-set.ts
+import { createHash as createHash3 } from "crypto";
+import { chmod, lstat as lstat2, mkdir as mkdir4, realpath, statfs } from "fs/promises";
+import { join as join8, resolve as resolve5 } from "path";
+async function loadFoundationModule() {
+  return await import(FOUNDATION_PACKAGE_NAME);
+}
+async function loadContractsModule() {
+  return await import(CONTRACTS_PACKAGE_NAME);
+}
+async function verifyMechanismResult(result) {
+  if (typeof result !== "object" || result === null || Array.isArray(result)) {
+    return failure("MECHANISM_RESULT_INVALID", "applyFileSet returned no concrete result object");
+  }
+  let contracts;
+  let registration;
+  try {
+    contracts = await loadContractsModule();
+    registration = contracts.findSchemaByObject(FILE_SET_RESULT_OBJECT);
+  } catch (cause) {
+    return failure("MECHANISM_RESULT_UNVERIFIABLE", `The published ${FILE_SET_RESULT_OBJECT} schema cannot be loaded: ${cause.message}`);
+  }
+  if (registration === null) {
+    return failure("MECHANISM_RESULT_UNVERIFIABLE", `The published contracts package no longer registers ${FILE_SET_RESULT_OBJECT}`);
+  }
+  const verdict = contracts.validateDocument(result, {
+    schemaId: registration.$id,
+    dialect: registration.dialect,
+    policy: "strict"
+  });
+  if (!verdict.valid) {
+    return failure(
+      "MECHANISM_RESULT_INVALID",
+      `The mechanism result is not a valid ${FILE_SET_RESULT_OBJECT} document (${verdict.errorCode ?? "invalid"})`,
+      { schemaId: registration.$id, errorCode: verdict.errorCode ?? null, errors: verdict.errors ?? [] }
+    );
+  }
+  return { ok: true, data: result };
+}
+function failure(code, message, details) {
+  return { ok: false, error: { code, message, ...details === void 0 ? {} : { details } } };
+}
+function candidateBytes(content) {
+  return Buffer.from(content ?? "", "utf8");
+}
+function candidateByteDigest(content) {
+  return createHash3("sha256").update(candidateBytes(content)).digest("hex");
+}
+function rawDigest(value, path) {
+  if (typeof value !== "string" || !value.startsWith(DIGEST_PREFIX)) {
+    throw new Error(`${path} does not carry a ${DIGEST_PREFIX}<hex> digest`);
+  }
+  const raw = value.slice(DIGEST_PREFIX.length);
+  if (!RAW_SHA256_PATTERN.test(raw)) {
+    throw new Error(`${path} digest is not 64 lowercase hexadecimal characters`);
+  }
+  return raw;
+}
+async function resolveRealRoot(root) {
+  let canonical;
+  try {
+    canonical = await realpath(resolve5(root));
+  } catch (cause) {
+    return failure("ROOT_INVALID", `Project root cannot be resolved: ${cause.message}`);
+  }
+  let info;
+  try {
+    info = await lstat2(canonical);
+  } catch (cause) {
+    return failure("ROOT_INVALID", `Project root cannot be inspected: ${cause.message}`);
+  }
+  if (info.isSymbolicLink() || !info.isDirectory()) {
+    return failure("ROOT_INVALID", `Project root must be one real directory: ${canonical}`);
+  }
+  return { ok: true, data: canonical };
+}
+async function qualifyRestructureMechanism(root) {
+  if (process.platform !== RESTRUCTURE_QUALIFIED_PLATFORM || process.arch !== RESTRUCTURE_QUALIFIED_ARCH) {
+    return failure(
+      "APPLY_ENVIRONMENT_UNSUPPORTED",
+      `Real apply is qualified only on ${RESTRUCTURE_QUALIFIED_PLATFORM}/${RESTRUCTURE_QUALIFIED_ARCH}; this runtime is ${process.platform}/${process.arch}`
+    );
+  }
+  const canonical = await resolveRealRoot(root);
+  if (!canonical.ok) return canonical;
+  let type;
+  try {
+    type = (await statfs(canonical.data)).type;
+  } catch (cause) {
+    return failure("APPLY_ENVIRONMENT_UNSUPPORTED", `Project root filesystem cannot be inspected: ${cause.message}`);
+  }
+  if (type !== APFS_STATFS_TYPE) {
+    return failure(
+      "APPLY_ENVIRONMENT_UNSUPPORTED",
+      `Real apply is qualified only on ${RESTRUCTURE_QUALIFIED_FILESYSTEM}; the project root reports filesystem type ${type}`
+    );
+  }
+  return { ok: true, data: { root: canonical.data, filesystem: RESTRUCTURE_QUALIFIED_FILESYSTEM } };
+}
+async function ensureRestructureMechanismRoot(canonicalRoot, options) {
+  const target = join8(canonicalRoot, RESTRUCTURE_RECOVERY_REL_PATH);
+  const current = async () => lstat2(target).catch((cause) => cause.code === "ENOENT" ? null : Promise.reject(cause));
+  let info = await current();
+  if (info === null) {
+    if (!options.create) {
+      return failure(
+        "RECOVERY_MATERIALS_MISSING",
+        `No ${RESTRUCTURE_RECOVERY_REL_PATH} mechanism directory exists under ${canonicalRoot}`
+      );
+    }
+    let created = false;
+    try {
+      await mkdir4(target, { mode: RESTRUCTURE_RECOVERY_ROOT_MODE });
+      created = true;
+    } catch (cause) {
+      if (cause.code !== "EEXIST") {
+        return failure("MECHANISM_ROOT_UNSAFE", `Cannot create ${target}: ${cause.message}`);
+      }
+    }
+    info = await current();
+    if (info === null) return failure("MECHANISM_ROOT_UNSAFE", `${target} disappeared while it was being created`);
+    if (info.isSymbolicLink() || !info.isDirectory()) {
+      return failure("MECHANISM_ROOT_UNSAFE", `${target} must be one real directory, not a link or special entry`);
+    }
+    if (created && (info.mode & 4095) !== RESTRUCTURE_RECOVERY_ROOT_MODE) {
+      await chmod(target, RESTRUCTURE_RECOVERY_ROOT_MODE);
+      info = await current();
+      if (info === null || info.isSymbolicLink() || !info.isDirectory()) {
+        return failure("MECHANISM_ROOT_UNSAFE", `${target} must be one real directory, not a link or special entry`);
+      }
+    }
+  }
+  if (info.isSymbolicLink() || !info.isDirectory()) {
+    return failure("MECHANISM_ROOT_UNSAFE", `${target} must be one real directory, not a link or special entry`);
+  }
+  if ((info.mode & 4095) !== RESTRUCTURE_RECOVERY_ROOT_MODE) {
+    return failure(
+      "MECHANISM_ROOT_UNSAFE",
+      `${target} must have mode 0${RESTRUCTURE_RECOVERY_ROOT_MODE.toString(8)}; it has 0${(info.mode & 4095).toString(8)}`
+    );
+  }
+  return { ok: true, data: target };
+}
+async function createRestructureRootBinding(canonicalRoot) {
+  try {
+    const module = await loadFoundationModule();
+    return { ok: true, data: await module.createFilesystemRootBinding(canonicalRoot) };
+  } catch (cause) {
+    return failure("MECHANISM_CALL_FAILED", `The adopted mechanism refused the project root binding: ${cause.message}`);
+  }
+}
+function toOperation(candidate) {
+  const expected = candidate.original.exists ? {
+    exists: true,
+    sha256: rawDigest(candidate.original.sha256, `${candidate.path} original`),
+    size: candidate.original.size,
+    mode: candidate.original.mode
+  } : { exists: false };
+  if (candidate.action === "delete") {
+    return { path: candidate.path, action: "delete", expected, next: null };
+  }
+  const bytes = candidateBytes(candidate.content);
+  const declared = rawDigest(candidate.sha256, candidate.path);
+  if (declared !== candidateByteDigest(candidate.content)) {
+    throw new Error(`${candidate.path} candidate bytes do not match their frozen digest`);
+  }
+  return {
+    path: candidate.path,
+    action: candidate.action,
+    expected,
+    next: { sha256: declared, size: bytes.byteLength, mode: candidate.mode, bytes }
+  };
+}
+async function buildFileSetApplyRequest(canonicalRoot, plan) {
+  if (plan.candidates.length === 0) {
+    return failure("PLAN_ZERO_OPERATIONS", "A plan with no file operations has nothing to apply");
+  }
+  const binding = await createRestructureRootBinding(canonicalRoot);
+  if (!binding.ok) return binding;
+  let operations;
+  try {
+    operations = plan.candidates.map(toOperation);
+  } catch (cause) {
+    return failure("CANDIDATE_BYTES_MISMATCH", cause.message);
+  }
+  return {
+    ok: true,
+    data: {
+      schemaVersion: 1,
+      kind: "skill-family.file-set-apply-request",
+      operationId: plan.operation_id,
+      root: canonicalRoot,
+      rootBinding: binding.data,
+      recoveryRelPath: RESTRUCTURE_RECOVERY_REL_PATH,
+      allowAdjacentStaging: true,
+      environment: { filesystem: RESTRUCTURE_QUALIFIED_FILESYSTEM, cooperativeWriters: true },
+      validationTimeoutMs: plan.validation_timeout_ms,
+      operations
+    }
+  };
+}
+async function applyRestructureFileSet(canonicalRoot, plan, options) {
+  const request = await buildFileSetApplyRequest(canonicalRoot, plan);
+  if (!request.ok) return request;
+  const module = await loadFoundationModule();
+  let raw;
+  try {
+    raw = await module.applyFileSet(request.data, { validate: options.validate });
+  } catch (cause) {
+    return failure("MECHANISM_CALL_FAILED", `applyFileSet did not return a mechanism result: ${cause.message}`);
+  }
+  return await verifyMechanismResult(raw);
+}
+async function observeRestructureJournal(canonicalRoot) {
+  const journalRoot = join8(canonicalRoot, RESTRUCTURE_RECOVERY_REL_PATH, "journal");
+  const module = await loadFoundationModule();
+  try {
+    return { ok: true, data: await module.inspectStateStoreLock(journalRoot, { recoveryObservation: true }) };
+  } catch (cause) {
+    return failure(
+      "MAINTENANCE_OBSERVATION_FAILED",
+      `The ${RESTRUCTURE_RECOVERY_JOURNAL_REL_PATH} journal cannot be observed: ${cause.message}`
+    );
+  }
+}
+async function recoverRestructureFileSet(canonicalRoot, plan, options) {
+  if (!options.allParticipantsStopped || !options.exclusiveMaintenance) {
+    return failure(
+      "MAINTENANCE_CONFIRMATION_REQUIRED",
+      "restructure recover requires --confirm-all-participants-stopped and --confirm-exclusive-maintenance"
+    );
+  }
+  const binding = await createRestructureRootBinding(canonicalRoot);
+  if (!binding.ok) return binding;
+  const observation = await observeRestructureJournal(canonicalRoot);
+  if (!observation.ok) return observation;
+  const maintenance = {
+    observation: observation.data,
+    confirmAllParticipantsStopped: true,
+    confirmExclusiveMaintenance: true
+  };
+  const request = {
+    schemaVersion: 1,
+    kind: "skill-family.file-set-recovery-request",
+    operationId: plan.operation_id,
+    root: canonicalRoot,
+    rootBinding: binding.data,
+    recoveryRelPath: RESTRUCTURE_RECOVERY_REL_PATH,
+    environment: { filesystem: RESTRUCTURE_QUALIFIED_FILESYSTEM, cooperativeWriters: true },
+    allowAdjacentStaging: true,
+    maintenance
+  };
+  const module = await loadFoundationModule();
+  let raw;
+  try {
+    raw = await module.recoverFileSet(request);
+  } catch (cause) {
+    return failure("MECHANISM_CALL_FAILED", `recoverFileSet did not return a mechanism result: ${cause.message}`);
+  }
+  return await verifyMechanismResult(raw);
+}
+async function pruneRestructureFileSet(canonicalRoot, plan, options) {
+  const binding = await createRestructureRootBinding(canonicalRoot);
+  if (!binding.ok) return binding;
+  const request = {
+    schemaVersion: 1,
+    kind: "skill-family.file-set-prune-request",
+    operationId: plan.operation_id,
+    root: canonicalRoot,
+    rootBinding: binding.data,
+    recoveryRelPath: RESTRUCTURE_RECOVERY_REL_PATH,
+    environment: { filesystem: RESTRUCTURE_QUALIFIED_FILESYSTEM, cooperativeWriters: true }
+  };
+  if (options.allParticipantsStopped && options.exclusiveMaintenance) {
+    const observation = await observeRestructureJournal(canonicalRoot);
+    if (!observation.ok) return observation;
+    request.maintenance = {
+      observation: observation.data,
+      confirmAllParticipantsStopped: true,
+      confirmExclusiveMaintenance: true
+    };
+  }
+  const module = await loadFoundationModule();
+  let raw;
+  try {
+    raw = await module.pruneFileSetRecovery(request);
+  } catch (cause) {
+    return failure("MECHANISM_CALL_FAILED", `pruneFileSetRecovery did not return a mechanism result: ${cause.message}`);
+  }
+  return await verifyMechanismResult(raw);
+}
+function validationState(validation) {
+  return validation.reason === null ? `validation.${validation.status}` : `validation.${validation.status}/${validation.reason}`;
+}
+function errorKinds(result) {
+  return [...new Set(result.errors.map((entry) => entry.details.kind))].sort();
+}
+function applyProjection(result) {
+  const kinds = errorKinds(result);
+  if (result.outcome === "committed") {
+    if (kinds.some((kind) => APPLY_MAINTENANCE_ERROR_KINDS.includes(kind))) {
+      return {
+        code: "APPLY_COMMITTED_MAINTENANCE_REQUIRED",
+        message: "The file set is committed but the exclusive project lock could not be released. Do not re-run apply for this plan; establish an exclusive maintenance interval and run restructure recover to confirm the terminal state.",
+        ok: false,
+        rerunApplyPermitted: false
+      };
+    }
+    const unconditional = result.validation.status === "passed" && result.errors.length === 0 && result.paths.length > 0 && result.paths.every((entry) => entry.current === "expected-new");
+    return unconditional ? { code: "APPLIED", message: `Applied ${result.paths.length} file operation(s); every path is at its frozen new state.`, ok: true, rerunApplyPermitted: false } : {
+      code: "APPLY_INCOMPLETE",
+      message: "The mechanism reported a commit but the per-path facts or validation do not support unconditional success.",
+      ok: false,
+      rerunApplyPermitted: false
+    };
+  }
+  const codes = {
+    "commit-unconfirmed": ["APPLY_COMMIT_UNCONFIRMED", "The commit decision is durable but its confirmation is incomplete; the file set is never rolled back automatically."],
+    "recovery-required": ["APPLY_RECOVERY_REQUIRED", "The mechanism could not prove a safe terminal state. Materials and recorded facts are retained for an explicit maintenance recovery."],
+    "rolled-back": ["APPLY_ROLLED_BACK", "The file set was rolled back to its original bytes and modes. This operation id is registered; re-plan to obtain a new id before applying again."]
+  };
+  const mapped = codes[result.outcome];
+  if (mapped) return { code: mapped[0], message: mapped[1], ok: false, rerunApplyPermitted: false };
+  if (result.outcome === "rejected") {
+    const identityTaken = kinds.some((kind) => kind === "operation-id-reused" || kind === "unfinished-operation");
+    return {
+      code: "APPLY_REJECTED",
+      message: identityTaken ? "The mechanism refused this plan because its operation id is already registered. Re-plan to obtain a new id before applying again." : "The mechanism refused the whole group before any business write. The environment can be corrected and the same plan retried.",
+      ok: false,
+      rerunApplyPermitted: !identityTaken
+    };
+  }
+  return {
+    code: "APPLY_UNEXPECTED_OUTCOME",
+    message: `The mechanism returned outcome ${result.outcome} for an apply call.`,
+    ok: false,
+    rerunApplyPermitted: false
+  };
+}
+function recoverProjection(result) {
+  const reading = (() => {
+    switch (result.outcome) {
+      case "already-committed":
+        return { code: "RECOVER_COMMITTED_CONFIRMED", message: "The recorded commit decision is confirmed as the terminal state; no path was rewritten.", ok: true };
+      case "already-rolled-back":
+        return { code: "RECOVER_ROLLED_BACK_CONFIRMED", message: "The recorded rollback is confirmed as the terminal state.", ok: true };
+      case "rolled-back":
+        return { code: "RECOVER_ROLLED_BACK", message: "The interrupted file set was restored to its original bytes and modes.", ok: true };
+      case "pruned":
+        return { code: "RECOVER_PRUNE_COMPLETED", message: "The interrupted material cleanup of a terminal operation was resumed and finished.", ok: true };
+      case "already-pruned":
+        return { code: "RECOVER_ALREADY_PRUNED", message: "The terminal materials of this operation were already cleaned; the journal is retained.", ok: true };
+      case "commit-unconfirmed":
+        return { code: "RECOVER_COMMIT_UNCONFIRMED", message: "A valid commit decision is durable but its strict confirmation did not hold; it is never reversed automatically.", ok: false };
+      case "recovery-required":
+        return { code: "RECOVER_REQUIRED", message: "Recovery could not reach a proven terminal state; materials and facts are retained.", ok: false };
+      case "rejected":
+        return { code: "RECOVER_REJECTED", message: "The mechanism refused the recovery request before any business write.", ok: false };
+      default:
+        return { code: "RECOVER_UNEXPECTED_OUTCOME", message: `The mechanism returned outcome ${result.outcome} for a recover call.`, ok: false };
+    }
+  })();
+  return { ...reading, rerunApplyPermitted: false };
+}
+function pruneProjection(result) {
+  const reading = (() => {
+    switch (result.outcome) {
+      case "pruned":
+        return { code: "PRUNED", message: "The terminal materials of this operation were removed; the journal is retained.", ok: true };
+      case "already-pruned":
+        return { code: "ALREADY_PRUNED", message: "The terminal materials of this operation were already removed.", ok: true };
+      case "rejected":
+        return { code: "PRUNE_REJECTED", message: "The mechanism refused the cleanup before touching any material.", ok: false };
+      case "recovery-required":
+        return { code: "PRUNE_RECOVERY_REQUIRED", message: "The cleanup stopped half way; the refusal and material facts are retained and a retry resumes the same plan.", ok: false };
+      default:
+        return { code: "PRUNE_UNEXPECTED_OUTCOME", message: `The mechanism returned outcome ${result.outcome} for a prune call.`, ok: false };
+    }
+  })();
+  return { ...reading, rerunApplyPermitted: false };
+}
+function projectRestructureFileSetResult(result, planPath = "", planDigest = "") {
+  const base = {
+    foundation: result,
+    planPath,
+    planDigest,
+    operation: result.operation,
+    outcome: result.outcome,
+    preflight: result.preflight,
+    businessWrite: result.businessWrite,
+    validation: result.validation,
+    validationState: validationState(result.validation),
+    recovery: result.recovery,
+    paths: result.paths,
+    errors: result.errors,
+    materialPath: result.materials.relPath,
+    errorKinds: errorKinds(result)
+  };
+  const reading = result.operation === "apply" ? applyProjection(result) : result.operation === "recover" ? recoverProjection(result) : pruneProjection(result);
+  return { ...base, ...reading };
+}
+var RESTRUCTURE_RECOVERY_REL_PATH, RESTRUCTURE_RECOVERY_JOURNAL_REL_PATH, RESTRUCTURE_RECOVERY_ROOT_MODE, RESTRUCTURE_QUALIFIED_PLATFORM, RESTRUCTURE_QUALIFIED_ARCH, RESTRUCTURE_QUALIFIED_FILESYSTEM, APFS_STATFS_TYPE, DIGEST_PREFIX, RAW_SHA256_PATTERN, FOUNDATION_PACKAGE_NAME, CONTRACTS_PACKAGE_NAME, FILE_SET_RESULT_OBJECT, APPLY_MAINTENANCE_ERROR_KINDS;
+var init_restructure_file_set = __esm({
+  "src/restructure-file-set.ts"() {
+    "use strict";
+    RESTRUCTURE_RECOVERY_REL_PATH = ".foundation-file-apply";
+    RESTRUCTURE_RECOVERY_JOURNAL_REL_PATH = `${RESTRUCTURE_RECOVERY_REL_PATH}/journal`;
+    RESTRUCTURE_RECOVERY_ROOT_MODE = 448;
+    RESTRUCTURE_QUALIFIED_PLATFORM = "darwin";
+    RESTRUCTURE_QUALIFIED_ARCH = "arm64";
+    RESTRUCTURE_QUALIFIED_FILESYSTEM = "apfs";
+    APFS_STATFS_TYPE = 26;
+    DIGEST_PREFIX = "sha256:";
+    RAW_SHA256_PATTERN = /^[a-f0-9]{64}$/;
+    FOUNDATION_PACKAGE_NAME = "skill-family-harness-node";
+    CONTRACTS_PACKAGE_NAME = "skill-family-contracts";
+    FILE_SET_RESULT_OBJECT = "file-set-result";
+    APPLY_MAINTENANCE_ERROR_KINDS = ["lock-release-failed"];
+  }
+});
+
+// src/restructure.ts
+var restructure_exports = {};
+__export(restructure_exports, {
+  RESTRUCTURE_MAX_OPERATIONS: () => RESTRUCTURE_MAX_OPERATIONS,
+  RESTRUCTURE_MAX_TOTAL_BYTES: () => RESTRUCTURE_MAX_TOTAL_BYTES,
+  RESTRUCTURE_PLAN_SCHEMA_VERSION: () => RESTRUCTURE_PLAN_SCHEMA_VERSION,
+  RESTRUCTURE_VALIDATION_TIMEOUT_MS: () => RESTRUCTURE_VALIDATION_TIMEOUT_MS,
+  applyRestructure: () => applyRestructure,
+  createModeForUmask: () => createModeForUmask,
+  createRestructureValidationCallback: () => createRestructureValidationCallback,
+  digestRestructureValue: () => digestRestructureValue,
+  gateRestructureOperationPlan: () => gateRestructureOperationPlan,
+  inspectRestructure: () => inspectRestructure,
+  planRestructure: () => planRestructure,
+  planningUmask: () => planningUmask,
+  pruneRestructureRecovery: () => pruneRestructureRecovery,
+  recoverRestructure: () => recoverRestructure,
+  restructureBoundaryFindings: () => restructureBoundaryFindings
+});
+import { createHash as createHash4, randomUUID as randomUUID2 } from "crypto";
+import { lstat as lstat3, readFile as readFile3, readdir as readdir3, realpath as realpath2, stat } from "fs/promises";
+import { dirname as dirname5, isAbsolute as isAbsolute4, join as join9, posix, relative as relative4, resolve as resolve6 } from "path";
+import { fileURLToPath as fileURLToPath2 } from "url";
+function digestBytes(value) {
+  return `sha256:${createHash4("sha256").update(value).digest("hex")}`;
+}
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value).filter(([, item]) => item !== void 0).sort(([left], [right]) => left.localeCompare(right)).map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+function digestRestructureValue(value) {
+  return digestBytes(canonicalJson(value));
+}
+function normalizeRelativePath2(value) {
+  if (!value || value.includes("\0") || isAbsolute4(value)) return void 0;
+  const normalized = value.replace(/\\/g, "/").replace(/^\.\//, "");
+  if (!normalized || normalized === "." || normalized.split("/").some((part) => part === ".." || part === "")) return void 0;
+  return normalized;
+}
+function isPathAllowed(path, allowed) {
+  return allowed.some((entry) => {
+    const normalized = normalizeRelativePath2(entry.replace(/\/$/, ""));
+    return normalized !== void 0 && (path === normalized || path.startsWith(`${normalized}/`));
+  });
+}
+async function readContainedFileWithMode(root, path) {
+  const normalized = normalizeRelativePath2(path);
+  if (!normalized) throw new Error(`Path must be a project-relative path without traversal: ${path}`);
+  const absoluteRoot = resolve6(root);
+  const absolutePath = resolve6(absoluteRoot, normalized);
+  if (relative4(absoluteRoot, absolutePath).startsWith("..")) throw new Error(`Path escapes project root: ${path}`);
+  try {
+    const info = await lstat3(absolutePath);
+    if (info.isSymbolicLink() || !info.isFile()) throw new Error(`Path is not a regular file: ${path}`);
+    return { buffer: await readFile3(absolutePath), mode: info.mode & MAX_POSIX_MODE };
+  } catch (error) {
+    if (error.code === "ENOENT") return void 0;
+    throw error;
+  }
+}
+async function readContainedFile(root, path) {
+  return (await readContainedFileWithMode(root, path))?.buffer;
+}
+async function snapshotFile(root, path) {
+  const normalized = normalizeRelativePath2(path);
+  if (!normalized) throw new Error(`Path must be a project-relative path without traversal: ${path}`);
+  const contained = await readContainedFileWithMode(root, normalized);
+  return contained === void 0 ? { path: normalized, exists: false, sha256: null, size: 0, mode: null } : {
+    path: normalized,
+    exists: true,
+    sha256: digestBytes(contained.buffer),
+    size: contained.buffer.byteLength,
+    mode: contained.mode
+  };
+}
+function sameSnapshot(left, right) {
+  return left.path === right.path && left.exists === right.exists && left.sha256 === right.sha256 && left.size === right.size && left.mode === right.mode;
+}
+async function configSnapshot(root) {
+  return snapshotFile(root, "artifact-graph.config.yaml");
+}
+async function loadRestructureContract(name) {
+  return loadContract(join9(CONTRACT_ROOT, `restructure-${name}`, "schema.json"), { expectedAuthority: "artifact" });
+}
+async function validateDomainContract(name, value) {
+  const contract = await loadRestructureContract(name);
+  return validateContractAgainstSchema(value, contract).errors;
+}
+function occurrenceKey(edge2) {
+  return [edge2.from, edge2.to, edge2.kind, edge2.source, edge2.sourcePath, edge2.sourceLine].join("	");
+}
+function relationOccurrences(graph) {
+  const counts = /* @__PURE__ */ new Map();
+  return [...graph.edges].sort((left, right) => occurrenceKey(left).localeCompare(occurrenceKey(right))).map((edge2) => {
+    const key = occurrenceKey(edge2);
+    const occurrence = (counts.get(key) ?? 0) + 1;
+    counts.set(key, occurrence);
+    return {
+      from: edge2.from,
+      to: edge2.to,
+      kind: edge2.kind,
+      source: edge2.source,
+      source_path: edge2.sourcePath,
+      source_line: edge2.sourceLine,
+      occurrence
+    };
+  });
+}
+function relationKey(value) {
+  return [value.from, value.to, value.kind, value.source, value.source_path, value.source_line, value.occurrence].join("	");
+}
+function acceptanceCriteria(node) {
+  const raw = node.attrs?.acceptanceCriteria;
+  if (!Array.isArray(raw)) return [];
+  return raw.flatMap((item, index) => {
+    if (typeof item === "string") {
+      const match = /\b(AC\d+)\b/.exec(item);
+      return [match?.[1] ?? `AC${index + 1}`];
+    }
+    if (item && typeof item === "object") {
+      const record = item;
+      const value = String(record.id ?? record.code ?? "").trim();
+      return value ? [value] : [`AC${index + 1}`];
+    }
+    return [`AC${index + 1}`];
+  });
+}
+function spanFor(buffer, path, range) {
+  return {
+    path,
+    start_byte: range.startByte,
+    end_byte: range.endByte,
+    sha256: digestBytes(buffer.subarray(range.startByte, range.endByte))
+  };
+}
+function mappingTemplate(request, requestDigest, config, sources, unresolved) {
+  return {
+    schema_version: "1.0",
+    request,
+    request_digest: requestDigest,
+    config_snapshot: config,
+    sources: sources.map((source) => ({
+      type: source.type,
+      id: source.id,
+      path: source.path,
+      snapshot: source.snapshot,
+      disposition: "preserved"
+    })),
+    targets: [],
+    content_moves: [],
+    identity_map: [],
+    criterion_map: [],
+    relation_map: [],
+    prose_edits: [],
+    file_headers: [],
+    unresolved
+  };
+}
+async function inspectRestructure(root, input) {
+  const schemaErrors = await validateDomainContract("request", input);
+  if (schemaErrors.length > 0) {
+    return { ok: false, error: { code: "REQUEST_SCHEMA_INVALID", message: "Restructure request does not match its contract", details: schemaErrors } };
+  }
+  const request = input;
+  const requestDigest = digestRestructureValue(request);
+  const schema = await loadConfig(root);
+  const graph = await scanArtifacts(root, schema);
+  const allOccurrences = relationOccurrences(graph);
+  const blockers = [];
+  const unresolved = [];
+  const inspected = [];
+  for (const requested of request.sources) {
+    const candidates = graph.nodes.filter((node2) => node2.type === requested.type && node2.code === requested.id && (!requested.path || node2.path === normalizeRelativePath2(requested.path)));
+    if (candidates.length !== 1) {
+      blockers.push({
+        code: candidates.length === 0 ? "SOURCE_NOT_FOUND" : "SOURCE_AMBIGUOUS",
+        message: candidates.length === 0 ? `Source ${requested.type}:${requested.id} was not found` : `Source ${requested.type}:${requested.id} resolves to ${candidates.length} records; specify a path`,
+        ...requested.path ? { path: requested.path } : {}
+      });
+      continue;
+    }
+    const node = candidates[0];
+    const raw = await readContainedFile(root, node.path);
+    if (!raw) {
+      blockers.push({ code: "SOURCE_NOT_FOUND", message: `Source file is missing: ${node.path}`, path: node.path, line: node.line });
+      continue;
+    }
+    const nodesInFile = graph.nodes.filter((candidate) => candidate.path === node.path);
+    const boundary = locateSoftwareRecord(raw.toString("utf8"), node, nodesInFile);
+    blockers.push(...boundary.blockers);
+    const recordSpan = boundary.range ? spanFor(raw, node.path, boundary.range) : void 0;
+    const uid = `${node.type}:${node.code}`;
+    inspected.push({
+      type: node.type,
+      id: node.code,
+      uid,
+      path: node.path,
+      title: node.title,
+      snapshot: await snapshotFile(root, node.path),
+      ...recordSpan ? {
+        record_span: recordSpan,
+        content: raw.subarray(recordSpan.start_byte, recordSpan.end_byte).toString("utf8")
+      } : {},
+      surrounding_spans: recordSpan ? [
+        ...recordSpan.start_byte > 0 ? [{
+          ...spanFor(raw, node.path, { startByte: 0, endByte: recordSpan.start_byte }),
+          content: raw.subarray(0, recordSpan.start_byte).toString("utf8")
+        }] : [],
+        ...recordSpan.end_byte < raw.byteLength ? [{
+          ...spanFor(raw, node.path, { startByte: recordSpan.end_byte, endByte: raw.byteLength }),
+          content: raw.subarray(recordSpan.end_byte).toString("utf8")
+        }] : []
+      ] : [],
+      acceptance_criteria: acceptanceCriteria(node),
+      incoming_relations: allOccurrences.filter((edge2) => edge2.to === uid),
+      outgoing_relations: allOccurrences.filter((edge2) => edge2.from === uid)
+    });
+  }
+  if (request.numbering_policy?.mode === "configured-next-available") {
+    unresolved.push({
+      code: "NUMBER_ALLOCATION_REQUIRES_MAPPING",
+      message: "The deterministic allocation result must be fixed in the mapping before plan compilation"
+    });
+  }
+  mergeFindings(unresolved, await scanUnsupportedReferences(
+    root,
+    [...new Set(inspected.map((item) => item.path))],
+    []
+  ));
+  const config = await configSnapshot(root);
+  const affectedPaths = new Set(inspected.map((item) => item.path));
+  for (const source of inspected) {
+    for (const edge2 of [...source.incoming_relations, ...source.outgoing_relations]) affectedPaths.add(edge2.source_path);
+  }
+  const affectedFiles = await Promise.all([...affectedPaths].sort().map((path) => snapshotFile(root, path)));
+  const inspection = {
+    schema_version: "1.0",
+    request,
+    request_digest: requestDigest,
+    config_snapshot: config,
+    sources: inspected,
+    affected_files: affectedFiles,
+    relation_occurrences: allOccurrences.filter((edge2) => inspected.some((source) => edge2.from === source.uid || edge2.to === source.uid)),
+    blockers,
+    unresolved,
+    mapping_template: {}
+  };
+  inspection.mapping_template = mappingTemplate(request, requestDigest, config, inspected, unresolved);
+  return { ok: true, data: inspection };
+}
+function finding(code, message, path, line) {
+  return { code, message, ...path ? { path } : {}, ...line ? { line } : {} };
+}
+async function verifySnapshot(root, expected, blockers) {
+  const normalized = normalizeRelativePath2(expected.path);
+  if (!normalized) {
+    blockers.push(finding("PATH_OUTSIDE_ROOT", `Invalid project-relative path: ${expected.path}`, expected.path));
+    return void 0;
+  }
+  const actual = await snapshotFile(root, normalized);
+  if (!sameSnapshot(actual, { ...expected, path: normalized })) {
+    blockers.push(finding("INPUT_CHANGED", `Input snapshot changed for ${normalized}`, normalized));
+  }
+  return actual;
+}
+function validateSpan(buffer, span, blockers) {
+  if (span.start_byte > span.end_byte || span.end_byte > buffer.byteLength) {
+    blockers.push(finding("SPAN_OUT_OF_RANGE", `Invalid half-open byte range [${span.start_byte}, ${span.end_byte})`, span.path));
+    return void 0;
+  }
+  const fragment = buffer.subarray(span.start_byte, span.end_byte);
+  if (digestBytes(fragment) !== span.sha256) {
+    blockers.push(finding("SOURCE_FRAGMENT_CHANGED", `Source fragment digest does not match ${span.path}`, span.path));
+    return void 0;
+  }
+  return fragment;
+}
+function rangesCover(range, moves) {
+  const intervals = moves.map((move) => ({ start: move.source.start_byte, end: move.source.end_byte })).filter((item) => item.end > range.startByte && item.start < range.endByte).sort((left, right) => left.start - right.start || left.end - right.end);
+  let cursor = range.startByte;
+  for (const interval of intervals) {
+    if (interval.start > cursor) return false;
+    cursor = Math.max(cursor, interval.end);
+  }
+  return cursor >= range.endByte;
+}
+function edgeDisplay(edge2) {
+  return `${edge2.from} --${edge2.kind}--> ${edge2.to} @ ${edge2.sourcePath}:${edge2.sourceLine} [${edge2.source}]${edge2.attrs ? ` ${canonicalJson(edge2.attrs)}` : ""}`;
+}
+function graphDiff(before, after) {
+  const beforeNodes = new Set(before.nodes.map((node) => `${node.uid} @ ${node.path}:${node.line}`));
+  const afterNodes = new Set(after.nodes.map((node) => `${node.uid} @ ${node.path}:${node.line}`));
+  const beforeEdges = new Set(before.edges.map(edgeDisplay));
+  const afterEdges = new Set(after.edges.map(edgeDisplay));
+  return {
+    added_nodes: [...afterNodes].filter((item) => !beforeNodes.has(item)).sort(),
+    removed_nodes: [...beforeNodes].filter((item) => !afterNodes.has(item)).sort(),
+    added_edges: [...afterEdges].filter((item) => !beforeEdges.has(item)).sort(),
+    removed_edges: [...beforeEdges].filter((item) => !afterEdges.has(item)).sort()
+  };
+}
+function issueIdentity(issue2) {
+  const edge2 = issue2.edge ? `${issue2.edge.from}	${issue2.edge.to}	${issue2.edge.kind}	${issue2.edge.source}	${canonicalJson(issue2.edge.attrs ?? {})}` : "";
+  return `${issue2.code}	${issue2.message}	${issue2.node ?? ""}	${edge2}`;
+}
+function readableDiff(path, oldContent, newContent) {
+  const oldLines = oldContent?.split(/(?<=\n)/) ?? [];
+  const newLines = newContent?.split(/(?<=\n)/) ?? [];
+  if (oldContent === newContent) return "";
+  return [
+    `--- ${oldContent === void 0 ? "/dev/null" : `a/${path}`}`,
+    `+++ ${newContent === void 0 ? "/dev/null" : `b/${path}`}`,
+    ...oldLines.map((line) => `-${line.replace(/\n$/, "")}`),
+    ...newLines.map((line) => `+${line.replace(/\n$/, "")}`)
+  ].join("\n");
+}
+function findRelativeLinks(fragment) {
+  const found = /* @__PURE__ */ new Set();
+  const pattern = /!?\[[^\]]*\]\(([^)]+)\)|^\s*\[[^\]]+\]:\s*(\S+)/gm;
+  let match;
+  while ((match = pattern.exec(fragment)) !== null) {
+    const target = String(match[1] ?? match[2] ?? "").trim().replace(/^<|>$/g, "");
+    if (target && !target.startsWith("#") && !/^[a-z][a-z0-9+.-]*:/i.test(target) && !target.startsWith("/")) found.add(target);
+  }
+  return [...found].sort();
+}
+function footnoteReferenceLabels(text) {
+  const labels = /* @__PURE__ */ new Set();
+  const pattern = /\[\^([^\]\s]+)\](?!:)/g;
+  let match;
+  while ((match = pattern.exec(text)) !== null) labels.add(match[1]);
+  return [...labels].sort();
+}
+function footnoteDefinition(label) {
+  return `[^${label}]:`;
+}
+function splitMarkdownTarget(target) {
+  const cleaned = target.trim().replace(/^<|>$/g, "");
+  const hash = cleaned.indexOf("#");
+  return hash < 0 ? { path: cleaned, anchor: null } : { path: cleaned.slice(0, hash), anchor: cleaned.slice(hash) };
+}
+async function pathExists2(absolutePath) {
+  try {
+    await lstat3(absolutePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function scanUnsupportedReferences(root, sourcePaths, targetPaths) {
+  const migrationPaths = [.../* @__PURE__ */ new Set([...sourcePaths, ...targetPaths])];
+  const migrationNames = new Set(migrationPaths.map((path) => posix.basename(path)));
+  const directories = new Set(migrationPaths.map((path) => posix.dirname(path)));
+  const findings = [];
+  async function visit(directory) {
+    for (const entry of await readdir3(directory, { withFileTypes: true })) {
+      if (entry.isDirectory() && SKIPPED_SCAN_DIRS.has(entry.name)) continue;
+      const absolute = join9(directory, entry.name);
+      if (entry.isDirectory()) {
+        await visit(absolute);
+        continue;
+      }
+      if (!entry.isFile() || !TEXT_EXTENSIONS.test(entry.name)) continue;
+      const path = relative4(root, absolute).replace(/\\/g, "/");
+      const raw = await readFile3(absolute, "utf8");
+      const namesTheMigration = migrationPaths.some((reference) => raw.includes(reference));
+      const lines = raw.split(/\r?\n/);
+      for (const [index, line] of lines.entries()) {
+        const lineNumber = index + 1;
+        if (MARKDOWN_FILE_SUFFIX.test(path)) {
+          const pattern = new RegExp(MARKDOWN_LINK_PATTERN.source, "g");
+          let match;
+          while ((match = pattern.exec(line)) !== null) {
+            const literal = match[0];
+            const { path: linkPath, anchor } = splitMarkdownTarget(match[2]);
+            if (!linkPath || linkPath.startsWith("/") || /^[a-z][a-z0-9+.-]*:/i.test(linkPath)) continue;
+            if (!migrationNames.has(posix.basename(linkPath))) continue;
+            const resolved = normalizeRelativePath2(posix.join(posix.dirname(path), linkPath));
+            if (!resolved || targetPaths.includes(resolved)) continue;
+            if (anchor) {
+              findings.push(finding(
+                "ANCHOR_REFERENCE_UNRESOLVED",
+                `The anchored reference "${literal}" points at a migration path; the renderer anchor rules are unknown and the anchor ${JSON.stringify(anchor)} may leave the file with its record`,
+                path,
+                lineNumber
+              ));
+            } else if (!await pathExists2(resolve6(root, resolved))) {
+              findings.push(finding(
+                "SIBLING_RELATIVE_REFERENCE_UNRESOLVED",
+                `The relative reference "${literal}" does not resolve inside the project although its file name matches a migration path; its intended destination must be decided explicitly`,
+                path,
+                lineNumber
+              ));
+            }
+          }
+        }
+        if (SCRIPT_FILE_SUFFIX.test(path) && namesTheMigration && RUNTIME_PATH_MARKER.test(line)) {
+          const literals = [...line.matchAll(/['"`]([^'"`\n]*)['"`]/g)].map((item) => item[1]);
+          const directoryLiteral = literals.find((literal) => directories.has(literal) || migrationPaths.some((reference) => reference.startsWith(`${literal}/`)));
+          if (directoryLiteral) {
+            findings.push(finding(
+              "RUNTIME_PATH_ASSEMBLY_UNRESOLVED",
+              `A path assembled at runtime from ${JSON.stringify(directoryLiteral)} cannot be resolved statically: ${line.trim()}`,
+              path,
+              lineNumber
+            ));
+          }
+        }
+      }
+    }
+  }
+  await visit(resolve6(root));
+  const unique = new Map(findings.map((item) => [`${item.code}	${item.path}	${item.line}	${item.message}`, item]));
+  return [...unique.values()].sort((left, right) => (left.path ?? "").localeCompare(right.path ?? "") || (left.line ?? 0) - (right.line ?? 0) || left.code.localeCompare(right.code));
+}
+function mergeFindings(target, additions) {
+  const seen = new Set(target.map((item) => `${item.code}	${item.path ?? ""}	${item.line ?? 0}	${item.message}`));
+  for (const item of additions) {
+    const key = `${item.code}	${item.path ?? ""}	${item.line ?? 0}	${item.message}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    target.push(item);
+  }
+}
+async function scanConsumerCandidates(root, references, excludedPaths = /* @__PURE__ */ new Set()) {
+  const results = [];
+  async function visit(directory) {
+    for (const entry of await readdir3(directory, { withFileTypes: true })) {
+      if (entry.isDirectory() && SKIPPED_SCAN_DIRS.has(entry.name)) continue;
+      const absolute = join9(directory, entry.name);
+      if (entry.isDirectory()) {
+        await visit(absolute);
+      } else if (entry.isFile() && TEXT_EXTENSIONS.test(entry.name)) {
+        const path = relative4(root, absolute).replace(/\\/g, "/");
+        if (excludedPaths.has(path)) continue;
+        const raw = await readFile3(absolute, "utf8");
+        raw.split(/\r?\n/).forEach((line, index) => {
+          for (const reference of references) {
+            if (path !== reference && line.includes(reference)) results.push({ path, line: index + 1, reference });
+          }
+        });
+      }
+    }
+  }
+  await visit(resolve6(root));
+  return results.sort((left, right) => left.path.localeCompare(right.path) || left.line - right.line || left.reference.localeCompare(right.reference));
+}
+function expectedRelationTargets(mapping) {
+  return new Set(mapping.relation_map.flatMap((entry) => entry.targets.map((target) => `${target.from}	${target.to}	${target.kind}`)));
+}
+function relationTriples(graph) {
+  return new Set(graph.edges.map((edge2) => `${edge2.from}	${edge2.to}	${edge2.kind}`));
+}
+function formatMode(value) {
+  return value === null ? "null" : `0o${value.toString(8).padStart(3, "0")}`;
+}
+function isPosixFileMode(value) {
+  return value === null || Number.isInteger(value) && value >= 0 && value <= MAX_POSIX_MODE;
+}
+function modeIsUsableAtApply(mode, umask) {
+  return Number.isInteger(mode) && mode >= 0 && mode <= MAX_POSIX_MODE && (mode & 256) !== 0 && (mode & 3584) === 0 && (mode & umask) === 0;
+}
+function createModeForUmask(umask) {
+  return CREATE_MODE_BASE & ~umask & MAX_POSIX_MODE;
+}
+function planningUmask() {
+  return process.umask() & MAX_POSIX_MODE;
+}
+function restructureBoundaryFindings(operations, limits) {
+  const findings = [];
+  if (operations.length === 0) {
+    findings.push(finding("NO_OPERATIONS", "The plan contains no file operations; a no-op plan has nothing to apply"));
+    return findings;
+  }
+  if (operations.length > limits.max_operations) {
+    findings.push(finding("TOO_MANY_OPERATIONS", `The plan contains ${operations.length} operations; at most ${limits.max_operations} are supported`));
+  }
+  const totalBytes = operations.reduce((total, operation) => total + operation.original_bytes + operation.new_bytes, 0);
+  if (totalBytes > limits.max_total_bytes) {
+    findings.push(finding("CAPACITY_EXCEEDED", `Planned original and new bytes total ${totalBytes}; the limit is ${limits.max_total_bytes}`));
+  }
+  const expectedCreateMode = createModeForUmask(limits.umask);
+  const applyModeContract = limits.mode_contract === "apply";
+  for (const operation of operations) {
+    const parent = dirname5(operation.path) || ".";
+    if (!operation.parent_exists) {
+      findings.push(finding("PARENT_DIRECTORY_MISSING", `Parent directory does not exist or is not a directory: ${parent}`, operation.path));
+    } else if (operation.parent_device !== null && operation.parent_device !== operation.root_device) {
+      findings.push(finding("CROSS_FILESYSTEM", `Parent directory is on another filesystem than the project root: ${parent}`, operation.path));
+    }
+    if (!isPosixFileMode(operation.mode)) {
+      findings.push(finding("MODE_OUT_OF_RANGE", `Candidate mode is not a POSIX permission value: ${formatMode(operation.mode)}`, operation.path));
+    }
+    if (!isPosixFileMode(operation.original_mode)) {
+      findings.push(finding("MODE_OUT_OF_RANGE", `Original mode is not a POSIX permission value: ${formatMode(operation.original_mode)}`, operation.path));
+    }
+    if (operation.original_exists && operation.original_mode === null) {
+      findings.push(finding("MODE_MISSING_FOR_EXISTING_FILE", `The existing file has no frozen POSIX mode: ${operation.path}`, operation.path));
+    }
+    if (!operation.original_exists && operation.original_mode !== null) {
+      findings.push(finding("MODE_NOT_APPLICABLE", `A POSIX mode was frozen for a path that does not exist: ${operation.path}`, operation.path));
+    }
+    if (applyModeContract) {
+      for (const [label, value] of [["candidate mode", operation.mode], ["original mode", operation.original_mode]]) {
+        if (value === null || modeIsUsableAtApply(value, limits.umask)) continue;
+        findings.push(finding(
+          "MODE_NOT_USABLE",
+          `Frozen ${label} ${formatMode(value)} cannot be reproduced by the applying process, which requires owner-read, no setuid/setgid/sticky bit, and no bit masked by umask ${formatMode(limits.umask)}: ${operation.path}`,
+          operation.path
+        ));
+      }
+    }
+    if (operation.action === "create") {
+      if (operation.original_exists) {
+        findings.push(finding("MODE_NOT_APPLICABLE", `create must target a path that does not exist yet: ${operation.path}`, operation.path));
+      }
+      if (!applyModeContract && operation.mode !== expectedCreateMode) {
+        findings.push(finding("MODE_NOT_APPLICABLE", `create mode ${formatMode(operation.mode)} is not the planning umask mode ${formatMode(expectedCreateMode)}: ${operation.path}`, operation.path));
+      }
+    } else if (operation.action === "replace") {
+      if (!operation.original_exists) {
+        findings.push(finding("MODE_NOT_APPLICABLE", `replace must target an existing file: ${operation.path}`, operation.path));
+      } else if (operation.original_mode !== null && operation.mode !== operation.original_mode) {
+        findings.push(finding("MODE_NOT_APPLICABLE", `replace must preserve the original mode ${formatMode(operation.original_mode)}: ${operation.path}`, operation.path));
+      }
+    } else if (operation.mode !== null) {
+      findings.push(finding("MODE_NOT_APPLICABLE", `delete must not carry a mode: ${operation.path}`, operation.path));
+    }
+  }
+  return findings;
+}
+async function probeDirectory(absolutePath) {
+  try {
+    const info = await stat(absolutePath);
+    return { exists: info.isDirectory(), device: info.dev };
+  } catch (error) {
+    const code = error.code;
+    if (code === "ENOENT" || code === "ENOTDIR") return { exists: false, device: null };
+    throw error;
+  }
+}
+async function planRestructure(root, input) {
+  const schemaErrors = await validateDomainContract("mapping", input);
+  if (schemaErrors.length > 0) {
+    return { ok: false, error: { code: "MAPPING_SCHEMA_INVALID", message: "Restructure mapping does not match its contract", details: schemaErrors } };
+  }
+  const mapping = input;
+  const blockers = [];
+  const unresolved = [...mapping.unresolved];
+  const requestErrors = await validateDomainContract("request", mapping.request);
+  if (requestErrors.length > 0) blockers.push(finding("REQUEST_SCHEMA_INVALID", requestErrors.join("; ")));
+  if (digestRestructureValue(mapping.request) !== mapping.request_digest) blockers.push(finding("REQUEST_DIGEST_MISMATCH", "request_digest does not bind the embedded request"));
+  const currentConfig = await configSnapshot(root);
+  if (!sameSnapshot(currentConfig, mapping.config_snapshot)) blockers.push(finding("CONFIG_CHANGED", "artifact-graph configuration changed after inspection", currentConfig.path));
+  const schema = await loadConfig(root);
+  const beforeGraph = await scanArtifacts(root, schema);
+  const beforeOccurrences = new Map(relationOccurrences(beforeGraph).map((entry) => [relationKey(entry), entry]));
+  const sourceUids = new Set(mapping.sources.map((source) => `${source.type}:${source.id}`));
+  const seenSourceUids = /* @__PURE__ */ new Set();
+  for (const source of mapping.sources) {
+    const uid = `${source.type}:${source.id}`;
+    if (seenSourceUids.has(uid)) blockers.push(finding("DUPLICATE_SOURCE", `Duplicate mapping source: ${uid}`, source.path));
+    seenSourceUids.add(uid);
+    if (source.snapshot.path !== source.path) blockers.push(finding("SOURCE_SNAPSHOT_PATH_MISMATCH", `Source snapshot path does not match source.path for ${uid}`, source.path));
+  }
+  for (const requested of mapping.request.sources) {
+    const requestedPath = requested.path ? normalizeRelativePath2(requested.path) : void 0;
+    const matches = mapping.sources.filter((source) => source.type === requested.type && source.id === requested.id && (!requested.path || source.path === requestedPath));
+    if (matches.length !== 1) blockers.push(finding("REQUEST_SOURCE_MISMATCH", `Request source ${requested.type}:${requested.id} must resolve to exactly one mapping source`));
+  }
+  for (const source of mapping.sources) {
+    if (!mapping.request.sources.some((requested) => requested.type === source.type && requested.id === source.id && (!requested.path || normalizeRelativePath2(requested.path) === source.path))) {
+      blockers.push(finding("UNREQUESTED_SOURCE", `Mapping source is not declared by the bound request: ${source.type}:${source.id}`, source.path));
+    }
+  }
+  const requiredOccurrences = [...beforeOccurrences.values()].filter((entry) => sourceUids.has(entry.from) || sourceUids.has(entry.to));
+  const mappedOccurrenceKeys = new Set(mapping.relation_map.map((entry) => relationKey(entry.occurrence)));
+  for (const occurrence of requiredOccurrences) {
+    if (!mappedOccurrenceKeys.has(relationKey(occurrence))) blockers.push(finding("RELATION_UNMAPPED", `Relation occurrence is not mapped: ${relationKey(occurrence)}`, occurrence.source_path, occurrence.source_line));
+  }
+  for (const entry of mapping.relation_map) {
+    if (!beforeOccurrences.has(relationKey(entry.occurrence))) blockers.push(finding("RELATION_OCCURRENCE_CHANGED", `Relation occurrence no longer exists: ${relationKey(entry.occurrence)}`, entry.occurrence.source_path, entry.occurrence.source_line));
+  }
+  const allowed = mapping.request.allowed_output_paths.map((path) => normalizeRelativePath2(path.replace(/\/$/, ""))).filter((path) => Boolean(path));
+  const targetKeys = /* @__PURE__ */ new Set();
+  const targetUids = /* @__PURE__ */ new Set();
+  for (const target of mapping.targets) {
+    const path = normalizeRelativePath2(target.path);
+    if (!path || !isPathAllowed(path, allowed)) blockers.push(finding("OUTPUT_PATH_NOT_ALLOWED", `Target path is outside allowed_output_paths: ${target.path}`, target.path));
+    if (targetKeys.has(target.key)) blockers.push(finding("DUPLICATE_TARGET_KEY", `Duplicate target key: ${target.key}`, target.path));
+    targetKeys.add(target.key);
+    if (target.snapshot.path !== target.path) blockers.push(finding("TARGET_SNAPSHOT_PATH_MISMATCH", `Target snapshot path does not match target.path for ${target.key}`, target.path));
+    const uid = `${target.type}:${target.id}`;
+    if (targetUids.has(uid)) blockers.push(finding("TARGET_ID_CONFLICT", `Duplicate target identity: ${uid}`, target.path));
+    targetUids.add(uid);
+    if (beforeGraph.nodes.some((node) => node.uid === uid) && !sourceUids.has(uid)) {
+      blockers.push(finding("TARGET_ID_CONFLICT", `Target identity already exists outside this migration: ${uid}`, target.path));
+    }
+    if (!schema.types[target.type] || !new RegExp(schema.idPatterns[target.type] ?? ".*").test(target.id)) blockers.push(finding("INVALID_TARGET_ID", `Target identity does not match configured type/id: ${uid}`, target.path));
+    if (path && !matchesConfiguredArtifactPath(path, schema)) blockers.push(finding("TARGET_PATH_NOT_SCANNED", `Target path is not covered by the active artifact configuration: ${path}`, path));
+  }
+  for (const identity of mapping.identity_map) {
+    for (const key of identity.target_keys) if (!targetKeys.has(key)) blockers.push(finding("TARGET_KEY_NOT_FOUND", `identity_map refers to unknown target key: ${key}`));
+  }
+  for (const source of mapping.sources) {
+    const identities = mapping.identity_map.filter((entry) => entry.source_type === source.type && entry.source_id === source.id);
+    if (identities.length !== 1) blockers.push(finding("IDENTITY_MAP_INCOMPLETE", `Expected exactly one identity_map entry for ${source.type}:${source.id}, found ${identities.length}`, source.path));
+    if (identities[0] && identities[0].source_disposition !== source.disposition) blockers.push(finding("IDENTITY_DISPOSITION_MISMATCH", `identity_map disposition differs for ${source.type}:${source.id}`, source.path));
+  }
+  const snapshots = /* @__PURE__ */ new Map();
+  const buffers = /* @__PURE__ */ new Map();
+  for (const expected of [...mapping.sources.map((item) => item.snapshot), ...mapping.targets.map((item) => item.snapshot)]) {
+    const normalized = normalizeRelativePath2(expected.path);
+    if (!normalized) {
+      blockers.push(finding("PATH_OUTSIDE_ROOT", `Invalid project-relative path: ${expected.path}`, expected.path));
+      continue;
+    }
+    if (snapshots.has(normalized) && !sameSnapshot(snapshots.get(normalized), { ...expected, path: normalized })) {
+      blockers.push(finding("SNAPSHOT_CONFLICT", `Multiple incompatible snapshots were supplied for ${normalized}`, normalized));
+      continue;
+    }
+    const actual = await verifySnapshot(root, { ...expected, path: normalized }, blockers);
+    if (actual) snapshots.set(normalized, actual);
+    const raw = await readContainedFile(root, normalized);
+    if (raw) buffers.set(normalized, raw);
+  }
+  snapshots.set(currentConfig.path, currentConfig);
+  const declaredSnapshots = [
+    mapping.config_snapshot,
+    ...mapping.sources.map((source) => source.snapshot),
+    ...mapping.targets.map((target) => target.snapshot)
+  ];
+  const checkedDeclaredModes = /* @__PURE__ */ new Set();
+  for (const declared of declaredSnapshots) {
+    const declaredMode = declared.mode ?? null;
+    const declaredPath = normalizeRelativePath2(declared.path) ?? declared.path;
+    const key = `${declaredPath}	${declared.exists}	${declaredMode}`;
+    if (checkedDeclaredModes.has(key)) continue;
+    checkedDeclaredModes.add(key);
+    if (!isPosixFileMode(declaredMode)) {
+      blockers.push(finding("MODE_OUT_OF_RANGE", `Frozen mode is not a POSIX permission value: ${formatMode(declaredMode)}`, declaredPath));
+    } else if (declared.exists && declaredMode === null) {
+      blockers.push(finding("MODE_MISSING_FOR_EXISTING_FILE", `Existing file must freeze its POSIX mode: ${declaredPath}`, declaredPath));
+    } else if (!declared.exists && declaredMode !== null) {
+      blockers.push(finding("MODE_NOT_APPLICABLE", `A POSIX mode was frozen for a path that does not exist: ${declaredPath}`, declaredPath));
+    }
+  }
+  const moveIds = /* @__PURE__ */ new Set();
+  const rangesByPath = /* @__PURE__ */ new Map();
+  const fragments = /* @__PURE__ */ new Map();
+  for (const move of mapping.content_moves) {
+    if (moveIds.has(move.id)) blockers.push(finding("DUPLICATE_CONTENT_MOVE", `Duplicate content move id: ${move.id}`));
+    moveIds.add(move.id);
+    const sourcePath = normalizeRelativePath2(move.source.path);
+    const targetPath = normalizeRelativePath2(move.target.path);
+    if (!sourcePath || !buffers.has(sourcePath)) {
+      blockers.push(finding("SOURCE_NOT_FOUND", `Content move source is unavailable: ${move.source.path}`, move.source.path));
+      continue;
+    }
+    if (!targetPath || !isPathAllowed(targetPath, allowed)) {
+      blockers.push(finding("OUTPUT_PATH_NOT_ALLOWED", `Content move target is outside allowed_output_paths: ${move.target.path}`, move.target.path));
+      continue;
+    }
+    const fragment = validateSpan(buffers.get(sourcePath), { ...move.source, path: sourcePath }, blockers);
+    if (!fragment) continue;
+    fragments.set(move.id, fragment);
+    const pathMoves = rangesByPath.get(sourcePath) ?? [];
+    for (const existing of pathMoves) {
+      if (Math.max(existing.source.start_byte, move.source.start_byte) < Math.min(existing.source.end_byte, move.source.end_byte)) {
+        const exactExplicitCopy = existing.source.start_byte === move.source.start_byte && existing.source.end_byte === move.source.end_byte && [existing, move].filter((item) => item.target.mode === "move").length <= 1;
+        if (!exactExplicitCopy) blockers.push(finding("SOURCE_SPAN_OVERLAP", `Content moves ${existing.id} and ${move.id} overlap without an exact explicit copy`, sourcePath));
+      }
+    }
+    pathMoves.push(move);
+    rangesByPath.set(sourcePath, pathMoves);
+    if (dirname5(sourcePath) !== dirname5(targetPath)) {
+      for (const link of findRelativeLinks(fragment.toString("utf8"))) {
+        const explicitlyEdited = mapping.prose_edits.some((edit) => edit.target_path === targetPath && edit.old_text.includes(link));
+        if (!explicitlyEdited) blockers.push(finding("RELATIVE_LINK_REQUIRES_MAPPING", `Relative reference "${link}" changes base directory when moved to ${targetPath}`, sourcePath));
+      }
+    }
+  }
+  for (const source of mapping.sources) {
+    const node = beforeGraph.nodes.find((candidate) => candidate.type === source.type && candidate.code === source.id && candidate.path === source.path);
+    const raw = buffers.get(source.path);
+    if (!node || !raw) continue;
+    const boundary = locateSoftwareRecord(raw.toString("utf8"), node, beforeGraph.nodes.filter((candidate) => candidate.path === source.path));
+    blockers.push(...boundary.blockers);
+    if (boundary.range && !rangesCover(boundary.range, rangesByPath.get(source.path) ?? [])) blockers.push(finding("SOURCE_CONTENT_UNMAPPED", `The complete source record ${node.uid} does not have an explicit content destination`, source.path, node.line));
+    if (source.type === "feature" && source.disposition === "retired") {
+      const criteria = acceptanceCriteria(node);
+      const mapped = new Set(mapping.criterion_map.filter((entry) => entry.source_feature === source.id && entry.targets.length > 0).map((entry) => entry.source_criterion));
+      for (const criterion of criteria) if (!mapped.has(criterion)) blockers.push(finding("CRITERION_UNMAPPED", `${source.id}:${criterion} has no target criterion`, source.path, node.line));
+    }
+  }
+  const candidateBuffers = /* @__PURE__ */ new Map();
+  const touched = /* @__PURE__ */ new Set();
+  for (const [sourcePath, moves] of rangesByPath) {
+    const original = buffers.get(sourcePath);
+    const removals = moves.filter((move) => move.target.mode === "move").sort((left, right) => left.source.start_byte - right.source.start_byte);
+    const chunks = [];
+    let cursor = 0;
+    for (const move of removals) {
+      chunks.push(original.subarray(cursor, move.source.start_byte));
+      cursor = move.source.end_byte;
+    }
+    chunks.push(original.subarray(cursor));
+    candidateBuffers.set(sourcePath, Buffer.concat(chunks));
+    touched.add(sourcePath);
+  }
+  const movesByTarget = /* @__PURE__ */ new Map();
+  for (const move of mapping.content_moves) {
+    const targetPath = normalizeRelativePath2(move.target.path);
+    if (!targetPath || !fragments.has(move.id)) continue;
+    const list = movesByTarget.get(targetPath) ?? [];
+    list.push(move);
+    movesByTarget.set(targetPath, list);
+  }
+  for (const [targetPath, moves] of movesByTarget) {
+    const base = candidateBuffers.get(targetPath) ?? buffers.get(targetPath) ?? Buffer.alloc(0);
+    const appended = [base];
+    for (const move of [...moves].sort((left, right) => left.target.order - right.target.order || left.id.localeCompare(right.id))) {
+      const separator = move.target.separator ?? (appended.some((item) => item.byteLength > 0) ? "\n" : "");
+      appended.push(Buffer.from(separator, "utf8"), fragments.get(move.id));
+    }
+    candidateBuffers.set(targetPath, Buffer.concat(appended));
+    touched.add(targetPath);
+    if (!snapshots.has(targetPath)) snapshots.set(targetPath, await snapshotFile(root, targetPath));
+  }
+  for (const header of mapping.file_headers) {
+    const path = normalizeRelativePath2(header.path);
+    if (!path || !isPathAllowed(path, allowed)) {
+      blockers.push(finding("OUTPUT_PATH_NOT_ALLOWED", `File header path is outside allowed_output_paths: ${header.path}`, header.path));
+      continue;
+    }
+    if (header.affected_records.length === 0 && header.content === "") {
+      const unselected = beforeGraph.nodes.filter((node) => node.path === path && !sourceUids.has(node.uid));
+      if (unselected.length > 0) {
+        blockers.push(finding("FILE_DELETE_HAS_UNSELECTED_RECORDS", `Cannot delete ${path}; it still contains unselected records: ${unselected.map((node) => node.uid).join(", ")}`, path));
+      } else {
+        candidateBuffers.set(path, Buffer.alloc(0));
+        touched.add(path);
+      }
+      if (!snapshots.has(path)) snapshots.set(path, await snapshotFile(root, path));
+      continue;
+    }
+    const raw = (candidateBuffers.get(path) ?? buffers.get(path) ?? Buffer.alloc(0)).toString("utf8");
+    candidateBuffers.set(path, Buffer.from(replaceSoftwareHeader(raw, header.content), "utf8"));
+    touched.add(path);
+    if (!snapshots.has(path)) snapshots.set(path, await snapshotFile(root, path));
+  }
+  for (const edit of mapping.prose_edits) {
+    const path = normalizeRelativePath2(edit.target_path);
+    const sourcePath = normalizeRelativePath2(edit.source.path);
+    if (!path || !sourcePath || !buffers.has(sourcePath)) {
+      blockers.push(finding("PROSE_EDIT_SOURCE_MISSING", `Prose edit source is unavailable: ${edit.source.path}`, edit.source.path));
+      continue;
+    }
+    if (!isPathAllowed(path, allowed)) {
+      blockers.push(finding("OUTPUT_PATH_NOT_ALLOWED", `Prose edit target is outside allowed_output_paths: ${edit.target_path}`, edit.target_path));
+      continue;
+    }
+    if (!validateSpan(buffers.get(sourcePath), { ...edit.source, path: sourcePath }, blockers)) continue;
+    const current = (candidateBuffers.get(path) ?? buffers.get(path) ?? Buffer.alloc(0)).toString("utf8");
+    const occurrences = current.split(edit.old_text).length - 1;
+    if (!edit.old_text || occurrences !== 1) {
+      blockers.push(finding("PROSE_EDIT_AMBIGUOUS", `Expected exactly one prose edit match in ${path}, found ${occurrences}`, path));
+      continue;
+    }
+    candidateBuffers.set(path, Buffer.from(current.replace(edit.old_text, edit.new_text), "utf8"));
+    touched.add(path);
+  }
+  const candidates = [];
+  const umask = planningUmask();
+  for (const path of [...touched].sort()) {
+    if (!isPathAllowed(path, allowed)) blockers.push(finding("OUTPUT_PATH_NOT_ALLOWED", `Candidate path is outside allowed_output_paths: ${path}`, path));
+    const original = buffers.get(path);
+    const candidate = candidateBuffers.get(path) ?? Buffer.alloc(0);
+    if (original && original.equals(candidate)) continue;
+    const deleteFile = candidate.byteLength === 0;
+    const snapshot = snapshots.get(path) ?? await snapshotFile(root, path);
+    const action = deleteFile ? "delete" : original ? "replace" : "create";
+    candidates.push({
+      path,
+      action,
+      content: deleteFile ? null : candidate.toString("utf8"),
+      sha256: deleteFile ? null : digestBytes(candidate),
+      mode: action === "delete" ? null : action === "replace" ? snapshot.mode : createModeForUmask(umask),
+      original: snapshot,
+      diff: readableDiff(path, original?.toString("utf8"), deleteFile ? void 0 : candidate.toString("utf8"))
+    });
+  }
+  const rootDirectory = await probeDirectory(resolve6(root));
+  const parentProbes = /* @__PURE__ */ new Map();
+  for (const candidate of candidates) {
+    const parent = dirname5(candidate.path);
+    if (!parentProbes.has(parent)) parentProbes.set(parent, await probeDirectory(resolve6(root, parent)));
+  }
+  blockers.push(...restructureBoundaryFindings(
+    candidates.map((candidate) => {
+      const parent = parentProbes.get(dirname5(candidate.path));
+      return {
+        path: candidate.path,
+        action: candidate.action,
+        original_exists: candidate.original.exists,
+        original_mode: candidate.original.mode,
+        original_bytes: candidate.action === "create" ? 0 : candidate.original.size,
+        new_bytes: candidate.action === "delete" ? 0 : Buffer.byteLength(candidate.content ?? "", "utf8"),
+        mode: candidate.mode,
+        parent_exists: parent.exists,
+        parent_device: parent.device,
+        root_device: rootDirectory.device ?? -1
+      };
+    }),
+    {
+      max_operations: RESTRUCTURE_MAX_OPERATIONS,
+      max_total_bytes: RESTRUCTURE_MAX_TOTAL_BYTES,
+      umask
+    }
+  ));
+  const overrides = new Map(candidates.map((candidate) => [candidate.path, candidate.content]));
+  const afterGraph = await scanArtifacts(root, schema, { contents: overrides });
+  const beforeIssues = new Set(validateGraph(beforeGraph, schema).map(issueIdentity));
+  const candidateIssues = validateGraph(afterGraph, schema);
+  for (const issue2 of candidateIssues) {
+    if (issue2.severity === "error" && !beforeIssues.has(issueIdentity(issue2))) blockers.push(finding("CANDIDATE_GRAPH_INVALID", `${issue2.code}: ${issue2.message}`, issue2.path, issue2.line));
+  }
+  const afterTriples = relationTriples(afterGraph);
+  for (const expected of expectedRelationTargets(mapping)) {
+    if (!afterTriples.has(expected)) blockers.push(finding("MAPPED_RELATION_MISSING", `Mapped relation is absent from the candidate graph: ${expected}`));
+  }
+  for (const source of mapping.sources) {
+    const uid = `${source.type}:${source.id}`;
+    const present = afterGraph.nodes.some((node) => node.uid === uid);
+    if (source.disposition === "retired" && present && !targetUids.has(uid)) blockers.push(finding("RETIRED_ID_STILL_PRESENT", `Retired identity remains in candidate graph: ${uid}`, source.path));
+    if (source.disposition === "preserved" && !present) blockers.push(finding("PRESERVED_ID_MISSING", `Preserved identity is missing from candidate graph: ${uid}`, source.path));
+  }
+  for (const criterion of mapping.criterion_map) {
+    const sourceNode = beforeGraph.nodes.find((node) => node.type === "feature" && node.code === criterion.source_feature);
+    if (!sourceNode || !acceptanceCriteria(sourceNode).includes(criterion.source_criterion)) blockers.push(finding("SOURCE_CRITERION_NOT_FOUND", `Source criterion does not exist: ${criterion.source_feature}:${criterion.source_criterion}`, sourceNode?.path, sourceNode?.line));
+    for (const target of criterion.targets) {
+      const targetNode = afterGraph.nodes.find((node) => node.type === "feature" && node.code === target.feature);
+      if (!targetNode || !acceptanceCriteria(targetNode).includes(target.criterion)) blockers.push(finding("TARGET_CRITERION_NOT_FOUND", `Target criterion does not exist: ${target.feature}:${target.criterion}`, targetNode?.path, targetNode?.line));
+    }
+  }
+  for (const header of mapping.file_headers) {
+    const actualRecords = afterGraph.nodes.filter((node) => node.path === header.path).map((node) => node.uid).sort();
+    const declaredRecords = [...header.affected_records].sort();
+    if (canonicalJson(actualRecords) !== canonicalJson(declaredRecords)) blockers.push(finding("FILE_HEADER_RECORD_SET_MISMATCH", `file_headers must name every affected record in ${header.path}`, header.path));
+  }
+  const e2ePaths = new Set(mapping.sources.filter((source) => source.type === "e2e_test").map((source) => source.path));
+  for (const move of mapping.content_moves) {
+    if (!e2ePaths.has(move.source.path) || move.source.path === move.target.path) continue;
+    for (const path of [move.source.path, move.target.path]) {
+      if (!mapping.file_headers.some((header) => header.path === path)) blockers.push(finding("E2E_FILE_HEADER_REQUIRED", `Cross-file E2E moves require final headers for both source and target files: ${path}`, path));
+    }
+  }
+  for (const target of mapping.targets) {
+    if (!afterGraph.nodes.some((node) => node.uid === `${target.type}:${target.id}` && node.path === target.path)) blockers.push(finding("TARGET_NOT_COMPILED", `Target identity was not produced at the declared path: ${target.type}:${target.id}`, target.path));
+  }
+  mergeFindings(unresolved, await scanUnsupportedReferences(
+    root,
+    [...new Set(mapping.sources.map((source) => source.path))],
+    [...new Set([
+      ...mapping.targets.map((target) => target.path),
+      ...mapping.content_moves.map((move) => move.target.path),
+      ...mapping.file_headers.map((header) => header.path)
+    ].map((path) => normalizeRelativePath2(path)).filter((path) => path !== void 0))]
+  ));
+  for (const move of mapping.content_moves) {
+    const fragment = fragments.get(move.id);
+    const sourcePath = normalizeRelativePath2(move.source.path);
+    const targetPath = normalizeRelativePath2(move.target.path);
+    if (!fragment || !sourcePath || !targetPath) continue;
+    const sourceText = (buffers.get(sourcePath) ?? Buffer.alloc(0)).toString("utf8");
+    const targetText = (candidateBuffers.get(targetPath) ?? buffers.get(targetPath) ?? Buffer.alloc(0)).toString("utf8");
+    for (const label of footnoteReferenceLabels(fragment.toString("utf8"))) {
+      if (!sourceText.includes(footnoteDefinition(label)) || targetText.includes(footnoteDefinition(label))) continue;
+      blockers.push(finding(
+        "FOOTNOTE_DEFINITION_UNMAPPED",
+        `The footnote definition ${footnoteDefinition(label)} stays outside the moved content; ${targetPath} would keep a dangling footnote reference and the mapping must carry the definition explicitly`,
+        sourcePath
+      ));
+    }
+  }
+  const consumerCandidates = await scanConsumerCandidates(root, [...new Set(mapping.sources.map((source) => source.path))]);
+  const plan = {
+    schema_version: RESTRUCTURE_PLAN_SCHEMA_VERSION,
+    operation_id: randomUUID2(),
+    validation_timeout_ms: RESTRUCTURE_VALIDATION_TIMEOUT_MS,
+    request_digest: mapping.request_digest,
+    mapping_digest: digestRestructureValue(mapping),
+    config_snapshot: currentConfig,
+    input_snapshots: [...snapshots.values()].sort((left, right) => left.path.localeCompare(right.path)),
+    candidates,
+    graph_diff: graphDiff(beforeGraph, afterGraph),
+    validation: { blockers, unresolved, candidate_issues: candidateIssues, consumer_candidates: consumerCandidates },
+    applicable: blockers.length === 0 && unresolved.length === 0
+  };
+  const planErrors = await validateDomainContract("plan", plan);
+  if (planErrors.length > 0) {
+    return { ok: false, error: { code: "PLAN_SCHEMA_INVALID", message: "Compiled plan does not match its contract", details: planErrors } };
+  }
+  return { ok: true, data: plan };
+}
+async function gateRestructureOperationPlan(operation, plan) {
+  const declaredVersion = plan && typeof plan === "object" ? plan.schema_version : void 0;
+  if (declaredVersion !== RESTRUCTURE_PLAN_SCHEMA_VERSION) {
+    return {
+      ok: false,
+      error: {
+        code: "PLAN_SCHEMA_VERSION_UNSUPPORTED",
+        message: `${operation} requires a restructure plan ${RESTRUCTURE_PLAN_SCHEMA_VERSION} document, received ${JSON.stringify(declaredVersion)}`
+      }
+    };
+  }
+  const errors = await validateDomainContract("plan", plan);
+  if (errors.length > 0) {
+    return { ok: false, error: { code: "PLAN_SCHEMA_INVALID", message: `Restructure plan does not match its ${RESTRUCTURE_PLAN_SCHEMA_VERSION} contract`, details: errors } };
+  }
+  return { ok: true, data: plan };
+}
+function refusal(code, message, findings = []) {
+  return { ok: false, error: { code, message, ...findings.length === 0 ? {} : { details: findings } } };
+}
+async function loadRestructurePlanDocument(operation, canonicalRoot, planPath) {
+  const absolute = resolve6(planPath);
+  let info;
+  try {
+    info = await lstat3(absolute);
+  } catch (cause) {
+    return refusal("PLAN_FILE_UNREADABLE", `Plan document cannot be read: ${absolute} (${cause.message})`);
+  }
+  if (info.isSymbolicLink() || !info.isFile()) {
+    return refusal("PLAN_FILE_UNSAFE", `Plan document must be the one regular file the operator persisted: ${absolute}`);
+  }
+  let bytes;
+  try {
+    bytes = await readFile3(absolute);
+  } catch (cause) {
+    return refusal("PLAN_FILE_UNREADABLE", `Plan document cannot be read: ${absolute} (${cause.message})`);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(bytes.toString("utf8"));
+  } catch (cause) {
+    return refusal("PLAN_FILE_INVALID_JSON", `Plan document is not JSON: ${absolute} (${cause.message})`);
+  }
+  const gate = await gateRestructureOperationPlan(operation, parsed);
+  if (!gate.ok) return gate;
+  return { ok: true, data: { path: absolute, realPath: await realpath2(absolute), digest: digestBytes(bytes), root: canonicalRoot, plan: gate.data } };
+}
+function planRootIdentityFindings(document) {
+  const findings = [];
+  const record = (path, label) => {
+    const normalized = normalizeRelativePath2(path);
+    if (!normalized || normalized !== path) {
+      findings.push(finding("PLAN_PATH_INVALID", `${label} is not a normalized project-relative path: ${JSON.stringify(path)}`, path));
+    }
+  };
+  record(document.plan.config_snapshot.path, "config_snapshot");
+  for (const snapshot of document.plan.input_snapshots) record(snapshot.path, "input_snapshot");
+  for (const candidate of document.plan.candidates) {
+    record(candidate.path, "candidate");
+    record(candidate.original.path, "candidate original");
+  }
+  if (document.plan.config_snapshot.path !== "artifact-graph.config.yaml") {
+    findings.push(finding("ROOT_IDENTITY_MISMATCH", `The plan does not record this project's configuration file: ${document.plan.config_snapshot.path}`));
+  }
+  const relativePlan = relative4(document.root, document.realPath);
+  if (!relativePlan || relativePlan.startsWith("..") || isAbsolute4(relativePlan)) {
+    findings.push(finding("ROOT_IDENTITY_MISMATCH", `The plan document is outside the project root: ${document.realPath}`, document.realPath));
+  }
+  return findings;
+}
+async function operationBoundaries(root, plan) {
+  const rootDirectory = await probeDirectory(resolve6(root));
+  const parents = /* @__PURE__ */ new Map();
+  const boundaries = [];
+  for (const candidate of plan.candidates) {
+    const parent = dirname5(candidate.path) || ".";
+    if (!parents.has(parent)) parents.set(parent, await probeDirectory(resolve6(root, parent)));
+    const probe = parents.get(parent);
+    boundaries.push({
+      path: candidate.path,
+      action: candidate.action,
+      original_exists: candidate.original.exists,
+      original_mode: candidate.original.mode,
+      original_bytes: candidate.action === "create" ? 0 : candidate.original.size,
+      new_bytes: candidate.action === "delete" ? 0 : Buffer.byteLength(candidate.content ?? "", "utf8"),
+      mode: candidate.mode,
+      parent_exists: probe.exists,
+      parent_device: probe.device,
+      root_device: rootDirectory.device ?? -1
+    });
+  }
+  return boundaries;
+}
+async function applyPreconditionFindings(root, document) {
+  const findings = [];
+  const plan = document.plan;
+  const currentConfig = await configSnapshot(root);
+  if (!sameSnapshot(currentConfig, plan.config_snapshot)) {
+    findings.push(finding("CONFIG_CHANGED", "artifact-graph configuration changed after planning", currentConfig.path));
+  }
+  for (const snapshot of plan.input_snapshots) await verifySnapshot(root, snapshot, findings);
+  const relativePlan = relative4(root, document.realPath).replace(/\\/g, "/");
+  for (const candidate of plan.candidates) {
+    if (candidate.path === relativePlan) {
+      findings.push(finding("PLAN_IN_WRITE_SET", `The plan document is inside its own candidate write set: ${candidate.path}`, candidate.path));
+    }
+    if (candidate.path === RESTRUCTURE_RECOVERY_REL_PATH || candidate.path.startsWith(`${RESTRUCTURE_RECOVERY_REL_PATH}/`)) {
+      findings.push(finding("MECHANISM_PATH_IN_WRITE_SET", `A candidate writes inside the mechanism directory: ${candidate.path}`, candidate.path));
+    }
+    let original;
+    try {
+      original = await snapshotFile(root, candidate.path);
+    } catch (cause) {
+      findings.push(finding("CANDIDATE_PATH_UNSAFE", cause.message, candidate.path));
+      continue;
+    }
+    if (!sameSnapshot(original, candidate.original)) {
+      findings.push(finding("INPUT_CHANGED", `The candidate path no longer holds its frozen original state: ${candidate.path}`, candidate.path));
+    }
+    if (candidate.action === "delete") continue;
+    if (candidate.mode === null) {
+      findings.push(finding("MODE_MISSING", `The candidate has no frozen POSIX mode to apply: ${candidate.path}`, candidate.path));
+    }
+    if (candidate.sha256 !== digestBytes(Buffer.from(candidate.content ?? "", "utf8"))) {
+      findings.push(finding("CANDIDATE_CONTENT_CHANGED", `Candidate bytes no longer match their frozen digest: ${candidate.path}`, candidate.path));
+    }
+  }
+  findings.push(...restructureBoundaryFindings(await operationBoundaries(root, plan), {
+    max_operations: RESTRUCTURE_MAX_OPERATIONS,
+    max_total_bytes: RESTRUCTURE_MAX_TOTAL_BYTES,
+    umask: planningUmask(),
+    mode_contract: "apply"
+  }));
+  return findings;
+}
+function createRestructureValidationCallback(plan, excludedConsumerPaths = []) {
+  const excludedConsumers = new Set(excludedConsumerPaths);
+  const addedNodes = plan.graph_diff.added_nodes;
+  const removedNodes = new Set(plan.graph_diff.removed_nodes);
+  const addedEdges = plan.graph_diff.added_edges;
+  const removedEdges = new Set(plan.graph_diff.removed_edges);
+  const knownErrors = new Set(plan.validation.candidate_issues.filter((issue2) => issue2.severity === "error").map(issueIdentity));
+  const relevantConsumers = new Set(plan.validation.consumer_candidates.map((candidate) => `${candidate.path}	${candidate.line}	${candidate.reference}`));
+  const referencePaths = [...new Set(plan.validation.consumer_candidates.map((candidate) => candidate.reference))];
+  return async function validateCandidateState(input) {
+    const schema = await loadConfig(input.root);
+    const graph = await scanArtifacts(input.root, schema);
+    if (input.signal.aborted) return { passed: false };
+    const nodes = new Set(graph.nodes.map((node) => `${node.uid} @ ${node.path}:${node.line}`));
+    const edges = new Set(graph.edges.map(edgeDisplay));
+    const nodeIdentityComplete = addedNodes.every((item) => nodes.has(item)) && [...removedNodes].every((item) => !nodes.has(item));
+    const edgeIdentityComplete = addedEdges.every((item) => edges.has(item)) && [...removedEdges].every((item) => !edges.has(item));
+    const newErrors = validateGraph(graph, schema).filter((issue2) => issue2.severity === "error" && !knownErrors.has(issueIdentity(issue2)));
+    const consumers = await scanConsumerCandidates(input.root, referencePaths, excludedConsumers);
+    const unplannedConsumers = consumers.filter((candidate) => !relevantConsumers.has(`${candidate.path}	${candidate.line}	${candidate.reference}`));
+    const passed = nodeIdentityComplete && edgeIdentityComplete && newErrors.length === 0 && unplannedConsumers.length === 0;
+    return { passed };
+  };
+}
+async function applyRestructure(input) {
+  if (input.confirmCooperativeWriters !== true) {
+    return refusal("COOPERATIVE_WRITERS_UNCONFIRMED", "restructure apply requires the explicit --confirm-cooperative-writers premise and never assumes it");
+  }
+  const qualification = await qualifyRestructureMechanism(input.root);
+  if (!qualification.ok) return qualification;
+  const document = await loadRestructurePlanDocument("apply", qualification.data.root, input.planPath);
+  if (!document.ok) return document;
+  const plan = document.data.plan;
+  if (plan.candidates.length === 0) {
+    return refusal("PLAN_NO_OPERATIONS", "A plan with no file operations must not be applied and must not reach the mechanism");
+  }
+  if (!plan.applicable || plan.validation.blockers.length > 0 || plan.validation.unresolved.length > 0) {
+    return refusal(
+      "PLAN_NOT_APPLICABLE",
+      "The plan is not applicable: it still carries blockers or unresolved findings",
+      [...plan.validation.blockers, ...plan.validation.unresolved]
+    );
+  }
+  const identity = planRootIdentityFindings(document.data);
+  if (identity.length > 0) return refusal("PLAN_BINDING_INVALID", "The plan document does not bind to this project root", identity);
+  const drift = await applyPreconditionFindings(qualification.data.root, document.data);
+  if (drift.length > 0) return refusal("APPLY_PRECONDITION_FAILED", "The project drifted after planning; nothing was written", drift);
+  const mechanismRoot = await ensureRestructureMechanismRoot(qualification.data.root, { create: true });
+  if (!mechanismRoot.ok) return mechanismRoot;
+  const planRelPath = relative4(qualification.data.root, document.data.realPath).replace(/\\/g, "/");
+  const applied = await applyRestructureFileSet(qualification.data.root, plan, {
+    validate: createRestructureValidationCallback(plan, [planRelPath])
+  });
+  if (!applied.ok) return applied;
+  const projection = projectRestructureFileSetResult(applied.data, document.data.realPath, document.data.digest);
+  return projection.ok ? { ok: true, data: projection } : { ok: false, error: { code: projection.code, message: projection.message, details: projection } };
+}
+async function recoverRestructure(input) {
+  if (input.allParticipantsStopped !== true || input.exclusiveMaintenance !== true) {
+    return refusal(
+      "MAINTENANCE_CONFIRMATION_REQUIRED",
+      "restructure recover requires both --confirm-all-participants-stopped and --confirm-exclusive-maintenance"
+    );
+  }
+  const qualification = await qualifyRestructureMechanism(input.root);
+  if (!qualification.ok) return qualification;
+  const document = await loadRestructurePlanDocument("recover", qualification.data.root, input.planPath);
+  if (!document.ok) return document;
+  const identity = planRootIdentityFindings(document.data);
+  if (identity.length > 0) return refusal("PLAN_BINDING_INVALID", "The plan document does not bind to this project root", identity);
+  const mechanismRoot = await ensureRestructureMechanismRoot(qualification.data.root, { create: false });
+  if (!mechanismRoot.ok) return mechanismRoot;
+  const recovered = await recoverRestructureFileSet(qualification.data.root, document.data.plan, {
+    allParticipantsStopped: true,
+    exclusiveMaintenance: true
+  });
+  if (!recovered.ok) return recovered;
+  const projection = projectRestructureFileSetResult(recovered.data, document.data.realPath, document.data.digest);
+  return projection.ok ? { ok: true, data: projection } : { ok: false, error: { code: projection.code, message: projection.message, details: projection } };
+}
+async function pruneRestructureRecovery(input) {
+  if (input.confirmCooperativeWriters !== true) {
+    return refusal("COOPERATIVE_WRITERS_UNCONFIRMED", "restructure prune-recovery requires the explicit --confirm-cooperative-writers premise and never assumes it");
+  }
+  if (input.allParticipantsStopped !== input.exclusiveMaintenance) {
+    return refusal(
+      "MAINTENANCE_CONFIRMATION_REQUIRED",
+      "A fault takeover needs --confirm-all-participants-stopped and --confirm-exclusive-maintenance together; neither is accepted alone"
+    );
+  }
+  const qualification = await qualifyRestructureMechanism(input.root);
+  if (!qualification.ok) return qualification;
+  const document = await loadRestructurePlanDocument("prune-recovery", qualification.data.root, input.planPath);
+  if (!document.ok) return document;
+  const identity = planRootIdentityFindings(document.data);
+  if (identity.length > 0) return refusal("PLAN_BINDING_INVALID", "The plan document does not bind to this project root", identity);
+  const mechanismRoot = await ensureRestructureMechanismRoot(qualification.data.root, { create: false });
+  if (!mechanismRoot.ok) return mechanismRoot;
+  const pruned = await pruneRestructureFileSet(qualification.data.root, document.data.plan, {
+    allParticipantsStopped: input.allParticipantsStopped,
+    exclusiveMaintenance: input.exclusiveMaintenance
+  });
+  if (!pruned.ok) return pruned;
+  const projection = projectRestructureFileSetResult(pruned.data, document.data.realPath, document.data.digest);
+  return projection.ok ? { ok: true, data: projection } : { ok: false, error: { code: projection.code, message: projection.message, details: projection } };
+}
+var RESTRUCTURE_PLAN_SCHEMA_VERSION, RESTRUCTURE_VALIDATION_TIMEOUT_MS, RESTRUCTURE_MAX_OPERATIONS, RESTRUCTURE_MAX_TOTAL_BYTES, MAX_POSIX_MODE, CREATE_MODE_BASE, MODULE_DIRECTORY, CONTRACT_ROOT, SKIPPED_SCAN_DIRS, TEXT_EXTENSIONS, MARKDOWN_LINK_PATTERN, RUNTIME_PATH_MARKER, MARKDOWN_FILE_SUFFIX, SCRIPT_FILE_SUFFIX;
+var init_restructure = __esm({
+  "src/restructure.ts"() {
+    "use strict";
+    init_index();
+    init_contract_kernel();
+    init_restructure_software();
+    init_restructure_file_set();
+    RESTRUCTURE_PLAN_SCHEMA_VERSION = "1.1";
+    RESTRUCTURE_VALIDATION_TIMEOUT_MS = 3e4;
+    RESTRUCTURE_MAX_OPERATIONS = 1024;
+    RESTRUCTURE_MAX_TOTAL_BYTES = 256 * 1024 * 1024;
+    MAX_POSIX_MODE = 511;
+    CREATE_MODE_BASE = 438;
+    MODULE_DIRECTORY = typeof __dirname === "string" ? __dirname : dirname5(fileURLToPath2(import.meta.url));
+    CONTRACT_ROOT = join9(MODULE_DIRECTORY, "..", "contracts");
+    SKIPPED_SCAN_DIRS = /* @__PURE__ */ new Set([".git", "node_modules", "dist", "coverage", ".tmp", ".codex", ".worktrees", ".foundation-file-apply", ".artifact-graph"]);
+    TEXT_EXTENSIONS = /\.(?:md|markdown|json|ya?ml|[cm]?[jt]sx?)$/i;
+    MARKDOWN_LINK_PATTERN = /!?\[([^\]\n]*)\]\(([^)\n]+)\)/g;
+    RUNTIME_PATH_MARKER = /\.join\s*\(|\$\{[^}]*\}|["'`]\s*\+|\+\s*["'`]/;
+    MARKDOWN_FILE_SUFFIX = /\.(?:md|markdown)$/i;
+    SCRIPT_FILE_SUFFIX = /\.(?:[cm]?[jt]sx?)$/i;
+  }
+});
+
 // src/index.ts
 import matter from "gray-matter";
 import yaml from "js-yaml";
 import { accessSync, constants as fsConstants, existsSync as existsSync3, statSync } from "fs";
-import { mkdir as mkdir4, readFile as readFile3, readdir as readdir3, writeFile as writeFile3 } from "fs/promises";
-import { basename as basename4, dirname as dirname5, extname, isAbsolute as isAbsolute4, join as join8, relative as relative4, resolve as resolve5 } from "path";
+import { mkdir as mkdir5, readFile as readFile4, writeFile as writeFile3 } from "fs/promises";
+import { basename as basename4, dirname as dirname6, extname, isAbsolute as isAbsolute5, join as join10, resolve as resolve7 } from "path";
 function isTargetArtifactType(type) {
   return isPacketTargetType(type);
 }
@@ -5193,10 +6919,10 @@ function resolveArtifactTypeName(schema, token) {
   return void 0;
 }
 async function loadConfig(root) {
-  const configPath = join8(root, "artifact-graph.config.yaml");
+  const configPath = join10(root, "artifact-graph.config.yaml");
   let parsed = {};
   try {
-    const raw = await readFile3(configPath, "utf-8");
+    const raw = await readFile4(configPath, "utf-8");
     parsed = yaml.load(raw) ?? {};
   } catch (error) {
     if (error.code !== "ENOENT") {
@@ -5322,7 +7048,7 @@ function validateE2eConfig(e2e) {
       if (typeof runner.root !== "string" || !runner.root.trim()) {
         throw new Error(`Invalid e2e.runners[${runner.name}].root: must be a non-empty string.`);
       }
-      if (isAbsolute4(runner.root)) {
+      if (isAbsolute5(runner.root)) {
         throw new Error(`Invalid e2e.runners[${runner.name}].root: "${runner.root}" must not be an absolute path.`);
       }
       if (runner.root.replace(/\\/g, "/").split("/").includes("..")) {
@@ -5385,14 +7111,19 @@ function buildGraph(nodes, edges, diagnostics = [], root) {
     diagnostics: diagnostics.sort((left, right) => left.code.localeCompare(right.code) || left.path.localeCompare(right.path) || left.line - right.line)
   };
 }
-async function scanArtifacts(root, schema) {
+async function scanArtifacts(root, schema, options = {}) {
   const config = schema ?? await loadConfig(root);
   const nodes = [];
   const edges = [];
   const scanDiagnostics = [];
   const scannedFiles = /* @__PURE__ */ new Map();
+  const contentOverrides = options.contents instanceof Map ? options.contents : new Map(Object.entries(options.contents ?? {}));
   for (const [type, definition] of artifactTypeEntriesBySpecificity(config)) {
-    const files = await findFiles(root, definition.paths);
+    const diskFiles = await findFiles(root, definition.paths);
+    const files = [.../* @__PURE__ */ new Set([
+      ...diskFiles.filter((file) => contentOverrides.get(file) !== null),
+      ...[...contentOverrides.keys()].filter((file) => contentOverrides.get(file) !== null && definition.paths.some((pattern) => matchesPattern(file, pattern)))
+    ])].sort();
     for (const file of files) {
       if (scannedFiles.has(file)) {
         const existingType = scannedFiles.get(file);
@@ -5406,7 +7137,7 @@ async function scanArtifacts(root, schema) {
         continue;
       }
       scannedFiles.set(file, type);
-      const raw = await readFile3(join8(root, file), "utf-8");
+      const raw = contentOverrides.has(file) ? contentOverrides.get(file) : await readFile4(join10(root, file), "utf-8");
       const parsed = parseFile(type, file, raw, config);
       const semantic = parseConfiguredRelations(type, file, raw, parsed.nodes, config);
       nodes.push(...parsed.nodes);
@@ -5414,7 +7145,7 @@ async function scanArtifacts(root, schema) {
       scanDiagnostics.push(...parsed.diagnostics, ...semantic.diagnostics);
     }
   }
-  const absoluteRoot = isAbsolute4(root) ? root : resolve5(root);
+  const absoluteRoot = isAbsolute5(root) ? root : resolve7(root);
   const graph = buildGraph(nodes, edges, scanDiagnostics, absoluteRoot);
   return resolveMatrixEdges(graph);
 }
@@ -5697,13 +7428,13 @@ function validateScenarioPrdLinksInternal(graph, schema, includeScanDiagnosedInv
   const scenarioFeatureRefs = /* @__PURE__ */ new Map();
   const featureScenarioRefs = /* @__PURE__ */ new Map();
   for (const node of scenarioNodes) {
-    scenarioFeatureRefs.set(node.uid, relationOccurrences(node, "\u5173\u8054\u529F\u80FD", "feature"));
+    scenarioFeatureRefs.set(node.uid, relationOccurrences2(node, "\u5173\u8054\u529F\u80FD", "feature"));
     if (!scenarioPattern.test(node.code)) {
       issues.push(issue("FORMAT_ERROR", `scenario ID ${node.code} does not match ${schema.idPatterns.scenario}`, node.path, node.line, { node: node.uid }));
     }
   }
   for (const node of featureNodes) {
-    featureScenarioRefs.set(node.uid, relationOccurrences(node, "scenarios", "scenario"));
+    featureScenarioRefs.set(node.uid, relationOccurrences2(node, "scenarios", "scenario"));
     if (!featurePattern.test(node.code)) {
       issues.push(issue("FORMAT_ERROR", `feature ID ${node.code} does not match ${schema.idPatterns.feature}`, node.path, node.line, { node: node.uid }));
     }
@@ -5777,7 +7508,7 @@ async function validateScenarioPrdLinkIndex(root, graph) {
   const indexPath = "artifacts/prd/feature-index.md";
   let raw = "";
   try {
-    raw = await readFile3(join8(root, indexPath), "utf-8");
+    raw = await readFile4(join10(root, indexPath), "utf-8");
   } catch (error) {
     if (error.code === "ENOENT") {
       return [];
@@ -5797,7 +7528,7 @@ async function validateScenarioPrdLinkIndex(root, graph) {
     if (!feature) {
       return;
     }
-    const actualCount = relationOccurrences(feature, "scenarios", "scenario").length;
+    const actualCount = relationOccurrences2(feature, "scenarios", "scenario").length;
     if (actualCount !== expectedCount) {
       issues.push(issue(
         "INDEX_MISMATCH",
@@ -6025,12 +7756,12 @@ function nextId(graph, schema, type, rangeName) {
   throw new Error(`ID range ${type}.${rangeName} is exhausted`);
 }
 async function writeGraphCache(root, graph) {
-  const cacheDir = join8(root, ".artifact-graph");
-  await mkdir4(cacheDir, { recursive: true });
-  await writeFile3(join8(cacheDir, "index.json"), `${JSON.stringify(graph, null, 2)}
+  const cacheDir = join10(root, ".artifact-graph");
+  await mkdir5(cacheDir, { recursive: true });
+  await writeFile3(join10(cacheDir, "index.json"), `${JSON.stringify(graph, null, 2)}
 `);
   const { default: Database } = await import("better-sqlite3");
-  const db = new Database(join8(cacheDir, "graph.sqlite"));
+  const db = new Database(join10(cacheDir, "graph.sqlite"));
   try {
     db.exec(`
       DROP TABLE IF EXISTS nodes;
@@ -6392,7 +8123,7 @@ function parseFeature(path, raw) {
 }
 function parseScenarios(path, raw, schema = DEFAULT_SCHEMA) {
   const lines = raw.split(/\r?\n/);
-  const codeLines = markdownCodeLineMask(lines);
+  const codeLines = markdownCodeLineMask2(lines);
   const scenarioIdPattern = new RegExp(schema.idPatterns.scenario ?? DEFAULT_SCHEMA.idPatterns.scenario);
   const starts = [];
   lines.forEach((line, index) => {
@@ -6810,13 +8541,7 @@ function parseE2eTest(path, raw) {
   const parsed = matter(raw);
   const data = parsed.data;
   const lines = raw.split(/\r?\n/);
-  const starts = [];
-  lines.forEach((line, index) => {
-    const match = /^#{2,3}\s+(TC-\d+[a-z]?)\s*[:：]?\s*(.*?)\s*$/.exec(line);
-    if (match) {
-      starts.push({ id: match[1], title: match[2].trim(), line: index + 1, index });
-    }
-  });
+  const starts = extractE2eTestCaseStarts(lines);
   const nodes = [];
   const edges = [];
   const batch = String(data.test_batch ?? basename4(path, extname(path))).trim();
@@ -6825,26 +8550,6 @@ function parseE2eTest(path, raw) {
   const frontmatterFeatures = [.../* @__PURE__ */ new Set([...Object.keys(asRecord(data.ac_coverage)), ...scopeFeatures])];
   const frontmatterDecisions = toArray(data.related_decisions).map((value) => String(value).trim()).filter(Boolean);
   const frontmatterEntities = toArray(data.related_entities).map((value) => String(value).trim()).filter(Boolean);
-  if (starts.length === 0) {
-    const code = `${batch}:FILE`;
-    nodes.push({
-      type: "e2e_test",
-      code,
-      title: raw.match(/^#\s+(.+)$/m)?.[1] ?? batch,
-      path,
-      line: 1,
-      attrs: {
-        ...data,
-        testCaseId: "FILE",
-        fileLevelOnly: true,
-        tcFields: {},
-        blockText: raw,
-        coveredFeatures: [],
-        coveredScenarios: []
-      }
-    });
-    addE2eFrontmatterEdges(edges, code, path, frontmatterScenarios, frontmatterFeatures, frontmatterDecisions, frontmatterEntities);
-  }
   for (let index = 0; index < starts.length; index += 1) {
     const start = starts[index];
     const end = starts[index + 1]?.index ?? lines.length;
@@ -6869,6 +8574,16 @@ function parseE2eTest(path, raw) {
     }
   }
   return { nodes, edges };
+}
+function extractE2eTestCaseStarts(lines) {
+  const codeLines = markdownCodeLineMask2(lines);
+  return lines.flatMap((line, index) => {
+    if (codeLines[index]) {
+      return [];
+    }
+    const match = /^#{2,3}\s+(TC-\d+[a-z]?)\s*[:：]?\s*(.*?)\s*$/.exec(line);
+    return match ? [{ id: match[1], title: match[2].trim(), line: index + 1, index }] : [];
+  });
 }
 function addE2eFrontmatterEdges(edges, code, path, scenarios, features, decisions, entities) {
   for (const scenario of scenarios) {
@@ -7654,7 +9369,7 @@ function matchExplicitRelationFieldLine(line, label) {
   const match = new RegExp(`^ {0,3}(?:\\*\\*${escaped}\\*\\*|${escaped})[:\uFF1A]\\s*(.*?)\\s*$`).exec(line);
   return match?.[1] ?? null;
 }
-function markdownCodeLineMask(lines) {
+function markdownCodeLineMask2(lines) {
   const result = new Array(lines.length).fill(false);
   let fence;
   lines.forEach((line, index) => {
@@ -7699,7 +9414,7 @@ function markdownRelationOccurrences(path, scenario, block, codeLines, label, ta
   });
   return result;
 }
-function relationOccurrences(node, field, targetType) {
+function relationOccurrences2(node, field, targetType) {
   const relationRecord = asRecord(node.attrs?.relationOccurrences);
   const rawOccurrences = toArray(relationRecord[field]);
   return rawOccurrences.flatMap((value) => {
@@ -7898,6 +9613,9 @@ function validateE2eRegistry(graph) {
     }
     const actualNodes = byPath.get(file) ?? [];
     if (actualNodes.length === 0) {
+      if (Number(batch.test_case_count ?? NaN) === 0) {
+        continue;
+      }
       issues.push(issue("E2E_REGISTRY_MISMATCH", `registry batch ${String(batch.batch_id ?? file)} file ${file || "<missing>"} does not match any E2E test file`, registry.path, registry.line, { node: registry.uid, severity: "warning" }));
       continue;
     }
@@ -7918,31 +9636,21 @@ function validateE2eRegistry(graph) {
 async function validateExecutableTraceability(root, config) {
   const issues = [];
   const schema = config ?? await loadConfig(root);
-  const e2eDir = join8(root, "artifacts", "tests", "e2e");
-  let e2eFiles;
-  try {
-    e2eFiles = (await readdir3(e2eDir)).filter((name) => /^test-.*\.md$/.test(name)).map((name) => join8(e2eDir, name));
-  } catch {
+  const e2eFiles = await findConfiguredE2eFiles(root, schema);
+  if (e2eFiles.length === 0) {
     return [];
   }
   const mdToRef = /* @__PURE__ */ new Map();
   const allMdTcInfo = /* @__PURE__ */ new Map();
   const tcKeyToFields = /* @__PURE__ */ new Map();
   const mdBatches = /* @__PURE__ */ new Set();
-  for (const filePath of e2eFiles) {
-    const raw = await readFile3(filePath, "utf-8");
-    const relPath = relative4(root, filePath).split("\\").join("/");
+  for (const relPath of e2eFiles) {
+    const raw = await readFile4(join10(root, relPath), "utf-8");
     const parsed = matter(raw);
     const data = parsed.data;
-    const batch = String(data.test_batch ?? basename4(filePath, extname(filePath))).trim();
+    const batch = String(data.test_batch ?? basename4(relPath, extname(relPath))).trim();
     const lines = raw.split(/\r?\n/);
-    const tcStarts = [];
-    lines.forEach((line, index) => {
-      const match = /^#{2,3}\s+(TC-\d+[a-z]?)\s*[:：]?\s*.*$/.exec(line);
-      if (match) {
-        tcStarts.push({ id: match[1], line: index + 1, index });
-      }
-    });
+    const tcStarts = extractE2eTestCaseStarts(lines);
     for (let i = 0; i < tcStarts.length; i += 1) {
       const start = tcStarts[i];
       const end = tcStarts[i + 1]?.index ?? lines.length;
@@ -7979,10 +9687,10 @@ async function validateExecutableTraceability(root, config) {
   const tcAnnotationRegex = /\/\/!?\s*@(?:e2e_test|tc)\s+(\S+?)\s+\[(\w+)\]/;
   const tcAnnotationNoLevelRegex = /\/\/!?\s*@(?:e2e_test|tc)\s+(\S+)/;
   for (const specFile of specFiles) {
-    const fullSpecPath = join8(root, specFile);
+    const fullSpecPath = join10(root, specFile);
     let content;
     try {
-      content = await readFile3(fullSpecPath, "utf-8");
+      content = await readFile4(fullSpecPath, "utf-8");
     } catch {
       continue;
     }
@@ -8061,7 +9769,7 @@ async function validateExecutableTraceability(root, config) {
       if (entry.testId) {
         let content;
         try {
-          content = await readFile3(join8(root, normalizedRefFile), "utf-8");
+          content = await readFile4(join10(root, normalizedRefFile), "utf-8");
         } catch {
           continue;
         }
@@ -8089,7 +9797,7 @@ async function validateExecutableTraceability(root, config) {
       }
       continue;
     }
-    if (!mdToRef.has(tcKey) && !await hasMarkdownTc(tcKey, e2eDir)) {
+    if (!allMdTcInfo.has(tcKey)) {
       for (const ann of annotations) {
         issues.push(issue("E2E-TRACE-002", `E2E trace annotation ${tcKey} references non-existent Markdown TC`, ann.file, ann.line, { node: tcKey, severity: "warning" }));
       }
@@ -8238,34 +9946,10 @@ async function computeE2eCoverageStats(graph, root, thresholds = {}) {
   let withExecutableRef = 0;
   const statusBreakdown = {};
   const chainTypeBreakdown = {};
-  const e2eDir = join8(root, "artifacts", "tests", "e2e");
-  const tcFieldsMap = /* @__PURE__ */ new Map();
-  let e2eFiles;
-  try {
-    e2eFiles = (await readdir3(e2eDir)).filter((name) => /^test-.*\.md$/.test(name)).map((name) => join8(e2eDir, name));
-  } catch {
-    e2eFiles = [];
-  }
-  for (const filePath of e2eFiles) {
-    const raw = await readFile3(filePath, "utf-8");
-    const lines = raw.split(/\r?\n/);
-    const tcStarts = [];
-    lines.forEach((line, index) => {
-      const match = /^#{2,3}\s+(TC-\d+[a-z]?)\s*[:：]?\s*.*$/.exec(line);
-      if (match) {
-        tcStarts.push({ id: match[1], index });
-      }
-    });
-    const parsed = matter(raw);
-    const batch = String(parsed.data.test_batch ?? basename4(filePath, extname(filePath))).trim();
-    for (let i = 0; i < tcStarts.length; i++) {
-      const start = tcStarts[i];
-      const end = tcStarts[i + 1]?.index ?? lines.length;
-      const block = lines.slice(start.index, end);
-      const fields = extractE2eTcFields(block);
-      tcFieldsMap.set(`${batch}:${start.id}`, fields);
-    }
-  }
+  const tcFieldsMap = new Map(e2eNodes.map((node) => [
+    node.code,
+    asRecord(node.attrs?.tcFields)
+  ]));
   for (const node of e2eNodes) {
     const tcKey = node.code;
     const fields = tcFieldsMap.get(tcKey) ?? asRecord(node.attrs?.tcFields);
@@ -8320,7 +10004,7 @@ async function computeE2eCoverageStats(graph, root, thresholds = {}) {
     let hasActiveE2eRef = false;
     for (const entry of parseExecutableRefLines(execRef)) {
       const normalized = resolveExecutableRefFile(entry.file, allProjectFiles);
-      if (!normalized || !existsSync3(join8(root, normalized))) continue;
+      if (!normalized || !existsSync3(join10(root, normalized))) continue;
       const accepting = await getAcceptingRunners(root, normalized, runners);
       if (accepting.some((runner) => runner.kind === "e2e")) {
         hasActiveE2eRef = true;
@@ -8379,7 +10063,7 @@ async function computeE2eCoverageStats(graph, root, thresholds = {}) {
   const acCoverageRateByFeature = {};
   const featureAcMap = /* @__PURE__ */ new Map();
   for (const node of featureNodes) {
-    const acs = parseAcceptanceCriteria(await readFile3(join8(root, node.path), "utf-8"));
+    const acs = parseAcceptanceCriteria(await readFile4(join10(root, node.path), "utf-8"));
     featureAcMap.set(node.code, new Set(acs));
   }
   const coveredAcByFeature = /* @__PURE__ */ new Map();
@@ -8421,39 +10105,26 @@ async function computeE2eCoverageStats(graph, root, thresholds = {}) {
   };
 }
 async function generateE2eRegistry(root, opts) {
-  const e2eDir = join8(root, "artifacts", "tests", "e2e");
-  let files;
-  try {
-    files = (await readdir3(e2eDir)).filter((name) => /^test-.*\.md$/.test(name)).sort();
-  } catch {
-    return {
-      registry_version: "1.0",
-      generated_at: opts?.deterministic ? "1970-01-01T00:00:00.000Z" : (/* @__PURE__ */ new Date()).toISOString(),
-      total_batches: 0,
-      total_test_cases: 0,
-      batches: []
-    };
-  }
+  const schema = await loadConfig(root);
+  const files = await findConfiguredE2eFiles(root, schema);
   const batches = [];
+  const batchIds = /* @__PURE__ */ new Set();
   let totalTestCases = 0;
   for (const file of files) {
-    const filePath = join8(e2eDir, file);
-    const raw = await readFile3(filePath, "utf-8");
+    const filePath = join10(root, file);
+    const raw = await readFile4(filePath, "utf-8");
     const parsed = matter(raw);
     const data = parsed.data;
     const batch = String(data.test_batch ?? basename4(file, extname(file))).trim();
-    const relPath = `artifacts/tests/e2e/${file}`;
+    const relPath = file;
     const scope = String(data.scope ?? "").trim();
     const acCoverage = normalizeAcCoverageForRegistry(data.ac_coverage);
     const relatedScenarios = toArray(data.related_scenarios).map(String).filter(Boolean);
     const lines = raw.split(/\r?\n/);
-    const tcStarts = [];
-    lines.forEach((line, index) => {
-      const match = /^#{2,3}\s+(TC-\d+[a-z]?)\s*[:：]?\s*.*$/.exec(line);
-      if (match) {
-        tcStarts.push({ id: match[1], index });
-      }
-    });
+    const tcStarts = extractE2eTestCaseStarts(lines);
+    if (tcStarts.length > 0) {
+      batchIds.add(batch);
+    }
     const statusSummary = {};
     const blockingReasons = {};
     const frontmatterFixesBlock = String(data.fixes_block ?? "").trim();
@@ -8462,8 +10133,9 @@ async function generateE2eRegistry(root, opts) {
         blockingReasons[tc.id] = frontmatterFixesBlock;
       }
     }
-    for (const start of tcStarts) {
-      const end = tcStarts[tcStarts.indexOf(start) + 1]?.index ?? lines.length;
+    for (let index = 0; index < tcStarts.length; index += 1) {
+      const start = tcStarts[index];
+      const end = tcStarts[index + 1]?.index ?? lines.length;
       const block = lines.slice(start.index, end);
       const fields = extractE2eTcFields(block);
       const status = String(fields["status"] ?? "created").trim().toLowerCase() || "created";
@@ -8496,7 +10168,7 @@ async function generateE2eRegistry(root, opts) {
   return {
     registry_version: "1.0",
     generated_at: opts?.deterministic ? "1970-01-01T00:00:00.000Z" : (/* @__PURE__ */ new Date()).toISOString(),
-    total_batches: batches.length,
+    total_batches: batchIds.size,
     total_test_cases: totalTestCases,
     batches
   };
@@ -8565,10 +10237,10 @@ async function validatePartialRustEvidence(tcFields, tcKey, root, allFiles) {
     if (!normalizedPath) {
       return { hasValidPartialRust: false, detail: `partial_rust file not found: ${ref.file}` };
     }
-    const fullPath = join8(root, normalizedPath);
+    const fullPath = join10(root, normalizedPath);
     let content;
     try {
-      content = await readFile3(fullPath, "utf-8");
+      content = await readFile4(fullPath, "utf-8");
     } catch {
       return { hasValidPartialRust: false, detail: `partial_rust file not found: ${ref.file}` };
     }
@@ -8602,7 +10274,7 @@ function detectTestLevel(specFile, content) {
 }
 function resolveExecutableRefFile(refFile, allFiles) {
   const normalized = refFile.replace(/\\/g, "/").replace(/^\.\//, "");
-  if (!normalized || isAbsolute4(refFile) || normalized.split("/").includes("..")) {
+  if (!normalized || isAbsolute5(refFile) || normalized.split("/").includes("..")) {
     return void 0;
   }
   if (allFiles.includes(normalized)) {
@@ -8675,17 +10347,6 @@ function splitMarkdownCells(line) {
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
-async function hasMarkdownTc(tcKey, e2eDir) {
-  const [batch, tcId] = tcKey.split(":");
-  const filePath = join8(e2eDir, `${batch}.md`);
-  try {
-    const raw = await readFile3(filePath, "utf-8");
-    const tcRegex = new RegExp(`^#{2,3}\\s+${escapeRegExp(tcId)}\\s*[:\uFF1A]?`, "m");
-    return tcRegex.test(raw);
-  } catch {
-    return false;
-  }
-}
 async function findFiles(root, patterns) {
   const all = await walkFiles(root);
   const matched = /* @__PURE__ */ new Set();
@@ -8697,6 +10358,10 @@ async function findFiles(root, patterns) {
     }
   }
   return [...matched].sort();
+}
+async function findConfiguredE2eFiles(root, schema) {
+  const patterns = schema.types.e2e_test?.paths ?? [];
+  return findFiles(root, patterns);
 }
 function matchesConfiguredArtifactPath(path, schema) {
   const normalizedPath = path.replace(/\\/g, "/").replace(/^\.\//, "");
@@ -8726,8 +10391,13 @@ function extractCodes(text, type, schema) {
 }
 function extractE2eTcFields(block) {
   const fields = {};
+  const codeLines = markdownCodeLineMask2(block);
   let current = "";
-  for (const line of block) {
+  for (let index = 0; index < block.length; index += 1) {
+    if (codeLines[index]) {
+      continue;
+    }
+    const line = block[index];
     const match = /^\*\*([^*]+?)\*\*\s*[:：]\s*(.*)$/.exec(line);
     if (match) {
       current = match[1].trim();
@@ -9186,14 +10856,14 @@ function resolveArtifactContext(graph, opts) {
     }
     if (root) {
       for (const ap of ALWAYS_PRESENT_ITEMS) {
-        const fullPath = join8(root, ap.path);
-        let stat2;
+        const fullPath = join10(root, ap.path);
+        let stat3;
         try {
-          stat2 = statSync(fullPath);
+          stat3 = statSync(fullPath);
         } catch {
-          stat2 = null;
+          stat3 = null;
         }
-        if (!stat2) {
+        if (!stat3) {
           const msg = `Required baseline artifact not found: ${ap.path}`;
           if (!missing.includes(msg)) {
             missing.push(msg);
@@ -9205,7 +10875,7 @@ function resolveArtifactContext(graph, opts) {
               suggestedAction: `\u521B\u5EFA\u6587\u4EF6 ${ap.path} \u6216\u914D\u7F6E\u8DF3\u8FC7 universal baseline`
             });
           }
-        } else if (!stat2.isFile()) {
+        } else if (!stat3.isFile()) {
           const msg = `Required baseline artifact is not a regular file: ${ap.path}`;
           if (!missing.includes(msg)) {
             missing.push(msg);
@@ -9452,6 +11122,9 @@ var init_index = __esm({
     init_hook_installer();
     init_review_result_validator();
     init_contract_kernel();
+    init_restructure();
+    init_restructure_file_set();
+    init_restructure_software();
     TARGET_ARTIFACT_TYPES = VALID_PACKET_TARGET_TYPES;
     NON_TARGET_ROLES = ["context", "candidate", "not-recommended"];
     DEFAULT_SCHEMA = {
@@ -9542,8 +11215,8 @@ var init_index = __esm({
 });
 
 // src/packet-prompt-audit.ts
-import { mkdir as mkdir5, writeFile as writeFile4 } from "fs/promises";
-import { join as join9 } from "path";
+import { mkdir as mkdir6, writeFile as writeFile4 } from "fs/promises";
+import { join as join11 } from "path";
 function promptFilename(target) {
   return `prompt-${target.type}-${target.id}.md`;
 }
@@ -9595,7 +11268,7 @@ async function auditSinglePromptTarget(target, graph, options) {
     }
     if (options.outDir) {
       const filename = promptFilename(target);
-      const outPath = join9(options.outDir, filename);
+      const outPath = join11(options.outDir, filename);
       await writeFile4(outPath, prompt, "utf-8");
       entry.outputPath = outPath;
     }
@@ -9671,7 +11344,7 @@ function computeCountsByType(entries) {
 async function auditPromptBatch(root, targets, options, graph) {
   const resolvedGraph = graph ?? await scanArtifacts(root);
   if (options.outDir) {
-    await mkdir5(options.outDir, { recursive: true });
+    await mkdir6(options.outDir, { recursive: true });
   }
   const entries = [];
   for (const target of targets) {
@@ -9700,10 +11373,10 @@ async function auditPromptBatch(root, targets, options, graph) {
     targets: summaryTargets
   };
   if (options.outDir) {
-    await mkdir5(options.outDir, { recursive: true });
-    const jsonPath = join9(options.outDir, "prompt-audit-summary.json");
+    await mkdir6(options.outDir, { recursive: true });
+    const jsonPath = join11(options.outDir, "prompt-audit-summary.json");
     await writeFile4(jsonPath, JSON.stringify(summary, null, 2) + "\n", "utf-8");
-    const mdPath = join9(options.outDir, "prompt-audit-summary.md");
+    const mdPath = join11(options.outDir, "prompt-audit-summary.md");
     await writeFile4(mdPath, renderPromptAuditSummaryMarkdown(summary), "utf-8");
   }
   return summary;
@@ -9743,9 +11416,9 @@ __export(refactor_id_exports, {
   refactorId: () => refactorId,
   renderRefactorIdMarkdown: () => renderRefactorIdMarkdown
 });
-import { chmod, readFile as readFile4, rename as rename2, rm, readdir as readdir4, stat, writeFile as writeFile5 } from "fs/promises";
+import { chmod as chmod2, readFile as readFile5, rename as rename2, rm, readdir as readdir4, stat as stat2, writeFile as writeFile5 } from "fs/promises";
 import { randomBytes } from "crypto";
-import { basename as basename5, dirname as dirname6, join as join10, relative as relative5 } from "path";
+import { basename as basename5, dirname as dirname7, join as join12, relative as relative5 } from "path";
 import yaml2 from "js-yaml";
 function escapeRegExp2(value) {
   return value.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&");
@@ -9923,12 +11596,12 @@ async function walkTextFiles(root) {
     for (const entry of entries) {
       if (entry.name.startsWith(".") && PROSE_SCAN_SKIP_DIRS.has(entry.name)) continue;
       if (PROSE_SCAN_SKIP_DIRS.has(entry.name)) continue;
-      const full = join10(dir, entry.name);
+      const full = join12(dir, entry.name);
       if (entry.isDirectory()) {
         await visit(full);
       } else if (entry.isFile()) {
         const ext = entry.name.includes(".") ? `.${entry.name.split(".").slice(-1)[0]}` : "";
-        if (TEXT_EXTENSIONS.has(ext.toLowerCase())) {
+        if (TEXT_EXTENSIONS2.has(ext.toLowerCase())) {
           found.push(relative5(root, full).replace(/\\/g, "/"));
         }
       }
@@ -9938,7 +11611,7 @@ async function walkTextFiles(root) {
   return found.sort();
 }
 async function computeLockImpact(root, type, oldId) {
-  const lockPath = join10(root, VERSION_LOCK_PATH);
+  const lockPath = join12(root, VERSION_LOCK_PATH);
   const impact = {
     lockPath: VERSION_LOCK_PATH,
     affectedImplementationLocks: [],
@@ -9947,7 +11620,7 @@ async function computeLockImpact(root, type, oldId) {
   };
   let raw;
   try {
-    raw = await readFile4(lockPath, "utf-8");
+    raw = await readFile5(lockPath, "utf-8");
   } catch {
     return impact;
   }
@@ -10030,7 +11703,7 @@ async function refactorId(options) {
   const fileContents = /* @__PURE__ */ new Map();
   const readArtifactFile = async (path) => {
     if (!fileContents.has(path)) {
-      fileContents.set(path, await readFile4(join10(root, path), "utf-8"));
+      fileContents.set(path, await readFile5(join12(root, path), "utf-8"));
     }
     return fileContents.get(path);
   };
@@ -10106,7 +11779,7 @@ async function refactorId(options) {
   for (const relativePath of await walkTextFiles(root)) {
     if (relativePath === VERSION_LOCK_PATH) continue;
     if (relativePath === "artifact-graph.config.yaml") continue;
-    const raw = await readFile4(join10(root, relativePath), "utf-8");
+    const raw = await readFile5(join12(root, relativePath), "utf-8");
     if (!containsIdToken(raw, oldId)) continue;
     const lines = raw.split(/\r?\n/);
     lines.forEach((line, index) => {
@@ -10182,7 +11855,7 @@ async function refactorId(options) {
   }
   if (options.__beforeWriteVerify) await options.__beforeWriteVerify();
   for (const path of targetFiles) {
-    const disk = await readFile4(join10(root, path), "utf-8");
+    const disk = await readFile5(join12(root, path), "utf-8");
     if (disk !== fileContents.get(path)) {
       return fail("PLAN_DRIFT", `\u8BA1\u5212\u4E0E\u5199\u5165\u4E4B\u95F4\u76EE\u6807\u6587\u4EF6\u53D1\u751F\u53D8\u5316\uFF08apply \u4E2D\u6B62\uFF0C\u96F6\u5199\u5165\uFF09\uFF1A${path}`, { path });
     }
@@ -10193,7 +11866,7 @@ async function refactorId(options) {
   const tempPathFor = options.__tempPathFor ?? ((targetPath) => {
     tempSequence += 1;
     const suffix = randomBytes(4).toString("hex");
-    return join10(dirname6(targetPath), `.${basename5(targetPath)}.${process.pid}.${tempSequence}.${suffix}.refactor-id.tmp`);
+    return join12(dirname7(targetPath), `.${basename5(targetPath)}.${process.pid}.${tempSequence}.${suffix}.refactor-id.tmp`);
   });
   let stage = "write";
   try {
@@ -10202,13 +11875,13 @@ async function refactorId(options) {
       if (options.__injectWriteFailure?.(path)) {
         throw Object.assign(new Error(`injected write failure: ${path}`), { code: "EINJECTED" });
       }
-      const original = fileContents.has(path) ? fileContents.get(path) : await readFile4(join10(root, path), "utf-8");
-      const targetPath = join10(root, path);
-      const originalMode = (await stat(targetPath)).mode & 4095;
+      const original = fileContents.has(path) ? fileContents.get(path) : await readFile5(join12(root, path), "utf-8");
+      const targetPath = join12(root, path);
+      const originalMode = (await stat2(targetPath)).mode & 4095;
       const tempPath = tempPathFor(targetPath);
       await writeFile5(tempPath, newContents.get(path), { encoding: "utf-8", flag: "wx" });
       createdTempPaths.push(tempPath);
-      await chmod(tempPath, originalMode);
+      await chmod2(tempPath, originalMode);
       stage = "rename";
       if (options.__injectRenameFailure?.(tempPath, targetPath)) {
         throw Object.assign(new Error(`injected rename failure: ${tempPath} -> ${targetPath}`), { code: "ERENAMEINJECTED" });
@@ -10226,21 +11899,21 @@ async function refactorId(options) {
         if (options.__injectRollbackFailure?.(entry.path)) {
           throw Object.assign(new Error(`injected rollback failure: ${entry.path}`), { code: "EROLLBACKINJECTED" });
         }
-        await writeFile5(join10(root, entry.path), entry.original, "utf-8");
-        await chmod(join10(root, entry.path), entry.originalMode);
+        await writeFile5(join12(root, entry.path), entry.original, "utf-8");
+        await chmod2(join12(root, entry.path), entry.originalMode);
       } catch (rollbackError) {
         rollbackErrors.push({ path: entry.path, message: rollbackError.message });
       }
     }
-    const failure = error;
-    const writeCode = failure.code === "EEXIST" ? "TEMP_FILE_COLLISION" : stage === "rename" || failure.code === "ERENAMEINJECTED" ? "RENAME_FAILED" : "WRITE_FAILED";
+    const failure2 = error;
+    const writeCode = failure2.code === "EEXIST" ? "TEMP_FILE_COLLISION" : stage === "rename" || failure2.code === "ERENAMEINJECTED" ? "RENAME_FAILED" : "WRITE_FAILED";
     if (rollbackErrors.length > 0) {
       return {
         ok: false,
         error: {
           code: "ROLLBACK_FAILED",
-          message: `apply \u5199\u5165\u5931\u8D25\uFF08${writeCode}\uFF09\u4E14\u56DE\u6EDA\u672A\u5B8C\u5168\u6210\u529F\uFF0C\u9700\u4EBA\u5DE5\u590D\u6838\uFF1A${failure.message}`,
-          details: { writeError: { code: writeCode, message: failure.message }, rollbackErrors }
+          message: `apply \u5199\u5165\u5931\u8D25\uFF08${writeCode}\uFF09\u4E14\u56DE\u6EDA\u672A\u5B8C\u5168\u6210\u529F\uFF0C\u9700\u4EBA\u5DE5\u590D\u6838\uFF1A${failure2.message}`,
+          details: { writeError: { code: writeCode, message: failure2.message }, rollbackErrors }
         }
       };
     }
@@ -10248,7 +11921,7 @@ async function refactorId(options) {
       ok: false,
       error: {
         code: writeCode,
-        message: `apply \u5199\u5165\u5931\u8D25\u5E76\u5DF2\u56DE\u6EDA\uFF1A${failure.message}`,
+        message: `apply \u5199\u5165\u5931\u8D25\u5E76\u5DF2\u56DE\u6EDA\uFF1A${failure2.message}`,
         details: { stage }
       }
     };
@@ -10343,12 +12016,12 @@ function renderRefactorIdMarkdown(result) {
   lines.push("");
   return lines.join("\n");
 }
-var TEXT_EXTENSIONS, PROSE_SCAN_SKIP_DIRS;
+var TEXT_EXTENSIONS2, PROSE_SCAN_SKIP_DIRS;
 var init_refactor_id = __esm({
   "src/refactor-id.ts"() {
     "use strict";
     init_index();
-    TEXT_EXTENSIONS = /* @__PURE__ */ new Set([".md", ".markdown", ".ts", ".tsx", ".mts", ".mjs", ".js", ".yaml", ".yml", ".json"]);
+    TEXT_EXTENSIONS2 = /* @__PURE__ */ new Set([".md", ".markdown", ".ts", ".tsx", ".mts", ".mjs", ".js", ".yaml", ".yml", ".json"]);
     PROSE_SCAN_SKIP_DIRS = /* @__PURE__ */ new Set(["node_modules", ".git", "dist", "coverage", ".tmp", ".codex", ".worktrees", ".qoder", ".agents"]);
   }
 });
@@ -10360,9 +12033,9 @@ __export(cli_exports, {
 });
 import yaml3 from "js-yaml";
 import { realpathSync as realpathSync2 } from "fs";
-import { access as access2, mkdir as mkdir6, readFile as readFile5, writeFile as writeFile6 } from "fs/promises";
-import { dirname as dirname7, isAbsolute as isAbsolute5, join as join11 } from "path";
-import { fileURLToPath as fileURLToPath2 } from "url";
+import { access as access2, mkdir as mkdir7, readFile as readFile6, writeFile as writeFile6 } from "fs/promises";
+import { dirname as dirname8, isAbsolute as isAbsolute6, join as join13 } from "path";
+import { fileURLToPath as fileURLToPath3 } from "url";
 async function runCli(argv, io = {}) {
   const parsed = parseArgs(argv);
   const cwd = io.cwd ?? process.cwd();
@@ -10389,7 +12062,7 @@ async function runCli(argv, io = {}) {
     switch (parsed.command) {
       case "init": {
         await initConfig(root);
-        out(`Created ${join11(root, "artifact-graph.config.yaml")}
+        out(`Created ${join13(root, "artifact-graph.config.yaml")}
 `);
         return 0;
       }
@@ -10780,7 +12453,7 @@ async function runCli(argv, io = {}) {
         if (packetJsonPath) {
           let rawJson;
           try {
-            rawJson = await readFile5(packetJsonPath, "utf-8");
+            rawJson = await readFile6(packetJsonPath, "utf-8");
           } catch (readErr) {
             err(`\u9519\u8BEF\uFF1A\u65E0\u6CD5\u8BFB\u53D6 packet \u6587\u4EF6: "${packetJsonPath}" \u2014 ${readErr.message}
 `);
@@ -10981,7 +12654,7 @@ async function runCli(argv, io = {}) {
             universalBaseline: discoverConfig.context?.universal_baseline
           });
         } else {
-          const targetsContent = await readFile5(targetsFile, "utf-8");
+          const targetsContent = await readFile6(targetsFile, "utf-8");
           const auditConfig2 = await loadConfig(root);
           const parseResult = parseTargetsFile(targetsContent, auditConfig2);
           if (parseResult.errors.length > 0) {
@@ -11106,7 +12779,7 @@ async function runCli(argv, io = {}) {
         } else {
           let ppaTargetsContent;
           try {
-            ppaTargetsContent = await readFile5(ppaTargetsFile, "utf-8");
+            ppaTargetsContent = await readFile6(ppaTargetsFile, "utf-8");
           } catch (readErr) {
             err(`\u9519\u8BEF\uFF1A\u65E0\u6CD5\u8BFB\u53D6 targets \u6587\u4EF6: "${ppaTargetsFile}" \u2014 ${readErr.message}
 `);
@@ -11249,16 +12922,25 @@ async function runCli(argv, io = {}) {
           }
           const refreshAll = parsed.flags.all === true;
           const refreshChangedOnly = parsed.flags["changed-only"] === true;
+          const removeOrphanEdges = parsed.multiFlags["remove-orphan-edge"] ?? [];
           if (!refreshAll && !refreshChangedOnly) {
-            err("Usage: artifact-graph version-lock refresh (--all | --changed-only (--staged | --worktree | --base <ref>)) [--remove-orphans] [--format json|markdown] [--lock-path <path>]\n");
+            err("Usage: artifact-graph version-lock refresh (--all | --changed-only (--staged | --worktree | --base <ref>)) [--remove-orphans | --remove-orphan-edge <edgeId>...] [--format json|markdown] [--lock-path <path>]\n");
             return 1;
           }
           if (parsed.flags.help === true) {
-            out("Usage: artifact-graph version-lock refresh (--all | --changed-only (--staged | --worktree | --base <ref>)) [--remove-orphans] [--format json|markdown] [--lock-path <path>]\n");
+            out("Usage: artifact-graph version-lock refresh (--all | --changed-only (--staged | --worktree | --base <ref>)) [--remove-orphans | --remove-orphan-edge <edgeId>...] [--format json|markdown] [--lock-path <path>]\n");
             return 0;
           }
           if (refreshAll && refreshChangedOnly) {
             err("Error: --all and --changed-only are mutually exclusive\n");
+            return 1;
+          }
+          if (parsed.flags["remove-orphan-edge"] === true) {
+            err("Error: --remove-orphan-edge requires an edgeId\n");
+            return 1;
+          }
+          if (parsed.flags["remove-orphans"] === true && removeOrphanEdges.length > 0) {
+            err("Error: --remove-orphans and --remove-orphan-edge are mutually exclusive\n");
             return 1;
           }
           let changedPaths = [];
@@ -11269,7 +12951,7 @@ async function runCli(argv, io = {}) {
               typeof parsed.flags.base === "string" ? "base" : null
             ].filter(Boolean);
             if (changeModeFlags.length !== 1) {
-              err("Usage: artifact-graph version-lock refresh --changed-only (--staged | --worktree | --base <ref>) [--remove-orphans] [--format json|markdown] [--lock-path <path>]\n");
+              err("Usage: artifact-graph version-lock refresh --changed-only (--staged | --worktree | --base <ref>) [--remove-orphans | --remove-orphan-edge <edgeId>...] [--format json|markdown] [--lock-path <path>]\n");
               return 1;
             }
             const changeResult = await collectChangedPaths(root, {
@@ -11303,7 +12985,8 @@ async function runCli(argv, io = {}) {
             changedOnly: refreshChangedOnly,
             changedPaths,
             all: refreshAll,
-            removeOrphans: parsed.flags["remove-orphans"] === true
+            removeOrphans: parsed.flags["remove-orphans"] === true,
+            removeOrphanEdges
           });
           if (refreshFormat === "json") {
             out(`${JSON.stringify(result, null, 2)}
@@ -11353,8 +13036,8 @@ async function runCli(argv, io = {}) {
         const hooks = hookFlag === "all" ? ["pre-commit", "pre-push"] : [hookFlag];
         const prepared = [];
         for (const hookName of hooks) {
-          const templatePath = fileURLToPath2(new URL(`../templates/git-hooks/${hookName}.sh`, import.meta.url));
-          const block = await readFile5(templatePath, "utf-8");
+          const templatePath = fileURLToPath3(new URL(`../templates/git-hooks/${hookName}.sh`, import.meta.url));
+          const block = await readFile6(templatePath, "utf-8");
           prepared.push(await prepareManagedHookBlock({
             hookPath: await resolveGitHookPath(root, hookName),
             block,
@@ -11398,10 +13081,10 @@ async function runCli(argv, io = {}) {
           err("Usage: artifact-graph validate-review-result --file <path> [--format json]\n");
           return 1;
         }
-        const resolvedPath = isAbsolute5(filePath) ? filePath : join11(root, filePath);
+        const resolvedPath = isAbsolute6(filePath) ? filePath : join13(root, filePath);
         let content;
         try {
-          content = await readFile5(resolvedPath, "utf-8");
+          content = await readFile6(resolvedPath, "utf-8");
         } catch (readErr) {
           err(`Error: Cannot read file: "${resolvedPath}" \u2014 ${readErr.message}
 `);
@@ -11436,11 +13119,11 @@ async function runCli(argv, io = {}) {
         const deterministic = checkMode || parsed.flags.deterministic === true;
         const registry = await generateE2eRegistry(root, { deterministic });
         const output = JSON.stringify(registry, null, 2) + "\n";
-        const outPath = typeof parsed.flags.out === "string" ? parsed.flags.out : join11(root, "artifacts/tests/e2e/e2e-test-registry.json");
+        const outPath = typeof parsed.flags.out === "string" ? parsed.flags.out : join13(root, "artifacts/tests/e2e/e2e-test-registry.json");
         if (checkMode) {
           let existing = "";
           try {
-            existing = await readFile5(outPath, "utf-8");
+            existing = await readFile6(outPath, "utf-8");
           } catch {
             err(`Check failed: ${outPath} does not exist or is not readable
 `);
@@ -11464,6 +13147,117 @@ async function runCli(argv, io = {}) {
         }
         return 0;
       }
+      case "restructure": {
+        const action = parsed.positional[0];
+        const format = typeof parsed.flags.format === "string" ? parsed.flags.format : "json";
+        const {
+          applyRestructure: applyRestructure2,
+          gateRestructureOperationPlan: gateRestructureOperationPlan2,
+          inspectRestructure: inspectRestructure2,
+          planRestructure: planRestructure2,
+          pruneRestructureRecovery: pruneRestructureRecovery2,
+          recoverRestructure: recoverRestructure2
+        } = await Promise.resolve().then(() => (init_restructure(), restructure_exports));
+        if (format !== "json") {
+          out(`${JSON.stringify({ ok: false, error: { code: "INVALID_FORMAT", message: `Invalid --format: "${format}". Allowed values: json` } }, null, 2)}
+`);
+          return 1;
+        }
+        const mechanismOperation = action === "apply" || action === "recover" || action === "prune-recovery" ? action : void 0;
+        if (mechanismOperation) {
+          const planFlag = typeof parsed.flags.plan === "string" ? parsed.flags.plan : void 0;
+          if (!planFlag) {
+            out(`${JSON.stringify({ ok: false, error: { code: "PLAN_REQUIRED", message: `restructure ${mechanismOperation} requires --plan <plan.json>` } }, null, 2)}
+`);
+            return 1;
+          }
+          const planPath = isAbsolute6(planFlag) ? planFlag : join13(cwd, planFlag);
+          let planDocument;
+          try {
+            planDocument = JSON.parse(await readFile6(planPath, "utf8"));
+          } catch (planError) {
+            out(`${JSON.stringify({ ok: false, error: { code: "PLAN_UNREADABLE", message: `Cannot read a plan document from ${planPath}: ${planError.message}` } }, null, 2)}
+`);
+            return 1;
+          }
+          const gate = await gateRestructureOperationPlan2(mechanismOperation, planDocument);
+          if (!gate.ok) {
+            out(`${JSON.stringify(gate, null, 2)}
+`);
+            return 1;
+          }
+          const confirmCooperativeWriters = parsed.flags["confirm-cooperative-writers"] === true;
+          const confirmAllParticipantsStopped = parsed.flags["confirm-all-participants-stopped"] === true;
+          const confirmExclusiveMaintenance = parsed.flags["confirm-exclusive-maintenance"] === true;
+          if (mechanismOperation === "apply" && !confirmCooperativeWriters) {
+            out(`${JSON.stringify({ ok: false, error: { code: "COOPERATIVE_WRITERS_UNCONFIRMED", message: "restructure apply requires --confirm-cooperative-writers" } }, null, 2)}
+`);
+            return 1;
+          }
+          if (mechanismOperation === "recover" && !(confirmAllParticipantsStopped && confirmExclusiveMaintenance)) {
+            out(`${JSON.stringify({ ok: false, error: { code: "MAINTENANCE_CONFIRMATION_REQUIRED", message: "restructure recover requires both --confirm-all-participants-stopped and --confirm-exclusive-maintenance" } }, null, 2)}
+`);
+            return 1;
+          }
+          if (mechanismOperation === "prune-recovery") {
+            if (!confirmCooperativeWriters) {
+              out(`${JSON.stringify({ ok: false, error: { code: "COOPERATIVE_WRITERS_UNCONFIRMED", message: "restructure prune-recovery requires --confirm-cooperative-writers" } }, null, 2)}
+`);
+              return 1;
+            }
+            if (confirmAllParticipantsStopped !== confirmExclusiveMaintenance) {
+              out(`${JSON.stringify({ ok: false, error: { code: "MAINTENANCE_CONFIRMATION_REQUIRED", message: "A fault takeover needs --confirm-all-participants-stopped and --confirm-exclusive-maintenance together; neither is accepted alone" } }, null, 2)}
+`);
+              return 1;
+            }
+          }
+          const result2 = mechanismOperation === "apply" ? await applyRestructure2({ root, planPath, confirmCooperativeWriters }) : mechanismOperation === "recover" ? await recoverRestructure2({
+            root,
+            planPath,
+            allParticipantsStopped: confirmAllParticipantsStopped,
+            exclusiveMaintenance: confirmExclusiveMaintenance
+          }) : await pruneRestructureRecovery2({
+            root,
+            planPath,
+            confirmCooperativeWriters,
+            allParticipantsStopped: confirmAllParticipantsStopped,
+            exclusiveMaintenance: confirmExclusiveMaintenance
+          });
+          out(`${JSON.stringify(result2, null, 2)}
+`);
+          return result2.ok ? 0 : 1;
+        }
+        if (action !== "inspect" && action !== "plan") {
+          out(`${JSON.stringify({ ok: false, error: { code: "INVALID_COMMAND", message: "Usage: artifact-graph restructure inspect|plan --root <project> --input <file> --format json; restructure apply|recover|prune-recovery --root <project> --plan <plan.json> [--format json]" } }, null, 2)}
+`);
+          return 1;
+        }
+        const inputPath = typeof parsed.flags.input === "string" ? parsed.flags.input : void 0;
+        if (!inputPath) {
+          out(`${JSON.stringify({ ok: false, error: { code: "INPUT_REQUIRED", message: "--input is required" } }, null, 2)}
+`);
+          return 1;
+        }
+        const resolvedInput = isAbsolute6(inputPath) ? inputPath : join13(cwd, inputPath);
+        let input;
+        try {
+          input = JSON.parse(await readFile6(resolvedInput, "utf8"));
+        } catch (inputError) {
+          out(`${JSON.stringify({ ok: false, error: { code: "INPUT_INVALID", message: `Cannot read valid JSON from ${inputPath}: ${inputError.message}` } }, null, 2)}
+`);
+          return 1;
+        }
+        if (action === "inspect") {
+          const result2 = await inspectRestructure2(root, input);
+          out(`${JSON.stringify(result2, null, 2)}
+`);
+          return result2.ok ? 0 : 1;
+        }
+        const result = await planRestructure2(root, input);
+        out(`${JSON.stringify(result, null, 2)}
+`);
+        return result.ok && result.data.applicable ? 0 : 1;
+      }
       case "contract": {
         const contractAction = parsed.positional[0];
         const contractFormat = typeof parsed.flags.format === "string" ? parsed.flags.format : "json";
@@ -11472,8 +13266,8 @@ async function runCli(argv, io = {}) {
 `);
           return 1;
         }
-        const packageDir = dirname7(fileURLToPath2(import.meta.url));
-        const contractsDir = typeof parsed.flags["contracts-dir"] === "string" ? parsed.flags["contracts-dir"] : join11(packageDir, "..", "contracts");
+        const packageDir = dirname8(fileURLToPath3(import.meta.url));
+        const contractsDir = typeof parsed.flags["contracts-dir"] === "string" ? parsed.flags["contracts-dir"] : join13(packageDir, "..", "contracts");
         const revisionDigest = typeof parsed.flags["revision-digest"] === "string" ? parsed.flags["revision-digest"] : void 0;
         async function resolveContract(contractId) {
           const catalog = await loadContractCatalog(contractsDir);
@@ -11687,7 +13481,7 @@ async function runCli(argv, io = {}) {
           }
           let markdownContent;
           try {
-            markdownContent = await readFile5(markdownPath, "utf-8");
+            markdownContent = await readFile6(markdownPath, "utf-8");
           } catch {
             out(`${JSON.stringify({ ok: false, error: { code: "SCHEMA_VALIDATION_FAILED", path: "/markdown", message: `Could not read markdown file "${markdownPath}"` } }, null, 2)}
 `);
@@ -11786,7 +13580,7 @@ function isGraphRelevantPath(path, schema) {
   return path === "artifact-graph.config.yaml" || path === VERSION_LOCK_PATH || matchesConfiguredArtifactPath(path, schema);
 }
 async function initConfig(root) {
-  const configPath = join11(root, "artifact-graph.config.yaml");
+  const configPath = join13(root, "artifact-graph.config.yaml");
   try {
     await access2(configPath);
     throw new Error(`Config already exists: ${configPath}`);
@@ -11795,12 +13589,13 @@ async function initConfig(root) {
       throw error;
     }
   }
-  await mkdir6(root, { recursive: true });
+  await mkdir7(root, { recursive: true });
   await writeFile6(configPath, yaml3.dump(DEFAULT_SCHEMA, { lineWidth: 120 }));
 }
 function parseArgs(argv) {
   const [command, ...rest] = argv;
   const flags = {};
+  const multiFlags = {};
   const positional = [];
   for (let index = 0; index < rest.length; index += 1) {
     const token = rest[index];
@@ -11810,6 +13605,9 @@ function parseArgs(argv) {
       const nextLooksLikeFlag = next && next.startsWith("-") && next.length > 1 && !/\d/.test(next[1]);
       if (next && !nextLooksLikeFlag) {
         flags[key] = next;
+        const values = multiFlags[key] ?? [];
+        values.push(next);
+        multiFlags[key] = values;
         index += 1;
       } else {
         flags[key] = true;
@@ -11823,7 +13621,7 @@ function parseArgs(argv) {
       positional.push(token);
     }
   }
-  return { command, positional, flags };
+  return { command, positional, flags, multiFlags };
 }
 function parseTimeViewFlag(value, err) {
   if (value === void 0) return void 0;
@@ -11836,13 +13634,13 @@ function parseTimeViewFlag(value, err) {
 }
 async function readReleaseInput(root, value) {
   if (value.includes(",")) return value.split(",");
-  const candidate = isAbsolute5(value) ? value : join11(root, value);
+  const candidate = isAbsolute6(value) ? value : join13(root, value);
   try {
     await access2(candidate);
   } catch {
     return [value];
   }
-  const raw = await readFile5(candidate, "utf-8");
+  const raw = await readFile6(candidate, "utf-8");
   try {
     const parsed = JSON.parse(raw);
     if (Array.isArray(parsed) && parsed.every((item) => typeof item === "string")) return parsed;
@@ -11874,13 +13672,16 @@ Commands:
       configure types.test.paths. See INSTALL.md: Code Traceability And Coverage Boundaries.
   version-lock update --target <type:id> --source <path> [--verified-by <path,path>] [--lock-path <path>]
   version-lock bootstrap [--force] [--lock-path <path>]
-  version-lock refresh (--all | --changed-only (--staged | --worktree | --base <ref>)) [--remove-orphans] [--format json|markdown] [--lock-path <path>]
+  version-lock refresh (--all | --changed-only (--staged | --worktree | --base <ref>)) [--remove-orphans | --remove-orphan-edge <edgeId>...] [--format json|markdown] [--lock-path <path>]
       --remove-orphans  delete locks whose artifact, source, or traceability edge no longer
                         exists (default: retain them). Typical cleanup after deleting or
                         splitting artifacts:
                           artifact-graph version-lock refresh --all --remove-orphans --format markdown
                           git diff artifacts/traceability-version-lock.json   # review
                           git add artifacts/traceability-version-lock.json    # stage, then commit
+      --remove-orphan-edge <edgeId>
+                        delete only the named edge when it is still orphaned; repeat for
+                        multiple edges. Mutually exclusive with --remove-orphans.
   trace-version --target <type:id> [--format json|markdown] [--warning-only] [--strict-missing-lock] [--lock-path <path>]
   hooks install-git [--hook pre-commit|pre-push|all] [--uninstall]
   next-id <type> --range <name>
@@ -11890,6 +13691,18 @@ Commands:
       \u5B89\u5168\u5236\u54C1\u6807\u8BC6\u4E00\u5BF9\u4E00\u91CD\u6784\uFF1A\u7F3A\u7701 dry-run \u53EA\u8F93\u51FA\u8BA1\u5212\uFF1B--apply \u4EE5\u5355\u4E00\u4E8B\u52A1\u6539\u5199\u7ED3\u6784\u5316
       \u767D\u540D\u5355\u4F4D\u7F6E\u5E76\u81EA\u52A8 rescan \u8BC1\u660E\u3002\u9501\u4E0D\u81EA\u52A8\u5237\u65B0\uFF0Capply \u540E\u6309\u63D0\u793A\u8FD0\u884C
       version-lock refresh --changed-only --worktree\u3002
+  restructure inspect --root <project> --input <request.json> [--format json]
+  restructure plan --root <project> --input <mapping.json> [--format json]
+  restructure apply --root <project> --plan <plan.json> --confirm-cooperative-writers [--format json]
+  restructure recover --root <project> --plan <plan.json> --confirm-all-participants-stopped --confirm-exclusive-maintenance [--format json]
+  restructure prune-recovery --root <project> --plan <plan.json> --confirm-cooperative-writers [--confirm-all-participants-stopped --confirm-exclusive-maintenance] [--format json]
+      apply \u5DF2\u5F00\u653E\u5E76\u5728\u5408\u683C\u73AF\u5883\u771F\u5B9E\u5199\u5165\uFF1A\u5E73\u53F0\u8D44\u683C\u4EC5 Darwin/arm64/APFS\uFF0C\u5176\u4ED6\u5E73\u53F0\u4ECD\u53EF\u7528 inspect/plan\uFF0C
+      apply \u4EE5 APPLY_ENVIRONMENT_UNSUPPORTED \u62D2\u7EDD\uFF0C\u4E0D\u4F1A\u964D\u7EA7\u6210\u65E0\u4E8B\u52A1\u5199\u5165\u3002\u6587\u4EF6\u96C6\u5408\u5199\u5165\u80FD\u529B\u7684\u6210\u719F\u5EA6\u4E3A
+      candidate\uFF1A\u4EE5\u5408\u4F5C\u5F0F\u5199\u8005\u4E3A\u524D\u63D0\u4E14\u4E0D\u81EA\u8BC1\u8BE5\u524D\u63D0\uFF0Capply \u4E0E prune-recovery \u5FC5\u987B\u7ED9\u51FA
+      --confirm-cooperative-writers\uFF0C\u7F3A\u5931\u5373\u62D2\u7EDD\u5199\u5165\uFF1Brecover \u5FC5\u987B\u540C\u65F6\u7ED9\u51FA
+      --confirm-all-participants-stopped \u4E0E --confirm-exclusive-maintenance\u3002\u6062\u590D\u6750\u6599\u9ED8\u8BA4\u4FDD\u7559\uFF0C
+      \u53EA\u6709\u663E\u5F0F prune-recovery \u624D\u6E05\u7406\u3002\u8BA1\u5212\u6587\u6863\u4FDD\u5B58\u5728\u5199\u96C6\u4E4B\u5916\u7684\u666E\u901A\u76EE\u5F55\uFF1A\u6062\u590D\u53EA\u4F9D\u8D56\u8BE5\u6587\u6863\uFF0C
+      \u4E0D\u4F9D\u8D56\u8FDB\u7A0B\u72B6\u6001\u3002
   validate-review-result --file <path> [--format json]
   generate-e2e-registry [--deterministic] [--out <path>] [--check]
   contract list [--contracts-dir <path>] [--format json]
@@ -11905,7 +13718,7 @@ function isCliEntrypoint(argvPath) {
     return false;
   }
   try {
-    return realpathSync2(argvPath) === realpathSync2(fileURLToPath2(import.meta.url));
+    return realpathSync2(argvPath) === realpathSync2(fileURLToPath3(import.meta.url));
   } catch {
     return false;
   }

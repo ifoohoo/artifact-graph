@@ -23,7 +23,7 @@ pnpm exec artifact-graph --help
 pnpm exec artifact-graph doctor --root .
 ```
 
-If either read-only command fails, confirm that Node.js `>=22.0.0` is active and reinstall the
+If either read-only command fails, confirm that Node.js `>=22.22.2 <23` is active and reinstall the
 package using the precise instructions in [INSTALL.md](INSTALL.md). Do not run a write command
 until the CLI resolves successfully and doctor reports an actionable diagnosis.
 
@@ -39,7 +39,7 @@ Or install from GitHub:
 npm install --save-dev github:ifoohoo/artifact-graph
 ```
 
-Node.js `>=22.0.0` is required. For pnpm 10+, see [INSTALL.md](INSTALL.md) for the native build
+Node.js `>=22.22.2 <23` is required. For pnpm 10+, see [INSTALL.md](INSTALL.md) for the native build
 allowlist setup.
 
 ## Quick Start
@@ -94,6 +94,43 @@ index before `refresh --all`; there is no `version-lock update --all` operation.
   relations (`artifactRelations`). Old 1.0 lock files without `artifactRelations` are treated as
   having an empty relation list; run `refresh --all` once to establish the complete relation baseline.
 - Install opt-in Git hooks with `artifact-graph hooks install-git --hook all`.
+- Inspect and plan artifact restructuring with `artifact-graph restructure inspect` and
+  `artifact-graph restructure plan`. These two are read-only compilations of a mapping you supply.
+
+### Restructuring Artifacts (Split, Move, Renumber)
+
+`artifact-graph restructure` compiles an explicit restructuring mapping into a reviewable candidate
+plan and then applies the file set as one operation. Three transformations are supported:
+`record-split` (physically split records), `identity-split` (split one numbered identity into
+several), and `move-renumber` (move records between files and renumber them). Deciding capability
+boundaries and where each acceptance criterion goes stays outside the CLI; the compiler only turns
+a complete mapping into a plan and applies it.
+
+```bash
+# pnpm
+pnpm exec artifact-graph restructure inspect --root . --input request.json --format json
+pnpm exec artifact-graph restructure plan --root . --input mapping.json --format json
+pnpm exec artifact-graph restructure apply --root . --plan plan.json --confirm-cooperative-writers
+
+# npm
+npx artifact-graph restructure inspect --root . --input request.json --format json
+npx artifact-graph restructure plan --root . --input mapping.json --format json
+npx artifact-graph restructure apply --root . --plan plan.json --confirm-cooperative-writers
+```
+
+`plan` reports blockers, unresolved items, candidate issues and out-of-scope reference sites;
+`applicable` is false while any blocker or unresolved item remains, and an inapplicable plan must not
+be applied. Keep the plan document in an ordinary directory outside the write set — recovery depends
+on that document, not on process state.
+
+> **Adoption limits.** The file-set write capability has `candidate` maturity. The qualified
+> environment is Darwin / arm64 / APFS only; other platforms are reported as unavailable rather than
+> degraded to a non-transactional write. It assumes cooperative writers and does not prove that
+> premise: `apply` and `prune-recovery` require `--confirm-cooperative-writers`, and refuse to write
+> without it. Recovery requires `recover` with both `--confirm-all-participants-stopped` and
+> `--confirm-exclusive-maintenance`. Recovery materials are retained by default; only an explicit
+> `prune-recovery` removes them. No cross-platform transactional guarantee is offered. `inspect` and
+> `plan` do not write to the project.
 
 ### Cleaning Up Orphan Locks After Deleting or Splitting Artifacts
 
@@ -112,6 +149,17 @@ npx artifact-graph version-lock refresh --all --remove-orphans --format markdown
 git diff artifacts/traceability-version-lock.json
 git add artifacts/traceability-version-lock.json
 ```
+
+When only the edge produced by one renumbering should go, name it explicitly instead of sweeping
+every orphan:
+
+```bash
+pnpm exec artifact-graph version-lock refresh --changed-only --worktree --remove-orphan-edge <edgeId>
+```
+
+`--remove-orphan-edge` is repeatable, applies only to edges that are still orphaned, and is mutually
+exclusive with `--remove-orphans` — passing both is rejected. Naming an edge that is still live is
+rejected without deleting anything, and pre-existing orphans in the same lock file are left intact.
 
 `version-lock audit` marks structural orphan locks and stale hashes as blocking issues and prints
 these same remediation steps. Runner liveness findings (a test file no longer active in any
