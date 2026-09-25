@@ -852,6 +852,68 @@ declare function prepareManagedHookBlock(options: ManagedHookBlockOptions): Prom
 declare function applyPreparedManagedHookBlocks(prepared: readonly PreparedManagedHookBlock[]): Promise<HookInstallResult[]>;
 declare function installManagedHookBlock(options: ManagedHookBlockOptions): Promise<HookInstallResult>;
 
+declare const GRAPH_PROVIDER_ID = "artifact-graph";
+declare const GRAPH_PROVIDER_ENTRY = "check-professional";
+declare const PROFESSIONAL_CONCLUSION_OBJECT = "professional-conclusion";
+declare const GRAPH_DOMAIN_CODES: Readonly<{
+    CLEAR: "GRAPH_CLEAR";
+    FINDINGS: "GRAPH_FINDINGS";
+    INCOMPLETE: "GRAPH_CHECK_INCOMPLETE";
+    UNAVAILABLE: "GRAPH_CHECK_UNAVAILABLE";
+}>;
+type GraphDomainCode = typeof GRAPH_DOMAIN_CODES.CLEAR | typeof GRAPH_DOMAIN_CODES.FINDINGS | typeof GRAPH_DOMAIN_CODES.INCOMPLETE | typeof GRAPH_DOMAIN_CODES.UNAVAILABLE;
+type ProofReadStatus = 'pass' | 'not_pass' | 'unavailable';
+interface ProfessionalConclusion {
+    schemaVersion: 1;
+    kind: 'skill-family.professional-conclusion';
+    provider: {
+        id: string;
+        version: string;
+        entry: string;
+    };
+    subject: {
+        ref: string;
+        revision?: string;
+    };
+    scope: {
+        checked: string[];
+        limitations: string[];
+    };
+    outcome: {
+        completion: 'complete' | 'partial' | 'not-performed';
+        code: string;
+        summary: string;
+    };
+    details?: Record<string, unknown>;
+}
+interface ProofReadResult {
+    status: ProofReadStatus;
+    reason: string;
+    provider: {
+        id?: string;
+        version?: string;
+        entry?: string;
+    } | null;
+    conclusion: ProfessionalConclusion | null;
+}
+interface CheckProfessionalOptions {
+    root: string;
+    conclusionOutput?: string;
+}
+interface CheckProfessionalResult {
+    conclusion: ProfessionalConclusion;
+    writeError?: string;
+}
+interface ReadProofOptions {
+    proofRoot: string;
+    proof: string;
+}
+declare function runCheckProfessional(options: CheckProfessionalOptions): Promise<CheckProfessionalResult>;
+declare function runReadProof(options: ReadProofOptions): Promise<{
+    result: ProofReadResult;
+    exitCode: number;
+}>;
+
 /**
  * Review Result Protocol validator.
  *
@@ -1820,6 +1882,13 @@ interface ArtifactTypeSchema {
     aliases?: string[];
     target?: boolean;
     extraFields?: ArtifactExtraFieldSchema[];
+    /**
+     * Custom types only. `json` reads one root object from the original file.
+     * Omit it to keep Markdown parsing.
+     */
+    format?: 'json';
+    /** One root own-property name when format is json. Dots stay inside that name. */
+    idField?: string;
 }
 interface ArtifactTarget {
     type: string;
@@ -2155,4 +2224,4 @@ declare function discoverTargets(graph: ArtifactGraph, options?: DiscoverOptions
 declare function resolveArtifactContext(graph: ArtifactGraph, opts: ContextOptions): ContextManifest;
 declare function formatContextMarkdown(manifest: ContextManifest): string;
 
-export { ALWAYS_PRESENT_ITEMS as ALWAYS_PRESENT, type ArtifactChainDoctorReport, type ArtifactEdge, type ArtifactEdgeRule, type ArtifactExtraFieldSchema, type ArtifactGraph, type ArtifactGraphCliCandidate, type ArtifactGraphCliResolution, type ArtifactGraphCliSource, type ArtifactNode, type ArtifactSchema, type ArtifactTarget, type ArtifactTypeMetadata, type ArtifactTypeRole, type ArtifactTypeSchema, BASELINE_CONSTRAINTS, BASELINE_CONSTRAINTS_COUNT, BASELINE_ITEMS_COUNT, type BatchDefinition, type ByteRange, CONTRACTS_PACKAGE_NAME, CONTRACT_ERROR_CODES, type CanonicalIR, type CollectChangedPathsOptions, type ContextItem, type ContextManifest, type ContextMode, type ContextOptions, type ContextTier, ContractCatalog, type ContractCatalogEntry, type ContractDefinition, ContractError, type ContractErrorCode, type ContractIdentity, ContractRegistry, type ContractRegistryEntry, type ContractSchema, type CoverageBoundaryReport, DEFAULT_MAX_CHARS, DEFAULT_SCHEMA, type DeclaredVerificationReference, type DiscoverOptions, E2E_NORMALIZER_CONFIG, type E2eCoverageStats, type E2eCoverageThresholds, type E2eRegistry, type E2eRegistryBatch, type E2eRunnerConfig, type E2eWaiver, type Evidence, type EvidenceObject, type ExecutorType, type ExternalEntryInfo, FILE_SET_RESULT_OBJECT, FOUNDATION_PACKAGE_NAME, type FileSnapshot, type Finding, type FindingLocation, type FindingSeverity, type FindingStatus, type FoundationModule, type GitChangeMode, type GitChangeResult, type GitHookName, type HookInstallResult, type ImpactEdgeRef, type ImpactMode, type ImpactNodeRef, type ImpactOptions, type ImpactReport, type ImplementationBlueprintDraft, type ImplementationPacket, type LegacyFieldMapping, type LoadContractOptions, MIN_PROMPT_CHARS, type ManagedHookBlockOptions, type MissingDetail, type NodeTimeView, type NormalizationResult, type NormalizerConfig, type PacketAuditEntry, type PacketAuditSummary, type PacketCategory, type PacketItem, type PacketOmittedItem, type PacketOptions, type PacketPromptError, type PacketPromptOptions, type PacketTarget, type PacketTargetType, type PacketValidationIssue, type PacketValidationResult, type PartialSupersedeAnnotation, type PolicyCompatibilityResult, type PreparedManagedHookBlock, type Producer, type ProjectPolicy, type PromptValidationIssue, type PromptValidationResult, type QueryOptions, RESTRUCTURE_MAX_OPERATIONS, RESTRUCTURE_MAX_TOTAL_BYTES, RESTRUCTURE_PLAN_SCHEMA_VERSION, RESTRUCTURE_QUALIFIED_ARCH, RESTRUCTURE_QUALIFIED_FILESYSTEM, RESTRUCTURE_QUALIFIED_PLATFORM, RESTRUCTURE_RECOVERY_JOURNAL_REL_PATH, RESTRUCTURE_RECOVERY_REL_PATH, RESTRUCTURE_RECOVERY_ROOT_MODE, RESTRUCTURE_VALIDATION_TIMEOUT_MS, type RecordBoundaryResult, type RelationSemanticsSpec, type RepairData, type RepairValidation, type ResolveArtifactGraphCliOptions, type RestructureApplyInput, type RestructureBoundaryLimits, type RestructureCandidate, type RestructureFileSetApplyOptions, type RestructureFinding, type RestructureInspection, type RestructureMaintenanceOptions, type RestructureMapping, type RestructureMechanismProjection, type RestructureMechanismQualification, type RestructureMechanismRootOptions, type RestructureOperationBoundary, type RestructurePlan, type RestructurePlanDocument, type RestructurePlanOperation, type RestructurePruneInput, type RestructureRecoveryInput, type RestructureRequest, type RestructureResult, type RestructureValidationCallback, type ReviewData, type ReviewDecision, type ReviewMetrics, type ReviewOrderStep, type ReviewResult, type ReviewStatus, type RiskChecklistItem, type ScanArtifactsOptions, type SchemaValidationResult, TARGET_ARTIFACT_TYPES, type TargetArtifactType, type TimeBucket, type TimeView, type TraceVersionResult, VALID_PACKET_TARGET_TYPES, VERSION_INDEX_SCHEMA_VERSION, VERSION_LOCK_PATH, VERSION_LOCK_SCHEMA_VERSION, type ValidationError, type ValidationIssue, type VersionEdgeKind, type VersionIndex, type VersionLockAuditMarkdownOptions, type VersionLockAuditResult, type VersionLockBootstrapOptions, type VersionLockEntry, type VersionLockFile, type VersionLockIssue, type VersionLockIssueSeverity, type VersionLockRef, type VersionLockRefreshOptions, type VersionLockRefreshResult, type VersionLockSourceRef, type VersionLockStatus, type VersionLockUpdateOptions, type VersionSourceKind, type VersionedEdge, type VersionedNode, type ViewExcludedNode, type ViewSelection, applyPreparedManagedHookBlocks, applyRestructure, applyRestructureFileSet, assemblePacket, auditPackets, auditVersionLock, bootstrapVersionLock, buildFileSetApplyRequest, buildGraph, buildVersionIndex, candidateByteDigest, collectChangedPaths, computeCoverageBoundary, computeE2eCoverageStats, computeImpact, computeRevisionDigest, createModeForUmask, createRestructureRootBinding, createRestructureValidationCallback, digestRestructureValue, discoverAndAuditPackets, discoverTargets, doctorArtifactChain, ensureRestructureMechanismRoot, filterGraphByView, formatContextMarkdown, gateRestructureOperationPlan, generateE2eRegistry, getArtifactTypeMetadata, getExternalEntryInfo, getTargetArtifactTypes, inspectRestructure, installManagedHookBlock, isOfficialNamespace, isPacketTargetType, isPacketTargetTypeDynamic, isTargetArtifactType, isVersionLockIssueBlocking, loadConfig, loadContract, loadContractCatalog, loadContractsFromDirectory, loadFoundationModule, locateSoftwareRecord, markdownRecordHeadings, matchesConfiguredArtifactPath, nextId, normalizeE2eLegacyArtifact, normalizeToCanonical, observeRestructureJournal, parseTargetSelector, parseTargetsFile, planRestructure, planningUmask, prepareManagedHookBlock, projectRestructureFileSetResult, pruneRestructureFileSet, pruneRestructureRecovery, qualifyRestructureMechanism, queryGraph, recoverRestructure, recoverRestructureFileSet, refreshVersionLock, renderCoverageBoundaryMarkdown, renderDoctorMarkdown, renderImpactMarkdown, renderMermaid, renderPacketMarkdown, renderPacketPrompt, renderTraceVersionMarkdown, renderVersionLockAuditMarkdown, renderVersionLockRefreshMarkdown, replaceSoftwareHeader, resolveArtifactContext, resolveArtifactGraphCli, resolveArtifactTypeName, resolveCliTarget, resolveGitHookPath, resolveMatrixEdges, resolveNodeTimeView, resolveRealRoot, restructureBoundaryFindings, scanArtifacts, traceVersion, updateVersionLock, validateContractAgainstSchema, validateExecutableTraceability, validateGraph, validateNamespaceAuthority, validatePacket, validatePacketMarkdown, validatePacketPrompt, validatePolicyCompatibility, validateReviewResult, validateScenarioPrdLinkIndex, validateScenarioPrdLinks, verifyDigest, verifyMechanismResult, versionLockIssueSeverity, writeGraphCache };
+export { ALWAYS_PRESENT_ITEMS as ALWAYS_PRESENT, type ArtifactChainDoctorReport, type ArtifactEdge, type ArtifactEdgeRule, type ArtifactExtraFieldSchema, type ArtifactGraph, type ArtifactGraphCliCandidate, type ArtifactGraphCliResolution, type ArtifactGraphCliSource, type ArtifactNode, type ArtifactSchema, type ArtifactTarget, type ArtifactTypeMetadata, type ArtifactTypeRole, type ArtifactTypeSchema, BASELINE_CONSTRAINTS, BASELINE_CONSTRAINTS_COUNT, BASELINE_ITEMS_COUNT, type BatchDefinition, type ByteRange, CONTRACTS_PACKAGE_NAME, CONTRACT_ERROR_CODES, type CanonicalIR, type CheckProfessionalOptions, type CheckProfessionalResult, type CollectChangedPathsOptions, type ContextItem, type ContextManifest, type ContextMode, type ContextOptions, type ContextTier, ContractCatalog, type ContractCatalogEntry, type ContractDefinition, ContractError, type ContractErrorCode, type ContractIdentity, ContractRegistry, type ContractRegistryEntry, type ContractSchema, type CoverageBoundaryReport, DEFAULT_MAX_CHARS, DEFAULT_SCHEMA, type DeclaredVerificationReference, type DiscoverOptions, E2E_NORMALIZER_CONFIG, type E2eCoverageStats, type E2eCoverageThresholds, type E2eRegistry, type E2eRegistryBatch, type E2eRunnerConfig, type E2eWaiver, type Evidence, type EvidenceObject, type ExecutorType, type ExternalEntryInfo, FILE_SET_RESULT_OBJECT, FOUNDATION_PACKAGE_NAME, type FileSnapshot, type Finding, type FindingLocation, type FindingSeverity, type FindingStatus, type FoundationModule, GRAPH_DOMAIN_CODES, GRAPH_PROVIDER_ENTRY, GRAPH_PROVIDER_ID, type GitChangeMode, type GitChangeResult, type GitHookName, type GraphDomainCode, type HookInstallResult, type ImpactEdgeRef, type ImpactMode, type ImpactNodeRef, type ImpactOptions, type ImpactReport, type ImplementationBlueprintDraft, type ImplementationPacket, type LegacyFieldMapping, type LoadContractOptions, MIN_PROMPT_CHARS, type ManagedHookBlockOptions, type MissingDetail, type NodeTimeView, type NormalizationResult, type NormalizerConfig, PROFESSIONAL_CONCLUSION_OBJECT, type PacketAuditEntry, type PacketAuditSummary, type PacketCategory, type PacketItem, type PacketOmittedItem, type PacketOptions, type PacketPromptError, type PacketPromptOptions, type PacketTarget, type PacketTargetType, type PacketValidationIssue, type PacketValidationResult, type PartialSupersedeAnnotation, type PolicyCompatibilityResult, type PreparedManagedHookBlock, type Producer, type ProfessionalConclusion, type ProjectPolicy, type PromptValidationIssue, type PromptValidationResult, type ProofReadResult, type ProofReadStatus, type QueryOptions, RESTRUCTURE_MAX_OPERATIONS, RESTRUCTURE_MAX_TOTAL_BYTES, RESTRUCTURE_PLAN_SCHEMA_VERSION, RESTRUCTURE_QUALIFIED_ARCH, RESTRUCTURE_QUALIFIED_FILESYSTEM, RESTRUCTURE_QUALIFIED_PLATFORM, RESTRUCTURE_RECOVERY_JOURNAL_REL_PATH, RESTRUCTURE_RECOVERY_REL_PATH, RESTRUCTURE_RECOVERY_ROOT_MODE, RESTRUCTURE_VALIDATION_TIMEOUT_MS, type ReadProofOptions, type RecordBoundaryResult, type RelationSemanticsSpec, type RepairData, type RepairValidation, type ResolveArtifactGraphCliOptions, type RestructureApplyInput, type RestructureBoundaryLimits, type RestructureCandidate, type RestructureFileSetApplyOptions, type RestructureFinding, type RestructureInspection, type RestructureMaintenanceOptions, type RestructureMapping, type RestructureMechanismProjection, type RestructureMechanismQualification, type RestructureMechanismRootOptions, type RestructureOperationBoundary, type RestructurePlan, type RestructurePlanDocument, type RestructurePlanOperation, type RestructurePruneInput, type RestructureRecoveryInput, type RestructureRequest, type RestructureResult, type RestructureValidationCallback, type ReviewData, type ReviewDecision, type ReviewMetrics, type ReviewOrderStep, type ReviewResult, type ReviewStatus, type RiskChecklistItem, type ScanArtifactsOptions, type SchemaValidationResult, TARGET_ARTIFACT_TYPES, type TargetArtifactType, type TimeBucket, type TimeView, type TraceVersionResult, VALID_PACKET_TARGET_TYPES, VERSION_INDEX_SCHEMA_VERSION, VERSION_LOCK_PATH, VERSION_LOCK_SCHEMA_VERSION, type ValidationError, type ValidationIssue, type VersionEdgeKind, type VersionIndex, type VersionLockAuditMarkdownOptions, type VersionLockAuditResult, type VersionLockBootstrapOptions, type VersionLockEntry, type VersionLockFile, type VersionLockIssue, type VersionLockIssueSeverity, type VersionLockRef, type VersionLockRefreshOptions, type VersionLockRefreshResult, type VersionLockSourceRef, type VersionLockStatus, type VersionLockUpdateOptions, type VersionSourceKind, type VersionedEdge, type VersionedNode, type ViewExcludedNode, type ViewSelection, applyPreparedManagedHookBlocks, applyRestructure, applyRestructureFileSet, assemblePacket, auditPackets, auditVersionLock, bootstrapVersionLock, buildFileSetApplyRequest, buildGraph, buildVersionIndex, candidateByteDigest, collectChangedPaths, computeCoverageBoundary, computeE2eCoverageStats, computeImpact, computeRevisionDigest, createModeForUmask, createRestructureRootBinding, createRestructureValidationCallback, digestRestructureValue, discoverAndAuditPackets, discoverTargets, doctorArtifactChain, ensureRestructureMechanismRoot, filterGraphByView, formatContextMarkdown, gateRestructureOperationPlan, generateE2eRegistry, getArtifactTypeMetadata, getExternalEntryInfo, getTargetArtifactTypes, inspectRestructure, installManagedHookBlock, isOfficialNamespace, isPacketTargetType, isPacketTargetTypeDynamic, isTargetArtifactType, isVersionLockIssueBlocking, loadConfig, loadContract, loadContractCatalog, loadContractsFromDirectory, loadFoundationModule, locateSoftwareRecord, markdownRecordHeadings, matchesConfiguredArtifactPath, nextId, normalizeE2eLegacyArtifact, normalizeToCanonical, observeRestructureJournal, parseTargetSelector, parseTargetsFile, planRestructure, planningUmask, prepareManagedHookBlock, projectRestructureFileSetResult, pruneRestructureFileSet, pruneRestructureRecovery, qualifyRestructureMechanism, queryGraph, recoverRestructure, recoverRestructureFileSet, refreshVersionLock, renderCoverageBoundaryMarkdown, renderDoctorMarkdown, renderImpactMarkdown, renderMermaid, renderPacketMarkdown, renderPacketPrompt, renderTraceVersionMarkdown, renderVersionLockAuditMarkdown, renderVersionLockRefreshMarkdown, replaceSoftwareHeader, resolveArtifactContext, resolveArtifactGraphCli, resolveArtifactTypeName, resolveCliTarget, resolveGitHookPath, resolveMatrixEdges, resolveNodeTimeView, resolveRealRoot, restructureBoundaryFindings, runCheckProfessional, runReadProof, scanArtifacts, traceVersion, updateVersionLock, validateContractAgainstSchema, validateExecutableTraceability, validateGraph, validateNamespaceAuthority, validatePacket, validatePacketMarkdown, validatePacketPrompt, validatePolicyCompatibility, validateReviewResult, validateScenarioPrdLinkIndex, validateScenarioPrdLinks, verifyDigest, verifyMechanismResult, versionLockIssueSeverity, writeGraphCache };

@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## 0.14.0
+
+### Added
+
+- Custom artifact types can read one JSON object per original file with `format: json` and a root
+  `idField`. Configured relation fields follow fixed dotted property paths; graph diagnostics and
+  version locks continue to refer to the original file. Markdown remains the default format.
+- Added `check-professional` to combine graph validation, version-lock audit, and coverage into a
+  graph-scoped conclusion without writing the scan cache. It can create a proof at an explicit
+  absolute path without overwriting an existing file. `read-proof` reads that proof without a scan.
+
+### Changed
+
+- Version lockstep with `artifact-chain-assistant` 0.14.0.
+
 ## 0.13.0
 
 ### Added

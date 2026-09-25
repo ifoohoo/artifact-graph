@@ -2,7 +2,8 @@
 
 [中文](README.zh-CN.md)
 
-Git-native Markdown artifact graph scanner and validator for agentic coding workflows.
+Git-native artifact graph scanner and validator for agentic coding workflows.
+Markdown stays the default parser. A custom type may set `format: json` and bring that original file into the same graph.
 
 `artifact-graph` helps projects keep requirements, scenarios, design notes, source files, tests,
 and version-lock metadata connected. It is designed for deterministic local use before an AI coding
@@ -10,8 +11,10 @@ agent claims implementation work is complete.
 
 <!-- release-skill:capability:external-write-boundary -->
 > **External-write boundary:** Installing `artifact-graph` does not modify a project or write to
-> remote systems. Read-only commands such as `--help`, `doctor`, `validate`, `query`, and `audit`
-> do not change project files. Commands including `init`, `version-lock refresh`, and
+> remote systems. Read-only commands such as `--help`, `doctor`, `validate`, `query`, `audit`,
+> `check-professional` (without `--conclusion-output`), and `read-proof` do not change project files.
+> `--conclusion-output` creates one new proof file at an explicit absolute path and never overwrites
+> an existing proof. Commands including `init`, `scan`, `version-lock refresh`, and
 > `hooks install-git` write locally only when explicitly invoked.
 
 <!-- release-skill:capability:safe-first-command -->
@@ -78,10 +81,80 @@ See [Code Traceability And Coverage Boundaries](INSTALL.md#code-traceability-and
 for syntax, scan configuration, classification, exemptions and project isolation. Inspect the
 index before `refresh --all`; there is no `version-lock update --all` operation.
 
+### JSON originals for custom types
+
+Built-in types keep their dedicated parsers. `format: json` belongs only on a custom type registered by the project, and that type must also set `idField`. Omitting `format` keeps Markdown parsing. A `*.json` scan path does not switch parsers until the type declares `format: json`.
+
+`idField` is the name of one property on the root object. The name is used whole, so a dot inside it stays part of the name. Each file must contain one JSON object and produces one node. The id is that property's string, including spaces and case, and is then checked with the type's existing `idPatterns`.
+
+Invalid JSON, a root array or scalar, a missing id, a non-string id, or a blank string produces a diagnostic and no node. A string that fails `idPatterns` still produces the node, together with a diagnostic.
+
+Relations stay in `relationSemantics`, using the existing `kind`, `fields`, `targetTypes`, and `label`. For JSON files, a dotted `fields` entry is a chain of own properties. `capability.capabilityRef` reads the root object's `capability`, then that object's `capabilityRef`. A missing property does not create an optional relation. If an intermediate value is not an object, or the final value is not a non-empty string or an array of non-empty strings, the diagnostic names the original file and the field. Valid array entries use the existing target resolver; a broken target remains a graph validation finding. An empty array creates no edge.
+
+A dot only separates exact property names. `*`, filters, JSONPath, and expressions are not path syntax in this batch. Records inside an array stay in the original object. This batch reads the id and configured relations; it does not select a title or status, and it does not join, prefix, or rewrite ids. Markdown fields are still looked up as one literal string. Diagnostics use line 1 because this batch does not map JSON tokens to source lines.
+
+A project can point a method at a capability and a release record at a method. The configuration below shows those two directions.
+
+```yaml
+types:
+  capability:
+    paths: ["capabilities/*.json"]
+    format: json
+    idField: capabilityId
+  method:
+    paths: ["methods/*.json"]
+    format: json
+    idField: methodId
+  skill_release:
+    paths: ["releases/*.json"]
+    format: json
+    idField: releaseId
+idPatterns:
+  capability: "^CAP-[A-Z0-9-]+$"
+  method: "^METH-[A-Z0-9-]+$"
+  skill_release: "^REL-[A-Z0-9-]+$"
+relationSemantics:
+  applies:
+    label: Method applies to capability
+    targetTypes: [capability]
+    fields: [capability.capabilityRef]
+  releases:
+    label: Release record points to method
+    targetTypes: [method]
+    fields: [methods]
+```
+
+A method file stores one capability id under nested properties. `capability.*` looks up a property named `*` and does not collect the neighboring properties.
+
+```json
+{
+  "methodId": "METH-1",
+  "capability": { "capabilityRef": "CAP-1" }
+}
+```
+
+A release file stores several method ids in a string array. `method:METH-1` is resolved by the existing `type:id` parser.
+
+```json
+{
+  "releaseId": "REL-1",
+  "methods": ["METH-1", "method:METH-2"]
+}
+```
+
+`scanArtifacts`, `validate`, and `version-lock` consume the same graph. The lock still hashes the original file bytes. Finding the configured nodes and relations shows that those files entered the graph. Domain review and publication facts need their own evidence.
+
 ### Daily commands
 
 - Generate or inspect project artifact graph configuration with `artifact-graph init`.
 - Validate artifact links with `artifact-graph validate`.
+- Emit a reusable graph professional proof with `artifact-graph check-professional --root . --format json`.
+  Add `--conclusion-output <absolute-path>` only when a proof file is required; the command composes
+  existing `validate`, `version-lock audit`, and `coverage` checks and does not write graph cache.
+- Read one graph proof with `artifact-graph read-proof --proof-root <root> --proof <relative> --format json`.
+  `GRAPH_CLEAR` with complete scope is `pass`; findings, incomplete checks, and recorded unavailability
+  are `not_pass`. A missing, damaged, foreign, or unknown-code file is `unavailable`. This is not the
+  Review Result Protocol.
 - Validate Review Result Protocol v1.0 documents with `artifact-graph validate-review-result --file <path>`.
 - Build implementation context with `artifact-graph context` or `artifact-graph packet`.
 - Add `--view current|planned|history|all` to `query`, `context`, or `packet` when a project maps

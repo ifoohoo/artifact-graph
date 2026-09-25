@@ -3924,6 +3924,378 @@ var init_hook_installer = __esm({
   }
 });
 
+// src/professional-conclusion.ts
+import { access as access2 } from "fs/promises";
+import { createRequire as createRequire2 } from "module";
+import { basename as basename3, dirname as dirname5, isAbsolute as isAbsolute4, join as join7, resolve as resolve5 } from "path";
+import { pathToFileURL } from "url";
+async function loadContracts() {
+  return await import(CONTRACTS_PACKAGE_NAME);
+}
+async function loadHarness() {
+  return await import("skill-family-harness-node");
+}
+function providerVersion() {
+  const anchor = typeof __filename === "string" ? __filename : import.meta.url;
+  const parsed = createRequire2(anchor)("../package.json");
+  if (typeof parsed.version !== "string" || parsed.version.length === 0) {
+    throw new Error("artifact-graph package.json is missing version");
+  }
+  return parsed.version;
+}
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+function harnessKind(error) {
+  if (error === null || typeof error !== "object" || !("details" in error)) {
+    return void 0;
+  }
+  const details = error.details;
+  return typeof details?.kind === "string" ? details.kind : void 0;
+}
+async function missingRequiredConfig(root) {
+  const configPath = join7(root, "artifact-graph.config.yaml");
+  try {
+    await access2(configPath);
+    return void 0;
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return `required configuration is missing: ${configPath}`;
+    }
+    return errorMessage(error);
+  }
+}
+async function runValidate(root) {
+  const config = await loadConfig(root);
+  const graph = await scanArtifacts(root, config);
+  const issues = validateGraph(graph, config);
+  issues.push(...await validateScenarioPrdLinkIndex(root, graph));
+  issues.push(...await validateExecutableTraceability(root, config));
+  const includeCoverage = config.e2e?.executable_ref_warning !== void 0 || config.e2e?.executable_ref_error !== void 0;
+  if (includeCoverage) {
+    const e2eConfig = config.e2e ?? {};
+    const coverageStats = await computeE2eCoverageStats(graph, root, {
+      executableRefWarning: e2eConfig.executable_ref_warning,
+      executableRefError: e2eConfig.executable_ref_error,
+      reportUncoveredScenarios: e2eConfig.report_uncovered_scenarios,
+      reportUncoveredFeatures: e2eConfig.report_uncovered_features,
+      scenarioWaivers: e2eConfig.scenario_waivers,
+      featureWaivers: e2eConfig.feature_waivers
+    });
+    for (const msg of coverageStats.thresholdWarnings) {
+      issues.push({
+        code: "E2E_COVERAGE_WARNING",
+        severity: "warning",
+        message: msg,
+        path: "e2e-coverage",
+        line: 1
+      });
+    }
+    for (const msg of coverageStats.thresholdErrors) {
+      issues.push({
+        code: "E2E_COVERAGE_ERROR",
+        severity: "error",
+        message: msg,
+        path: "e2e-coverage",
+        line: 1
+      });
+    }
+  }
+  return { name: CHECK_VALIDATE, status: "completed", issues };
+}
+async function runLockAudit(root) {
+  const result = await auditVersionLock(root);
+  return { name: CHECK_LOCK, status: "completed", issues: result.issues };
+}
+async function runCoverage(root) {
+  const report = await computeCoverageBoundary(root);
+  return {
+    name: CHECK_COVERAGE,
+    status: "completed",
+    issues: [],
+    coverage: {
+      assessment: report.graphHealth.assessment,
+      changedPathScope: report.scanCoverage.changedPathScope,
+      behaviorStatus: report.behaviorVerification.status
+    }
+  };
+}
+async function settleCheck(name, run) {
+  try {
+    return await run();
+  } catch (error) {
+    return { name, status: "not-performed", issues: [], reason: errorMessage(error) };
+  }
+}
+function mapDomain(checks) {
+  const completed = checks.filter((check) => check.status === "completed");
+  const missing = checks.filter((check) => check.status === "not-performed");
+  const hasFindings = completed.some((check) => check.issues.length > 0);
+  if (completed.length === 0) {
+    return {
+      code: GRAPH_DOMAIN_CODES.UNAVAILABLE,
+      completion: "not-performed",
+      summary: "Graph checks did not start because configuration, runtime, or inputs were unavailable."
+    };
+  }
+  if (hasFindings) {
+    return {
+      code: GRAPH_DOMAIN_CODES.FINDINGS,
+      completion: missing.length > 0 ? "partial" : "complete",
+      summary: "At least one completed graph check reported issues. Original issues are preserved."
+    };
+  }
+  if (missing.length > 0) {
+    return {
+      code: GRAPH_DOMAIN_CODES.INCOMPLETE,
+      completion: "partial",
+      summary: "Some declared graph checks completed without findings; others lacked input or could not finish."
+    };
+  }
+  return {
+    code: GRAPH_DOMAIN_CODES.CLEAR,
+    completion: "complete",
+    summary: "Declared graph checks completed without issues. This does not prove unregistered relations or content correctness."
+  };
+}
+function buildLimitations(checks) {
+  const limitations = [STANDING_LIMITATION];
+  for (const check of checks) {
+    if (check.status === "not-performed") {
+      limitations.push(`${check.name} did not complete: ${check.reason ?? "unknown error"}`);
+    }
+    if (check.coverage?.behaviorStatus === "not-evaluated") {
+      limitations.push("coverage does not evaluate whether declared verification actually ran.");
+    }
+    if (check.coverage?.changedPathScope === "unavailable") {
+      limitations.push("coverage could not observe Git worktree changes.");
+    }
+  }
+  return [...new Set(limitations)];
+}
+function buildConclusion(root, checks) {
+  const absoluteRoot = resolve5(root);
+  const mapped = mapDomain(checks);
+  const checked = checks.filter((check) => check.status === "completed").map((check) => check.name);
+  const limitations = buildLimitations(checks);
+  const issues = checks.flatMap((check) => check.issues);
+  return {
+    schemaVersion: 1,
+    kind: "skill-family.professional-conclusion",
+    provider: {
+      id: GRAPH_PROVIDER_ID,
+      version: providerVersion(),
+      entry: GRAPH_PROVIDER_ENTRY
+    },
+    subject: {
+      ref: pathToFileURL(absoluteRoot).href
+    },
+    scope: {
+      checked: mapped.completion === "not-performed" ? [] : checked,
+      limitations
+    },
+    outcome: {
+      completion: mapped.completion,
+      code: mapped.code,
+      summary: mapped.summary
+    },
+    details: {
+      checks: checks.map((check) => ({
+        name: check.name,
+        status: check.status,
+        issueCount: check.issues.length,
+        ...check.reason ? { reason: check.reason } : {},
+        ...check.coverage ? { coverage: check.coverage } : {}
+      })),
+      issues
+    }
+  };
+}
+async function assertConclusionShape(conclusion) {
+  const contracts = await loadContracts();
+  const registration = contracts.findSchemaByObject(PROFESSIONAL_CONCLUSION_OBJECT);
+  if (registration === null) {
+    throw new Error("skill-family-contracts 0.22.0 does not register professional-conclusion");
+  }
+  const verdict = contracts.validateDocument(conclusion, {
+    schemaId: registration.$id,
+    dialect: registration.dialect,
+    policy: "strict"
+  });
+  if (!verdict.valid) {
+    throw new Error(`constructed professional conclusion failed public schema validation (${verdict.errorCode ?? "invalid"})`);
+  }
+}
+async function publishConclusion(absoluteOutput, conclusion) {
+  if (!isAbsolute4(absoluteOutput)) {
+    return "--conclusion-output must be an absolute path";
+  }
+  const outputRoot = dirname5(absoluteOutput);
+  const relPath = basename3(absoluteOutput);
+  if (relPath.length === 0 || relPath === "." || relPath === "..") {
+    return "--conclusion-output must name a file";
+  }
+  try {
+    const harness = await loadHarness();
+    await harness.publishFileExclusive(outputRoot, relPath, `${JSON.stringify(conclusion, null, 2)}
+`);
+    return void 0;
+  } catch (error) {
+    const kind = harnessKind(error);
+    if (kind === "exclusive-publish-conflict") {
+      return `exclusive publication target already exists: ${absoluteOutput}`;
+    }
+    return errorMessage(error);
+  }
+}
+async function runCheckProfessional(options) {
+  const root = resolve5(options.root);
+  const configGap = await missingRequiredConfig(root);
+  const checks = configGap === void 0 ? await Promise.all([
+    settleCheck(CHECK_VALIDATE, () => runValidate(root)),
+    settleCheck(CHECK_LOCK, () => runLockAudit(root)),
+    settleCheck(CHECK_COVERAGE, () => runCoverage(root))
+  ]) : [
+    { name: CHECK_VALIDATE, status: "not-performed", issues: [], reason: configGap },
+    { name: CHECK_LOCK, status: "not-performed", issues: [], reason: configGap },
+    { name: CHECK_COVERAGE, status: "not-performed", issues: [], reason: configGap }
+  ];
+  const conclusion = buildConclusion(root, checks);
+  await assertConclusionShape(conclusion);
+  if (options.conclusionOutput === void 0) {
+    return { conclusion };
+  }
+  if (!isAbsolute4(options.conclusionOutput)) {
+    return { conclusion, writeError: "--conclusion-output must be an absolute path" };
+  }
+  const writeError = await publishConclusion(resolve5(options.conclusionOutput), conclusion);
+  return { conclusion, ...writeError ? { writeError } : {} };
+}
+function asRecord(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value;
+}
+function readProvider(value) {
+  const record = asRecord(value);
+  if (record === null) {
+    return null;
+  }
+  const provider = {};
+  if (typeof record.id === "string") provider.id = record.id;
+  if (typeof record.version === "string") provider.version = record.version;
+  if (typeof record.entry === "string") provider.entry = record.entry;
+  return Object.keys(provider).length > 0 ? provider : null;
+}
+function interpretConclusion(conclusion) {
+  const provider = conclusion.provider;
+  if (provider.id !== GRAPH_PROVIDER_ID) {
+    return {
+      status: "unavailable",
+      reason: `proof provider ${provider.id} is not ${GRAPH_PROVIDER_ID}`,
+      provider,
+      conclusion
+    };
+  }
+  if (!KNOWN_DOMAIN_CODES.has(conclusion.outcome.code)) {
+    return {
+      status: "unavailable",
+      reason: `unknown same-version domain code: ${conclusion.outcome.code}`,
+      provider,
+      conclusion
+    };
+  }
+  if (conclusion.outcome.code === GRAPH_DOMAIN_CODES.CLEAR && conclusion.outcome.completion === "complete") {
+    return {
+      status: "pass",
+      reason: "GRAPH_CLEAR with complete scope is acceptable for this provider version.",
+      provider,
+      conclusion
+    };
+  }
+  return {
+    status: "not_pass",
+    reason: `proof records ${conclusion.outcome.code} (${conclusion.outcome.completion}); complete does not mean pass.`,
+    provider,
+    conclusion
+  };
+}
+async function runReadProof(options) {
+  const unavailable = (reason, provider = null, conclusion = null) => ({
+    result: { status: "unavailable", reason, provider, conclusion },
+    exitCode: 2
+  });
+  let receipt;
+  try {
+    const harness = await loadHarness();
+    receipt = await harness.readFileStrict(options.proofRoot, options.proof, { encoding: "utf8" });
+  } catch (error) {
+    const kind = harnessKind(error);
+    if (kind === "missing-resource") {
+      return unavailable(`proof file does not exist: ${options.proof}`, null, null);
+    }
+    return unavailable(errorMessage(error), null, null);
+  }
+  const raw = typeof receipt.content === "string" ? receipt.content : receipt.content.toString("utf8");
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    return unavailable(`proof is not valid JSON: ${errorMessage(error)}`, null, null);
+  }
+  const previewProvider = readProvider(asRecord(parsed)?.provider);
+  let contracts;
+  try {
+    contracts = await loadContracts();
+  } catch (error) {
+    return unavailable(`cannot load skill-family-contracts: ${errorMessage(error)}`, previewProvider, null);
+  }
+  const registration = contracts.findSchemaByObject(PROFESSIONAL_CONCLUSION_OBJECT);
+  if (registration === null) {
+    return unavailable("professional-conclusion schema is not registered", previewProvider, null);
+  }
+  const verdict = contracts.validateDocument(parsed, {
+    schemaId: registration.$id,
+    dialect: registration.dialect,
+    policy: "strict"
+  });
+  if (!verdict.valid) {
+    return unavailable(
+      `proof failed professional-conclusion schema validation (${verdict.errorCode ?? "invalid"})`,
+      previewProvider,
+      null
+    );
+  }
+  const interpreted = interpretConclusion(parsed);
+  const exitCode = interpreted.status === "pass" ? 0 : interpreted.status === "not_pass" ? 1 : 2;
+  return { result: interpreted, exitCode };
+}
+var GRAPH_PROVIDER_ID, GRAPH_PROVIDER_ENTRY, PROFESSIONAL_CONCLUSION_OBJECT, GRAPH_DOMAIN_CODES, KNOWN_DOMAIN_CODES, CHECK_VALIDATE, CHECK_LOCK, CHECK_COVERAGE, STANDING_LIMITATION, CONTRACTS_PACKAGE_NAME;
+var init_professional_conclusion = __esm({
+  "src/professional-conclusion.ts"() {
+    "use strict";
+    init_coverage();
+    init_index();
+    init_versioned_traceability();
+    GRAPH_PROVIDER_ID = "artifact-graph";
+    GRAPH_PROVIDER_ENTRY = "check-professional";
+    PROFESSIONAL_CONCLUSION_OBJECT = "professional-conclusion";
+    GRAPH_DOMAIN_CODES = Object.freeze({
+      CLEAR: "GRAPH_CLEAR",
+      FINDINGS: "GRAPH_FINDINGS",
+      INCOMPLETE: "GRAPH_CHECK_INCOMPLETE",
+      UNAVAILABLE: "GRAPH_CHECK_UNAVAILABLE"
+    });
+    KNOWN_DOMAIN_CODES = new Set(Object.values(GRAPH_DOMAIN_CODES));
+    CHECK_VALIDATE = "validate";
+    CHECK_LOCK = "version-lock-audit";
+    CHECK_COVERAGE = "coverage";
+    STANDING_LIMITATION = "Graph checks do not prove content semantics, method execution, or publication facts.";
+    CONTRACTS_PACKAGE_NAME = "skill-family-contracts";
+  }
+});
+
 // src/review-result-validator.ts
 function validateReviewResult(input) {
   const errors = [];
@@ -4275,7 +4647,7 @@ __export(contract_kernel_exports, {
 });
 import { createHash as createHash2 } from "crypto";
 import { readFile as readFile2, readdir as readdir2 } from "fs/promises";
-import { join as join7 } from "path";
+import { join as join8 } from "path";
 import _AjvModule from "ajv";
 function isOfficialNamespace(namespace) {
   return OFFICIAL_NAMESPACE_PATTERN.test(namespace);
@@ -4688,7 +5060,7 @@ async function loadContractsFromDirectory(contractsDir, options) {
   const entries = await readdir2(contractsDir, { withFileTypes: true });
   for (const entry of entries) {
     if (entry.isDirectory()) {
-      const schemaPath = join7(contractsDir, entry.name, "schema.json");
+      const schemaPath = join8(contractsDir, entry.name, "schema.json");
       const contract = await loadContract(schemaPath, options);
       contracts.push(contract);
     }
@@ -5280,12 +5652,12 @@ var init_restructure_software = __esm({
 // src/restructure-file-set.ts
 import { createHash as createHash3 } from "crypto";
 import { chmod, lstat as lstat2, mkdir as mkdir4, realpath, statfs } from "fs/promises";
-import { join as join8, resolve as resolve5 } from "path";
+import { join as join9, resolve as resolve6 } from "path";
 async function loadFoundationModule() {
   return await import(FOUNDATION_PACKAGE_NAME);
 }
 async function loadContractsModule() {
-  return await import(CONTRACTS_PACKAGE_NAME);
+  return await import(CONTRACTS_PACKAGE_NAME2);
 }
 async function verifyMechanismResult(result) {
   if (typeof result !== "object" || result === null || Array.isArray(result)) {
@@ -5338,7 +5710,7 @@ function rawDigest(value, path) {
 async function resolveRealRoot(root) {
   let canonical;
   try {
-    canonical = await realpath(resolve5(root));
+    canonical = await realpath(resolve6(root));
   } catch (cause) {
     return failure("ROOT_INVALID", `Project root cannot be resolved: ${cause.message}`);
   }
@@ -5377,7 +5749,7 @@ async function qualifyRestructureMechanism(root) {
   return { ok: true, data: { root: canonical.data, filesystem: RESTRUCTURE_QUALIFIED_FILESYSTEM } };
 }
 async function ensureRestructureMechanismRoot(canonicalRoot, options) {
-  const target = join8(canonicalRoot, RESTRUCTURE_RECOVERY_REL_PATH);
+  const target = join9(canonicalRoot, RESTRUCTURE_RECOVERY_REL_PATH);
   const current = async () => lstat2(target).catch((cause) => cause.code === "ENOENT" ? null : Promise.reject(cause));
   let info = await current();
   if (info === null) {
@@ -5491,7 +5863,7 @@ async function applyRestructureFileSet(canonicalRoot, plan, options) {
   return await verifyMechanismResult(raw);
 }
 async function observeRestructureJournal(canonicalRoot) {
-  const journalRoot = join8(canonicalRoot, RESTRUCTURE_RECOVERY_REL_PATH, "journal");
+  const journalRoot = join9(canonicalRoot, RESTRUCTURE_RECOVERY_REL_PATH, "journal");
   const module = await loadFoundationModule();
   try {
     return { ok: true, data: await module.inspectStateStoreLock(journalRoot, { recoveryObservation: true }) };
@@ -5678,7 +6050,7 @@ function projectRestructureFileSetResult(result, planPath = "", planDigest = "")
   const reading = result.operation === "apply" ? applyProjection(result) : result.operation === "recover" ? recoverProjection(result) : pruneProjection(result);
   return { ...base, ...reading };
 }
-var RESTRUCTURE_RECOVERY_REL_PATH, RESTRUCTURE_RECOVERY_JOURNAL_REL_PATH, RESTRUCTURE_RECOVERY_ROOT_MODE, RESTRUCTURE_QUALIFIED_PLATFORM, RESTRUCTURE_QUALIFIED_ARCH, RESTRUCTURE_QUALIFIED_FILESYSTEM, APFS_STATFS_TYPE, DIGEST_PREFIX, RAW_SHA256_PATTERN, FOUNDATION_PACKAGE_NAME, CONTRACTS_PACKAGE_NAME, FILE_SET_RESULT_OBJECT, APPLY_MAINTENANCE_ERROR_KINDS;
+var RESTRUCTURE_RECOVERY_REL_PATH, RESTRUCTURE_RECOVERY_JOURNAL_REL_PATH, RESTRUCTURE_RECOVERY_ROOT_MODE, RESTRUCTURE_QUALIFIED_PLATFORM, RESTRUCTURE_QUALIFIED_ARCH, RESTRUCTURE_QUALIFIED_FILESYSTEM, APFS_STATFS_TYPE, DIGEST_PREFIX, RAW_SHA256_PATTERN, FOUNDATION_PACKAGE_NAME, CONTRACTS_PACKAGE_NAME2, FILE_SET_RESULT_OBJECT, APPLY_MAINTENANCE_ERROR_KINDS;
 var init_restructure_file_set = __esm({
   "src/restructure-file-set.ts"() {
     "use strict";
@@ -5692,7 +6064,7 @@ var init_restructure_file_set = __esm({
     DIGEST_PREFIX = "sha256:";
     RAW_SHA256_PATTERN = /^[a-f0-9]{64}$/;
     FOUNDATION_PACKAGE_NAME = "skill-family-harness-node";
-    CONTRACTS_PACKAGE_NAME = "skill-family-contracts";
+    CONTRACTS_PACKAGE_NAME2 = "skill-family-contracts";
     FILE_SET_RESULT_OBJECT = "file-set-result";
     APPLY_MAINTENANCE_ERROR_KINDS = ["lock-release-failed"];
   }
@@ -5719,7 +6091,7 @@ __export(restructure_exports, {
 });
 import { createHash as createHash4, randomUUID as randomUUID2 } from "crypto";
 import { lstat as lstat3, readFile as readFile3, readdir as readdir3, realpath as realpath2, stat } from "fs/promises";
-import { dirname as dirname5, isAbsolute as isAbsolute4, join as join9, posix, relative as relative4, resolve as resolve6 } from "path";
+import { dirname as dirname6, isAbsolute as isAbsolute5, join as join10, posix, relative as relative4, resolve as resolve7 } from "path";
 import { fileURLToPath as fileURLToPath2 } from "url";
 function digestBytes(value) {
   return `sha256:${createHash4("sha256").update(value).digest("hex")}`;
@@ -5735,7 +6107,7 @@ function digestRestructureValue(value) {
   return digestBytes(canonicalJson(value));
 }
 function normalizeRelativePath2(value) {
-  if (!value || value.includes("\0") || isAbsolute4(value)) return void 0;
+  if (!value || value.includes("\0") || isAbsolute5(value)) return void 0;
   const normalized = value.replace(/\\/g, "/").replace(/^\.\//, "");
   if (!normalized || normalized === "." || normalized.split("/").some((part) => part === ".." || part === "")) return void 0;
   return normalized;
@@ -5749,8 +6121,8 @@ function isPathAllowed(path, allowed) {
 async function readContainedFileWithMode(root, path) {
   const normalized = normalizeRelativePath2(path);
   if (!normalized) throw new Error(`Path must be a project-relative path without traversal: ${path}`);
-  const absoluteRoot = resolve6(root);
-  const absolutePath = resolve6(absoluteRoot, normalized);
+  const absoluteRoot = resolve7(root);
+  const absolutePath = resolve7(absoluteRoot, normalized);
   if (relative4(absoluteRoot, absolutePath).startsWith("..")) throw new Error(`Path escapes project root: ${path}`);
   try {
     const info = await lstat3(absolutePath);
@@ -5783,7 +6155,7 @@ async function configSnapshot(root) {
   return snapshotFile(root, "artifact-graph.config.yaml");
 }
 async function loadRestructureContract(name) {
-  return loadContract(join9(CONTRACT_ROOT, `restructure-${name}`, "schema.json"), { expectedAuthority: "artifact" });
+  return loadContract(join10(CONTRACT_ROOT, `restructure-${name}`, "schema.json"), { expectedAuthority: "artifact" });
 }
 async function validateDomainContract(name, value) {
   const contract = await loadRestructureContract(name);
@@ -6058,7 +6430,7 @@ async function scanUnsupportedReferences(root, sourcePaths, targetPaths) {
   async function visit(directory) {
     for (const entry of await readdir3(directory, { withFileTypes: true })) {
       if (entry.isDirectory() && SKIPPED_SCAN_DIRS.has(entry.name)) continue;
-      const absolute = join9(directory, entry.name);
+      const absolute = join10(directory, entry.name);
       if (entry.isDirectory()) {
         await visit(absolute);
         continue;
@@ -6087,7 +6459,7 @@ async function scanUnsupportedReferences(root, sourcePaths, targetPaths) {
                 path,
                 lineNumber
               ));
-            } else if (!await pathExists2(resolve6(root, resolved))) {
+            } else if (!await pathExists2(resolve7(root, resolved))) {
               findings.push(finding(
                 "SIBLING_RELATIVE_REFERENCE_UNRESOLVED",
                 `The relative reference "${literal}" does not resolve inside the project although its file name matches a migration path; its intended destination must be decided explicitly`,
@@ -6112,7 +6484,7 @@ async function scanUnsupportedReferences(root, sourcePaths, targetPaths) {
       }
     }
   }
-  await visit(resolve6(root));
+  await visit(resolve7(root));
   const unique = new Map(findings.map((item) => [`${item.code}	${item.path}	${item.line}	${item.message}`, item]));
   return [...unique.values()].sort((left, right) => (left.path ?? "").localeCompare(right.path ?? "") || (left.line ?? 0) - (right.line ?? 0) || left.code.localeCompare(right.code));
 }
@@ -6130,7 +6502,7 @@ async function scanConsumerCandidates(root, references, excludedPaths = /* @__PU
   async function visit(directory) {
     for (const entry of await readdir3(directory, { withFileTypes: true })) {
       if (entry.isDirectory() && SKIPPED_SCAN_DIRS.has(entry.name)) continue;
-      const absolute = join9(directory, entry.name);
+      const absolute = join10(directory, entry.name);
       if (entry.isDirectory()) {
         await visit(absolute);
       } else if (entry.isFile() && TEXT_EXTENSIONS.test(entry.name)) {
@@ -6145,7 +6517,7 @@ async function scanConsumerCandidates(root, references, excludedPaths = /* @__PU
       }
     }
   }
-  await visit(resolve6(root));
+  await visit(resolve7(root));
   return results.sort((left, right) => left.path.localeCompare(right.path) || left.line - right.line || left.reference.localeCompare(right.reference));
 }
 function expectedRelationTargets(mapping) {
@@ -6185,7 +6557,7 @@ function restructureBoundaryFindings(operations, limits) {
   const expectedCreateMode = createModeForUmask(limits.umask);
   const applyModeContract = limits.mode_contract === "apply";
   for (const operation of operations) {
-    const parent = dirname5(operation.path) || ".";
+    const parent = dirname6(operation.path) || ".";
     if (!operation.parent_exists) {
       findings.push(finding("PARENT_DIRECTORY_MISSING", `Parent directory does not exist or is not a directory: ${parent}`, operation.path));
     } else if (operation.parent_device !== null && operation.parent_device !== operation.root_device) {
@@ -6376,7 +6748,7 @@ async function planRestructure(root, input) {
     }
     pathMoves.push(move);
     rangesByPath.set(sourcePath, pathMoves);
-    if (dirname5(sourcePath) !== dirname5(targetPath)) {
+    if (dirname6(sourcePath) !== dirname6(targetPath)) {
       for (const link of findRelativeLinks(fragment.toString("utf8"))) {
         const explicitlyEdited = mapping.prose_edits.some((edit) => edit.target_path === targetPath && edit.old_text.includes(link));
         if (!explicitlyEdited) blockers.push(finding("RELATIVE_LINK_REQUIRES_MAPPING", `Relative reference "${link}" changes base directory when moved to ${targetPath}`, sourcePath));
@@ -6493,15 +6865,15 @@ async function planRestructure(root, input) {
       diff: readableDiff(path, original?.toString("utf8"), deleteFile ? void 0 : candidate.toString("utf8"))
     });
   }
-  const rootDirectory = await probeDirectory(resolve6(root));
+  const rootDirectory = await probeDirectory(resolve7(root));
   const parentProbes = /* @__PURE__ */ new Map();
   for (const candidate of candidates) {
-    const parent = dirname5(candidate.path);
-    if (!parentProbes.has(parent)) parentProbes.set(parent, await probeDirectory(resolve6(root, parent)));
+    const parent = dirname6(candidate.path);
+    if (!parentProbes.has(parent)) parentProbes.set(parent, await probeDirectory(resolve7(root, parent)));
   }
   blockers.push(...restructureBoundaryFindings(
     candidates.map((candidate) => {
-      const parent = parentProbes.get(dirname5(candidate.path));
+      const parent = parentProbes.get(dirname6(candidate.path));
       return {
         path: candidate.path,
         action: candidate.action,
@@ -6627,7 +6999,7 @@ function refusal(code, message, findings = []) {
   return { ok: false, error: { code, message, ...findings.length === 0 ? {} : { details: findings } } };
 }
 async function loadRestructurePlanDocument(operation, canonicalRoot, planPath) {
-  const absolute = resolve6(planPath);
+  const absolute = resolve7(planPath);
   let info;
   try {
     info = await lstat3(absolute);
@@ -6671,18 +7043,18 @@ function planRootIdentityFindings(document) {
     findings.push(finding("ROOT_IDENTITY_MISMATCH", `The plan does not record this project's configuration file: ${document.plan.config_snapshot.path}`));
   }
   const relativePlan = relative4(document.root, document.realPath);
-  if (!relativePlan || relativePlan.startsWith("..") || isAbsolute4(relativePlan)) {
+  if (!relativePlan || relativePlan.startsWith("..") || isAbsolute5(relativePlan)) {
     findings.push(finding("ROOT_IDENTITY_MISMATCH", `The plan document is outside the project root: ${document.realPath}`, document.realPath));
   }
   return findings;
 }
 async function operationBoundaries(root, plan) {
-  const rootDirectory = await probeDirectory(resolve6(root));
+  const rootDirectory = await probeDirectory(resolve7(root));
   const parents = /* @__PURE__ */ new Map();
   const boundaries = [];
   for (const candidate of plan.candidates) {
-    const parent = dirname5(candidate.path) || ".";
-    if (!parents.has(parent)) parents.set(parent, await probeDirectory(resolve6(root, parent)));
+    const parent = dirname6(candidate.path) || ".";
+    if (!parents.has(parent)) parents.set(parent, await probeDirectory(resolve7(root, parent)));
     const probe = parents.get(parent);
     boundaries.push({
       path: candidate.path,
@@ -6861,8 +7233,8 @@ var init_restructure = __esm({
     RESTRUCTURE_MAX_TOTAL_BYTES = 256 * 1024 * 1024;
     MAX_POSIX_MODE = 511;
     CREATE_MODE_BASE = 438;
-    MODULE_DIRECTORY = typeof __dirname === "string" ? __dirname : dirname5(fileURLToPath2(import.meta.url));
-    CONTRACT_ROOT = join9(MODULE_DIRECTORY, "..", "contracts");
+    MODULE_DIRECTORY = typeof __dirname === "string" ? __dirname : dirname6(fileURLToPath2(import.meta.url));
+    CONTRACT_ROOT = join10(MODULE_DIRECTORY, "..", "contracts");
     SKIPPED_SCAN_DIRS = /* @__PURE__ */ new Set([".git", "node_modules", "dist", "coverage", ".tmp", ".codex", ".worktrees", ".foundation-file-apply", ".artifact-graph"]);
     TEXT_EXTENSIONS = /\.(?:md|markdown|json|ya?ml|[cm]?[jt]sx?)$/i;
     MARKDOWN_LINK_PATTERN = /!?\[([^\]\n]*)\]\(([^)\n]+)\)/g;
@@ -6877,7 +7249,7 @@ import matter from "gray-matter";
 import yaml from "js-yaml";
 import { accessSync, constants as fsConstants, existsSync as existsSync3, statSync } from "fs";
 import { mkdir as mkdir5, readFile as readFile4, writeFile as writeFile3 } from "fs/promises";
-import { basename as basename4, dirname as dirname6, extname, isAbsolute as isAbsolute5, join as join10, resolve as resolve7 } from "path";
+import { basename as basename5, dirname as dirname7, extname, isAbsolute as isAbsolute6, join as join11, resolve as resolve8 } from "path";
 function isTargetArtifactType(type) {
   return isPacketTargetType(type);
 }
@@ -6919,7 +7291,7 @@ function resolveArtifactTypeName(schema, token) {
   return void 0;
 }
 async function loadConfig(root) {
-  const configPath = join10(root, "artifact-graph.config.yaml");
+  const configPath = join11(root, "artifact-graph.config.yaml");
   let parsed = {};
   try {
     const raw = await readFile4(configPath, "utf-8");
@@ -6963,7 +7335,30 @@ async function loadConfig(root) {
     idRanges: mergeRecord(DEFAULT_SCHEMA.idRanges, parsed.idRanges),
     e2e: mergedE2e
   };
+  validateJsonArtifactTypes(merged.types);
   return merged;
+}
+function validateJsonArtifactTypes(types) {
+  for (const [type, definition] of Object.entries(types)) {
+    const raw = definition;
+    const format = raw.format;
+    const idField = raw.idField;
+    if (format === void 0) {
+      if (idField !== void 0) {
+        throw new Error(`Invalid types.${type}.idField: idField requires format json.`);
+      }
+      continue;
+    }
+    if (format !== "json") {
+      throw new Error(`Invalid types.${type}.format: only json is supported. Omit format to keep Markdown parsing.`);
+    }
+    if (SPECIALIZED_PARSER_TYPES.has(type)) {
+      throw new Error(`Invalid types.${type}.format: JSON format applies only to custom types. ${type} keeps its dedicated parser.`);
+    }
+    if (typeof idField !== "string" || idField.length === 0 || idField.trim() !== idField) {
+      throw new Error(`Invalid types.${type}.idField: format json requires the name of one root property.`);
+    }
+  }
 }
 function validateRelationSemanticsConfig(value) {
   if (value === void 0) return;
@@ -7048,7 +7443,7 @@ function validateE2eConfig(e2e) {
       if (typeof runner.root !== "string" || !runner.root.trim()) {
         throw new Error(`Invalid e2e.runners[${runner.name}].root: must be a non-empty string.`);
       }
-      if (isAbsolute5(runner.root)) {
+      if (isAbsolute6(runner.root)) {
         throw new Error(`Invalid e2e.runners[${runner.name}].root: "${runner.root}" must not be an absolute path.`);
       }
       if (runner.root.replace(/\\/g, "/").split("/").includes("..")) {
@@ -7137,15 +7532,15 @@ async function scanArtifacts(root, schema, options = {}) {
         continue;
       }
       scannedFiles.set(file, type);
-      const raw = contentOverrides.has(file) ? contentOverrides.get(file) : await readFile4(join10(root, file), "utf-8");
+      const raw = contentOverrides.has(file) ? contentOverrides.get(file) : await readFile4(join11(root, file), "utf-8");
       const parsed = parseFile(type, file, raw, config);
-      const semantic = parseConfiguredRelations(type, file, raw, parsed.nodes, config);
+      const semantic = isJsonOriginalType(type, config) ? { edges: [], diagnostics: [] } : parseConfiguredRelations(type, file, raw, parsed.nodes, config);
       nodes.push(...parsed.nodes);
       edges.push(...parsed.edges, ...semantic.edges);
       scanDiagnostics.push(...parsed.diagnostics, ...semantic.diagnostics);
     }
   }
-  const absoluteRoot = isAbsolute5(root) ? root : resolve7(root);
+  const absoluteRoot = isAbsolute6(root) ? root : resolve8(root);
   const graph = buildGraph(nodes, edges, scanDiagnostics, absoluteRoot);
   return resolveMatrixEdges(graph);
 }
@@ -7350,33 +7745,6 @@ function validateGraph(graph, schema = DEFAULT_SCHEMA) {
     issues.push(issue("CYCLE_DETECTED", `depends_on cycle detected: ${cycle.join(" -> ")}`, "", 1, { node: cycle[0] }));
   }
   const defaultTypeKeys = new Set(Object.keys(DEFAULT_SCHEMA.types));
-  const specializedParserTypes = /* @__PURE__ */ new Set([
-    "feature",
-    "scenario",
-    "entity",
-    "decision",
-    "test",
-    "design",
-    "e2e_test",
-    "e2e_registry",
-    "rule-golden-cases",
-    "test-strategy",
-    "traceability-matrix-v2",
-    "traceability-version-lock",
-    "interface_contracts",
-    "data_contracts",
-    "application_state_machines",
-    "error_model",
-    "domain-glossary",
-    "bounded-context-map",
-    "domain-invariants",
-    "generation-packet-spec",
-    "report-contracts",
-    "verification-fixtures",
-    "ui-flow-contracts",
-    "non-functional-budgets",
-    "implementation-blueprint"
-  ]);
   const uidsWithEdges = /* @__PURE__ */ new Set();
   for (const edge2 of graph.edges) {
     uidsWithEdges.add(edge2.from);
@@ -7384,7 +7752,7 @@ function validateGraph(graph, schema = DEFAULT_SCHEMA) {
   }
   for (const node of graph.nodes) {
     if (defaultTypeKeys.has(node.type)) continue;
-    if (specializedParserTypes.has(node.type)) continue;
+    if (SPECIALIZED_PARSER_TYPES.has(node.type)) continue;
     if (!schema.types[node.type]) continue;
     if (!uidsWithEdges.has(node.uid)) {
       issues.push(issue(
@@ -7508,7 +7876,7 @@ async function validateScenarioPrdLinkIndex(root, graph) {
   const indexPath = "artifacts/prd/feature-index.md";
   let raw = "";
   try {
-    raw = await readFile4(join10(root, indexPath), "utf-8");
+    raw = await readFile4(join11(root, indexPath), "utf-8");
   } catch (error) {
     if (error.code === "ENOENT") {
       return [];
@@ -7756,12 +8124,12 @@ function nextId(graph, schema, type, rangeName) {
   throw new Error(`ID range ${type}.${rangeName} is exhausted`);
 }
 async function writeGraphCache(root, graph) {
-  const cacheDir = join10(root, ".artifact-graph");
+  const cacheDir = join11(root, ".artifact-graph");
   await mkdir5(cacheDir, { recursive: true });
-  await writeFile3(join10(cacheDir, "index.json"), `${JSON.stringify(graph, null, 2)}
+  await writeFile3(join11(cacheDir, "index.json"), `${JSON.stringify(graph, null, 2)}
 `);
   const { default: Database } = await import("better-sqlite3");
-  const db = new Database(join10(cacheDir, "graph.sqlite"));
+  const db = new Database(join11(cacheDir, "graph.sqlite"));
   try {
     db.exec(`
       DROP TABLE IF EXISTS nodes;
@@ -7802,7 +8170,13 @@ async function writeGraphCache(root, graph) {
     db.close();
   }
 }
+function isJsonOriginalType(type, schema) {
+  return schema.types[type]?.format === "json" && !SPECIALIZED_PARSER_TYPES.has(type);
+}
 function parseFile(type, path, raw, schema = DEFAULT_SCHEMA) {
+  if (isJsonOriginalType(type, schema)) {
+    return parseGenericJson(type, path, raw, schema);
+  }
   if (type === "feature") {
     return { ...parseFeature(path, raw), diagnostics: [] };
   }
@@ -7870,6 +8244,184 @@ function parseFile(type, path, raw, schema = DEFAULT_SCHEMA) {
     return { ...parseImplementationBlueprint(path, raw), diagnostics: [] };
   }
   return parseGenericMarkdown(type, path, raw, schema);
+}
+function isJsonObject(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function jsonRootKind(value) {
+  if (Array.isArray(value)) return "array";
+  if (value === null) return "null";
+  return typeof value;
+}
+function parseGenericJson(type, path, raw, schema) {
+  const diagnostics = [];
+  const idField = schema.types[type]?.idField;
+  if (typeof idField !== "string" || idField.length === 0 || idField.trim() !== idField) {
+    diagnostics.push(issue(
+      "INVALID_JSON",
+      `types.${type}.idField must name one root property when format is json`,
+      path,
+      1
+    ));
+    return { nodes: [], edges: [], diagnostics };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    diagnostics.push(issue(
+      "INVALID_JSON",
+      `JSON artifact ${path} is not valid JSON: ${error.message}`,
+      path,
+      1
+    ));
+    return { nodes: [], edges: [], diagnostics };
+  }
+  if (!isJsonObject(parsed)) {
+    diagnostics.push(issue(
+      "INVALID_JSON_ROOT",
+      `JSON artifact ${path} must be one root object, got ${jsonRootKind(parsed)}`,
+      path,
+      1
+    ));
+    return { nodes: [], edges: [], diagnostics };
+  }
+  if (!Object.prototype.hasOwnProperty.call(parsed, idField)) {
+    diagnostics.push(issue(
+      "ARTIFACT_ID_MISSING",
+      `Artifact of type ${type} at ${path} has no root property ${idField}`,
+      path,
+      1,
+      { severity: "warning" }
+    ));
+    return { nodes: [], edges: [], diagnostics };
+  }
+  const idValue = parsed[idField];
+  if (typeof idValue !== "string") {
+    diagnostics.push(issue(
+      "INVALID_ID",
+      `Artifact of type ${type} at ${path} field ${idField} must be a non-empty string`,
+      path,
+      1
+    ));
+    return { nodes: [], edges: [], diagnostics };
+  }
+  if (idValue.trim() === "") {
+    diagnostics.push(issue(
+      "ARTIFACT_ID_MISSING",
+      `Artifact of type ${type} at ${path} field ${idField} must be a non-empty string`,
+      path,
+      1,
+      { severity: "warning" }
+    ));
+    return { nodes: [], edges: [], diagnostics };
+  }
+  const code = idValue;
+  const idPattern = schema.idPatterns[type];
+  if (idPattern && !new RegExp(idPattern).test(code)) {
+    diagnostics.push(issue(
+      "INVALID_ID",
+      `Artifact ${type}:${code} field ${idField} does not match ${idPattern}`,
+      path,
+      1,
+      { node: toUid(type, code) }
+    ));
+  }
+  const node = {
+    type,
+    code,
+    title: code,
+    path,
+    line: 1
+  };
+  const relations = jsonConfiguredRelations(type, path, parsed, schema, toUid(type, code));
+  diagnostics.push(...relations.diagnostics);
+  return { nodes: [node], edges: relations.edges, diagnostics };
+}
+function readJsonRelation(record, field) {
+  const segments = field.split(".");
+  if (segments.some((segment) => segment.length === 0)) {
+    return { status: "illegal-path" };
+  }
+  let current = record;
+  for (let index = 0; index < segments.length; index += 1) {
+    const key = segments[index] ?? "";
+    if (!isJsonObject(current)) {
+      return { status: "type-error", at: segments.slice(0, index).join(".") };
+    }
+    if (!Object.prototype.hasOwnProperty.call(current, key)) {
+      return { status: "absent" };
+    }
+    const next = current[key];
+    const last = index === segments.length - 1;
+    if (!last && !isJsonObject(next)) {
+      return { status: "type-error", at: segments.slice(0, index + 1).join(".") };
+    }
+    current = next;
+  }
+  return { status: "value", value: current };
+}
+function jsonRelationTerminal(value, field, path, sourceUid, diagnostics) {
+  const message = `Relation field ${field} in ${path} must be a non-empty string or an array of non-empty strings`;
+  if (typeof value === "string") {
+    if (value.trim() === "") {
+      diagnostics.push(issue("RELATION_VALUE_TYPE", message, path, 1, { node: sourceUid }));
+      return [];
+    }
+    return [value];
+  }
+  if (Array.isArray(value)) {
+    const refs = [];
+    for (const item of value) {
+      if (typeof item !== "string" || item.trim() === "") {
+        diagnostics.push(issue(
+          "RELATION_VALUE_TYPE",
+          `Relation field ${field} in ${path} must contain only non-empty strings`,
+          path,
+          1,
+          { node: sourceUid }
+        ));
+        continue;
+      }
+      refs.push(item);
+    }
+    return refs;
+  }
+  diagnostics.push(issue("RELATION_VALUE_TYPE", message, path, 1, { node: sourceUid }));
+  return [];
+}
+function jsonConfiguredRelations(type, path, record, schema, sourceUid) {
+  const edges = [];
+  const diagnostics = [];
+  for (const [kind, spec] of Object.entries(schema.relationSemantics ?? {})) {
+    for (const field of spec.fields) {
+      const read = readJsonRelation(record, field);
+      if (read.status === "absent") continue;
+      if (read.status === "illegal-path") {
+        diagnostics.push(issue(
+          "INVALID_RELATION_FIELD",
+          `Relation field ${field} is not a fixed path of own properties`,
+          path,
+          1,
+          { node: sourceUid }
+        ));
+        continue;
+      }
+      if (read.status === "type-error") {
+        diagnostics.push(issue(
+          "RELATION_VALUE_TYPE",
+          `Relation field ${field} in ${path} cannot be read at ${read.at}: expected an object`,
+          path,
+          1,
+          { node: sourceUid }
+        ));
+        continue;
+      }
+      const values = jsonRelationTerminal(read.value, field, path, sourceUid, diagnostics);
+      appendConfiguredRelationEdges(sourceUid, kind, field, values, spec, schema, path, "json", edges, diagnostics);
+    }
+  }
+  return { edges, diagnostics };
 }
 function parseGenericMarkdown(type, path, raw, schema) {
   const diagnostics = [];
@@ -7989,38 +8541,18 @@ function parseConfiguredRelations(type, path, raw, nodes, schema) {
   const diagnostics = [];
   for (const [kind, spec] of Object.entries(schema.relationSemantics ?? {})) {
     for (const field of spec.fields) {
-      for (const value of toArray(data[field])) {
-        const parsed = parseConfiguredRelationTarget(value, spec, schema);
-        if (!parsed?.code) continue;
-        const matchingTargetTypes = parsed.targetType ? [] : relationTargetTypeMatches(parsed.code, spec.targetTypes, schema);
-        const targetType = parsed.targetType ?? inferRelationTargetType(parsed.code, spec.targetTypes, schema);
-        if (!parsed.targetType && matchingTargetTypes.length > 1) {
-          diagnostics.push(issue(
-            "AMBIGUOUS_RELATION_TARGET",
-            `${sourceUid} relation ${kind} target "${parsed.code}" matches ${matchingTargetTypes.join(", ")}; use a qualified type:id reference`,
-            path,
-            1,
-            { node: sourceUid }
-          ));
-        }
-        const targetUid = targetType ? toUid(targetType, parsed.code) : `resolve:${parsed.code}`;
-        if (targetType) {
-          const pattern = schema.idPatterns[targetType];
-          if (pattern && !new RegExp(pattern).test(parsed.code)) {
-            diagnostics.push(issue(
-              "FORMAT_ERROR",
-              `${sourceUid} has invalid ${targetType} reference "${parsed.code}" in field ${field} (expected ${pattern})`,
-              path,
-              1,
-              { node: sourceUid }
-            ));
-          }
-        }
-        edges.push({
-          ...edge(sourceUid, targetUid, kind, "frontmatter", path, 1),
-          ...parsed.sections.length > 0 ? { attrs: { sections: parsed.sections } } : {}
-        });
-      }
+      appendConfiguredRelationEdges(
+        sourceUid,
+        kind,
+        field,
+        toArray(data[field]),
+        spec,
+        schema,
+        path,
+        "frontmatter",
+        edges,
+        diagnostics
+      );
     }
   }
   const external = getExternalEntryInfo({
@@ -8038,6 +8570,40 @@ function parseConfiguredRelations(type, path, raw, nodes, schema) {
     });
   }
   return { edges, diagnostics };
+}
+function appendConfiguredRelationEdges(sourceUid, kind, field, values, spec, schema, path, edgeSource, edges, diagnostics) {
+  for (const value of values) {
+    const parsed = parseConfiguredRelationTarget(value, spec, schema);
+    if (!parsed?.code) continue;
+    const matchingTargetTypes = parsed.targetType ? [] : relationTargetTypeMatches(parsed.code, spec.targetTypes, schema);
+    const targetType = parsed.targetType ?? inferRelationTargetType(parsed.code, spec.targetTypes, schema);
+    if (!parsed.targetType && matchingTargetTypes.length > 1) {
+      diagnostics.push(issue(
+        "AMBIGUOUS_RELATION_TARGET",
+        `${sourceUid} relation ${kind} target "${parsed.code}" matches ${matchingTargetTypes.join(", ")}; use a qualified type:id reference`,
+        path,
+        1,
+        { node: sourceUid }
+      ));
+    }
+    const targetUid = targetType ? toUid(targetType, parsed.code) : `resolve:${parsed.code}`;
+    if (targetType) {
+      const pattern = schema.idPatterns[targetType];
+      if (pattern && !new RegExp(pattern).test(parsed.code)) {
+        diagnostics.push(issue(
+          "FORMAT_ERROR",
+          `${sourceUid} has invalid ${targetType} reference "${parsed.code}" in field ${field} (expected ${pattern})`,
+          path,
+          1,
+          { node: sourceUid }
+        ));
+      }
+    }
+    edges.push({
+      ...edge(sourceUid, targetUid, kind, edgeSource, path, 1),
+      ...parsed.sections.length > 0 ? { attrs: { sections: parsed.sections } } : {}
+    });
+  }
 }
 function parseConfiguredRelationTarget(value, spec, schema) {
   if (typeof value === "string" || typeof value === "number") {
@@ -8229,7 +8795,7 @@ function parseDecisions(path, raw) {
 }
 function isTestFile(filePath) {
   const normalized = filePath.replace(/\\/g, "/");
-  const name = basename4(normalized);
+  const name = basename5(normalized);
   if (/\.(test|spec)\.[^.]+$/.test(name)) return true;
   if (/(^|\/)(tests|test|__tests__)\//.test(normalized)) return true;
   if (/\w+Tests?\.java$/.test(name)) return true;
@@ -8544,10 +9110,10 @@ function parseE2eTest(path, raw) {
   const starts = extractE2eTestCaseStarts(lines);
   const nodes = [];
   const edges = [];
-  const batch = String(data.test_batch ?? basename4(path, extname(path))).trim();
+  const batch = String(data.test_batch ?? basename5(path, extname(path))).trim();
   const frontmatterScenarios = toArray(data.related_scenarios).map((value) => String(value).trim()).filter(Boolean);
   const scopeFeatures = extractCodes(String(data.scope ?? ""), "feature");
-  const frontmatterFeatures = [.../* @__PURE__ */ new Set([...Object.keys(asRecord(data.ac_coverage)), ...scopeFeatures])];
+  const frontmatterFeatures = [.../* @__PURE__ */ new Set([...Object.keys(asRecord2(data.ac_coverage)), ...scopeFeatures])];
   const frontmatterDecisions = toArray(data.related_decisions).map((value) => String(value).trim()).filter(Boolean);
   const frontmatterEntities = toArray(data.related_entities).map((value) => String(value).trim()).filter(Boolean);
   for (let index = 0; index < starts.length; index += 1) {
@@ -8607,7 +9173,7 @@ function parseE2eRegistry(path, raw) {
     data = { parseError: error.message };
   }
   return {
-    nodes: [{ type: "e2e_registry", code: basename4(path, extname(path)), title: "E2E Test Registry", path, line: 1, attrs: data }],
+    nodes: [{ type: "e2e_registry", code: basename5(path, extname(path)), title: "E2E Test Registry", path, line: 1, attrs: data }],
     edges: []
   };
 }
@@ -9415,13 +9981,13 @@ function markdownRelationOccurrences(path, scenario, block, codeLines, label, ta
   return result;
 }
 function relationOccurrences2(node, field, targetType) {
-  const relationRecord = asRecord(node.attrs?.relationOccurrences);
+  const relationRecord = asRecord2(node.attrs?.relationOccurrences);
   const rawOccurrences = toArray(relationRecord[field]);
   return rawOccurrences.flatMap((value) => {
     if (typeof value === "string") {
       return [{ field, targetType, target: value, path: node.path, line: node.line }];
     }
-    const record = asRecord(value);
+    const record = asRecord2(value);
     const target = String(record.target ?? "").trim();
     if (!target) {
       return [];
@@ -9528,7 +10094,7 @@ function validateE2eTests(graph) {
         issues.push(issue("E2E_REQUIRED_FRONTMATTER", `${node.uid} missing required frontmatter ${field}`, node.path, 1, { node: node.uid, severity: "warning" }));
       }
     }
-    const fields = asRecord(attrs.tcFields);
+    const fields = asRecord2(attrs.tcFields);
     const requiredTcFields = [
       ["\u6807\u9898", node.title],
       ["\u524D\u7F6E\u6761\u4EF6", fields["\u524D\u7F6E\u6761\u4EF6"]],
@@ -9578,7 +10144,7 @@ function validateE2eTests(graph) {
   }
   for (const [path, nodes] of nodesByPath) {
     const first = nodes[0];
-    const declared = flattenAcCoverage(asRecord(first.attrs?.ac_coverage));
+    const declared = flattenAcCoverage(asRecord2(first.attrs?.ac_coverage));
     const covered = new Set(nodes.flatMap((node) => toArray(node.attrs?.coveredFeatures).map((value) => {
       const ref = value;
       return `${String(ref.feature)}:${String(ref.ac)}`;
@@ -9622,7 +10188,7 @@ function validateE2eRegistry(graph) {
     const first = actualNodes[0];
     compareRegistryValue(issues, registry, batch, "batch_id", first.attrs?.test_batch);
     compareRegistryValue(issues, registry, batch, "scope", first.attrs?.scope);
-    compareRegistryAcCoverage(issues, registry, batch, asRecord(first.attrs?.ac_coverage));
+    compareRegistryAcCoverage(issues, registry, batch, asRecord2(first.attrs?.ac_coverage));
     compareRegistryArray(issues, registry, batch, "related_scenarios", toArray(first.attrs?.related_scenarios).map((value) => String(value)));
     compareRegistryValue(issues, registry, batch, "test_case_count", actualNodes.filter((node) => node.attrs?.fileLevelOnly !== true).length);
   }
@@ -9645,10 +10211,10 @@ async function validateExecutableTraceability(root, config) {
   const tcKeyToFields = /* @__PURE__ */ new Map();
   const mdBatches = /* @__PURE__ */ new Set();
   for (const relPath of e2eFiles) {
-    const raw = await readFile4(join10(root, relPath), "utf-8");
+    const raw = await readFile4(join11(root, relPath), "utf-8");
     const parsed = matter(raw);
     const data = parsed.data;
-    const batch = String(data.test_batch ?? basename4(relPath, extname(relPath))).trim();
+    const batch = String(data.test_batch ?? basename5(relPath, extname(relPath))).trim();
     const lines = raw.split(/\r?\n/);
     const tcStarts = extractE2eTestCaseStarts(lines);
     for (let i = 0; i < tcStarts.length; i += 1) {
@@ -9687,7 +10253,7 @@ async function validateExecutableTraceability(root, config) {
   const tcAnnotationRegex = /\/\/!?\s*@(?:e2e_test|tc)\s+(\S+?)\s+\[(\w+)\]/;
   const tcAnnotationNoLevelRegex = /\/\/!?\s*@(?:e2e_test|tc)\s+(\S+)/;
   for (const specFile of specFiles) {
-    const fullSpecPath = join10(root, specFile);
+    const fullSpecPath = join11(root, specFile);
     let content;
     try {
       content = await readFile4(fullSpecPath, "utf-8");
@@ -9769,7 +10335,7 @@ async function validateExecutableTraceability(root, config) {
       if (entry.testId) {
         let content;
         try {
-          content = await readFile4(join10(root, normalizedRefFile), "utf-8");
+          content = await readFile4(join11(root, normalizedRefFile), "utf-8");
         } catch {
           continue;
         }
@@ -9948,11 +10514,11 @@ async function computeE2eCoverageStats(graph, root, thresholds = {}) {
   const chainTypeBreakdown = {};
   const tcFieldsMap = new Map(e2eNodes.map((node) => [
     node.code,
-    asRecord(node.attrs?.tcFields)
+    asRecord2(node.attrs?.tcFields)
   ]));
   for (const node of e2eNodes) {
     const tcKey = node.code;
-    const fields = tcFieldsMap.get(tcKey) ?? asRecord(node.attrs?.tcFields);
+    const fields = tcFieldsMap.get(tcKey) ?? asRecord2(node.attrs?.tcFields);
     const execRef = String(fields["executable_ref"] ?? "").trim();
     if (execRef && !isPendingExecutableRef(execRef)) {
       withExecutableRef++;
@@ -9982,8 +10548,8 @@ async function computeE2eCoverageStats(graph, root, thresholds = {}) {
     }
   }
   for (const node of e2eNodes) {
-    const fields = tcFieldsMap.get(node.code) ?? asRecord(node.attrs?.tcFields);
-    const acCoverage = asRecord(fields["ac_coverage"] ?? node.attrs?.ac_coverage);
+    const fields = tcFieldsMap.get(node.code) ?? asRecord2(node.attrs?.tcFields);
+    const acCoverage = asRecord2(fields["ac_coverage"] ?? node.attrs?.ac_coverage);
     for (const feature of Object.keys(acCoverage)) {
       acCoveredFeatures.add(feature);
     }
@@ -9995,7 +10561,7 @@ async function computeE2eCoverageStats(graph, root, thresholds = {}) {
   const runners = (await loadConfig(root)).e2e?.runners ?? [];
   const allProjectFiles = await walkFiles(root);
   for (const node of e2eNodes) {
-    const fields = tcFieldsMap.get(node.code) ?? asRecord(node.attrs?.tcFields);
+    const fields = tcFieldsMap.get(node.code) ?? asRecord2(node.attrs?.tcFields);
     const status = String(fields["status"] ?? "").trim().toLowerCase();
     const execRef = String(fields["executable_ref"] ?? "").trim();
     if (status !== "verified") continue;
@@ -10004,7 +10570,7 @@ async function computeE2eCoverageStats(graph, root, thresholds = {}) {
     let hasActiveE2eRef = false;
     for (const entry of parseExecutableRefLines(execRef)) {
       const normalized = resolveExecutableRefFile(entry.file, allProjectFiles);
-      if (!normalized || !existsSync3(join10(root, normalized))) continue;
+      if (!normalized || !existsSync3(join11(root, normalized))) continue;
       const accepting = await getAcceptingRunners(root, normalized, runners);
       if (accepting.some((runner) => runner.kind === "e2e")) {
         hasActiveE2eRef = true;
@@ -10016,7 +10582,7 @@ async function computeE2eCoverageStats(graph, root, thresholds = {}) {
     for (const scenario of relatedScenarios) {
       verifiedScenarios.add(scenario);
     }
-    const acCoverage = asRecord(fields["ac_coverage"] ?? node.attrs?.ac_coverage);
+    const acCoverage = asRecord2(fields["ac_coverage"] ?? node.attrs?.ac_coverage);
     for (const feature of Object.keys(acCoverage)) {
       verifiedFeatures.add(feature);
     }
@@ -10063,13 +10629,13 @@ async function computeE2eCoverageStats(graph, root, thresholds = {}) {
   const acCoverageRateByFeature = {};
   const featureAcMap = /* @__PURE__ */ new Map();
   for (const node of featureNodes) {
-    const acs = parseAcceptanceCriteria(await readFile4(join10(root, node.path), "utf-8"));
+    const acs = parseAcceptanceCriteria(await readFile4(join11(root, node.path), "utf-8"));
     featureAcMap.set(node.code, new Set(acs));
   }
   const coveredAcByFeature = /* @__PURE__ */ new Map();
   for (const node of e2eNodes) {
-    const fields = tcFieldsMap.get(node.code) ?? asRecord(node.attrs?.tcFields);
-    const acCoverage = asRecord(fields["ac_coverage"] ?? node.attrs?.ac_coverage);
+    const fields = tcFieldsMap.get(node.code) ?? asRecord2(node.attrs?.tcFields);
+    const acCoverage = asRecord2(fields["ac_coverage"] ?? node.attrs?.ac_coverage);
     for (const [feature, acs] of Object.entries(acCoverage)) {
       const existing = coveredAcByFeature.get(feature) ?? /* @__PURE__ */ new Set();
       for (const ac of toArray(acs)) {
@@ -10111,11 +10677,11 @@ async function generateE2eRegistry(root, opts) {
   const batchIds = /* @__PURE__ */ new Set();
   let totalTestCases = 0;
   for (const file of files) {
-    const filePath = join10(root, file);
+    const filePath = join11(root, file);
     const raw = await readFile4(filePath, "utf-8");
     const parsed = matter(raw);
     const data = parsed.data;
-    const batch = String(data.test_batch ?? basename4(file, extname(file))).trim();
+    const batch = String(data.test_batch ?? basename5(file, extname(file))).trim();
     const relPath = file;
     const scope = String(data.scope ?? "").trim();
     const acCoverage = normalizeAcCoverageForRegistry(data.ac_coverage);
@@ -10237,7 +10803,7 @@ async function validatePartialRustEvidence(tcFields, tcKey, root, allFiles) {
     if (!normalizedPath) {
       return { hasValidPartialRust: false, detail: `partial_rust file not found: ${ref.file}` };
     }
-    const fullPath = join10(root, normalizedPath);
+    const fullPath = join11(root, normalizedPath);
     let content;
     try {
       content = await readFile4(fullPath, "utf-8");
@@ -10274,7 +10840,7 @@ function detectTestLevel(specFile, content) {
 }
 function resolveExecutableRefFile(refFile, allFiles) {
   const normalized = refFile.replace(/\\/g, "/").replace(/^\.\//, "");
-  if (!normalized || isAbsolute5(refFile) || normalized.split("/").includes("..")) {
+  if (!normalized || isAbsolute6(refFile) || normalized.split("/").includes("..")) {
     return void 0;
   }
   if (allFiles.includes(normalized)) {
@@ -10449,7 +11015,7 @@ function flattenAcCoverage(value) {
   return Object.entries(value).flatMap(([feature, refs]) => toArray(refs).map((ac) => ({ feature, ac: String(ac).replace(/^AC[-\s]?(\d+)$/i, (_match, digits) => `AC${Number(digits)}`) })));
 }
 function needsDesktopChainWarning(node) {
-  const tcFields = asRecord(node.attrs?.tcFields);
+  const tcFields = asRecord2(node.attrs?.tcFields);
   const chainType = String(tcFields["chain_type"] ?? "").trim().toLowerCase();
   if (chainType && VALID_CHAIN_TYPES.has(chainType) && chainType !== "desktop_chain" || chainType in DEPRECATED_CHAIN_TYPE_ALIASES) {
     return false;
@@ -10506,7 +11072,7 @@ function compareRegistryAcCoverage(issues, registry, batch, actual) {
     issues.push(issue("E2E_REGISTRY_MISMATCH", `registry batch ${String(batch.batch_id ?? "")} ac_coverage cannot be determined`, registry.path, registry.line, { node: registry.uid, severity: "warning" }));
     return;
   }
-  if (normalizeAcCoverage(asRecord(batch.ac_coverage)) !== normalizeAcCoverage(actual)) {
+  if (normalizeAcCoverage(asRecord2(batch.ac_coverage)) !== normalizeAcCoverage(actual)) {
     issues.push(issue("E2E_REGISTRY_MISMATCH", `registry batch ${String(batch.batch_id ?? "")} ac_coverage does not match actual file`, registry.path, registry.line, { node: registry.uid, severity: "warning" }));
   }
 }
@@ -10521,7 +11087,7 @@ function groupBy(values, key) {
   }
   return result;
 }
-function asRecord(value) {
+function asRecord2(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value : {};
 }
 function isEmptyValue(value) {
@@ -10580,7 +11146,7 @@ function normalizeDesignCode(value) {
   if (!raw) {
     return "";
   }
-  return basename4(raw, extname(raw));
+  return basename5(raw, extname(raw));
 }
 function toUid(type, code) {
   return `${type}:${code}`;
@@ -10856,7 +11422,7 @@ function resolveArtifactContext(graph, opts) {
     }
     if (root) {
       for (const ap of ALWAYS_PRESENT_ITEMS) {
-        const fullPath = join10(root, ap.path);
+        const fullPath = join11(root, ap.path);
         let stat3;
         try {
           stat3 = statSync(fullPath);
@@ -11098,7 +11664,7 @@ function formatContextMarkdown(manifest) {
   }
   return lines.join("\n");
 }
-var TARGET_ARTIFACT_TYPES, NON_TARGET_ROLES, DEFAULT_SCHEMA, EMPTY_RELATION_FIELD_VALUES, VALID_TC_STATUSES, VALID_CHAIN_TYPES, DEPRECATED_CHAIN_TYPE_ALIASES, CONTEXT_CATEGORIES, TIER_ORDER;
+var TARGET_ARTIFACT_TYPES, NON_TARGET_ROLES, DEFAULT_SCHEMA, SPECIALIZED_PARSER_TYPES, EMPTY_RELATION_FIELD_VALUES, VALID_TC_STATUSES, VALID_CHAIN_TYPES, DEPRECATED_CHAIN_TYPE_ALIASES, CONTEXT_CATEGORIES, TIER_ORDER;
 var init_index = __esm({
   "src/index.ts"() {
     "use strict";
@@ -11120,6 +11686,7 @@ var init_index = __esm({
     init_git_changes();
     init_git_hook_path();
     init_hook_installer();
+    init_professional_conclusion();
     init_review_result_validator();
     init_contract_kernel();
     init_restructure();
@@ -11172,6 +11739,33 @@ var init_index = __esm({
         runners: []
       }
     };
+    SPECIALIZED_PARSER_TYPES = /* @__PURE__ */ new Set([
+      "feature",
+      "scenario",
+      "entity",
+      "decision",
+      "test",
+      "design",
+      "e2e_test",
+      "e2e_registry",
+      "rule-golden-cases",
+      "test-strategy",
+      "traceability-matrix-v2",
+      "traceability-version-lock",
+      "interface_contracts",
+      "data_contracts",
+      "application_state_machines",
+      "error_model",
+      "domain-glossary",
+      "bounded-context-map",
+      "domain-invariants",
+      "generation-packet-spec",
+      "report-contracts",
+      "verification-fixtures",
+      "ui-flow-contracts",
+      "non-functional-budgets",
+      "implementation-blueprint"
+    ]);
     EMPTY_RELATION_FIELD_VALUES = /* @__PURE__ */ new Set(["\u65E0", "none", "n/a", "-"]);
     VALID_TC_STATUSES = /* @__PURE__ */ new Set(["created", "automated", "verified", "waived"]);
     VALID_CHAIN_TYPES = /* @__PURE__ */ new Set([
@@ -11216,7 +11810,7 @@ var init_index = __esm({
 
 // src/packet-prompt-audit.ts
 import { mkdir as mkdir6, writeFile as writeFile4 } from "fs/promises";
-import { join as join11 } from "path";
+import { join as join12 } from "path";
 function promptFilename(target) {
   return `prompt-${target.type}-${target.id}.md`;
 }
@@ -11268,7 +11862,7 @@ async function auditSinglePromptTarget(target, graph, options) {
     }
     if (options.outDir) {
       const filename = promptFilename(target);
-      const outPath = join11(options.outDir, filename);
+      const outPath = join12(options.outDir, filename);
       await writeFile4(outPath, prompt, "utf-8");
       entry.outputPath = outPath;
     }
@@ -11374,9 +11968,9 @@ async function auditPromptBatch(root, targets, options, graph) {
   };
   if (options.outDir) {
     await mkdir6(options.outDir, { recursive: true });
-    const jsonPath = join11(options.outDir, "prompt-audit-summary.json");
+    const jsonPath = join12(options.outDir, "prompt-audit-summary.json");
     await writeFile4(jsonPath, JSON.stringify(summary, null, 2) + "\n", "utf-8");
-    const mdPath = join11(options.outDir, "prompt-audit-summary.md");
+    const mdPath = join12(options.outDir, "prompt-audit-summary.md");
     await writeFile4(mdPath, renderPromptAuditSummaryMarkdown(summary), "utf-8");
   }
   return summary;
@@ -11418,7 +12012,7 @@ __export(refactor_id_exports, {
 });
 import { chmod as chmod2, readFile as readFile5, rename as rename2, rm, readdir as readdir4, stat as stat2, writeFile as writeFile5 } from "fs/promises";
 import { randomBytes } from "crypto";
-import { basename as basename5, dirname as dirname7, join as join12, relative as relative5 } from "path";
+import { basename as basename6, dirname as dirname8, join as join13, relative as relative5 } from "path";
 import yaml2 from "js-yaml";
 function escapeRegExp2(value) {
   return value.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&");
@@ -11596,7 +12190,7 @@ async function walkTextFiles(root) {
     for (const entry of entries) {
       if (entry.name.startsWith(".") && PROSE_SCAN_SKIP_DIRS.has(entry.name)) continue;
       if (PROSE_SCAN_SKIP_DIRS.has(entry.name)) continue;
-      const full = join12(dir, entry.name);
+      const full = join13(dir, entry.name);
       if (entry.isDirectory()) {
         await visit(full);
       } else if (entry.isFile()) {
@@ -11611,7 +12205,7 @@ async function walkTextFiles(root) {
   return found.sort();
 }
 async function computeLockImpact(root, type, oldId) {
-  const lockPath = join12(root, VERSION_LOCK_PATH);
+  const lockPath = join13(root, VERSION_LOCK_PATH);
   const impact = {
     lockPath: VERSION_LOCK_PATH,
     affectedImplementationLocks: [],
@@ -11703,7 +12297,7 @@ async function refactorId(options) {
   const fileContents = /* @__PURE__ */ new Map();
   const readArtifactFile = async (path) => {
     if (!fileContents.has(path)) {
-      fileContents.set(path, await readFile5(join12(root, path), "utf-8"));
+      fileContents.set(path, await readFile5(join13(root, path), "utf-8"));
     }
     return fileContents.get(path);
   };
@@ -11779,7 +12373,7 @@ async function refactorId(options) {
   for (const relativePath of await walkTextFiles(root)) {
     if (relativePath === VERSION_LOCK_PATH) continue;
     if (relativePath === "artifact-graph.config.yaml") continue;
-    const raw = await readFile5(join12(root, relativePath), "utf-8");
+    const raw = await readFile5(join13(root, relativePath), "utf-8");
     if (!containsIdToken(raw, oldId)) continue;
     const lines = raw.split(/\r?\n/);
     lines.forEach((line, index) => {
@@ -11855,7 +12449,7 @@ async function refactorId(options) {
   }
   if (options.__beforeWriteVerify) await options.__beforeWriteVerify();
   for (const path of targetFiles) {
-    const disk = await readFile5(join12(root, path), "utf-8");
+    const disk = await readFile5(join13(root, path), "utf-8");
     if (disk !== fileContents.get(path)) {
       return fail("PLAN_DRIFT", `\u8BA1\u5212\u4E0E\u5199\u5165\u4E4B\u95F4\u76EE\u6807\u6587\u4EF6\u53D1\u751F\u53D8\u5316\uFF08apply \u4E2D\u6B62\uFF0C\u96F6\u5199\u5165\uFF09\uFF1A${path}`, { path });
     }
@@ -11866,7 +12460,7 @@ async function refactorId(options) {
   const tempPathFor = options.__tempPathFor ?? ((targetPath) => {
     tempSequence += 1;
     const suffix = randomBytes(4).toString("hex");
-    return join12(dirname7(targetPath), `.${basename5(targetPath)}.${process.pid}.${tempSequence}.${suffix}.refactor-id.tmp`);
+    return join13(dirname8(targetPath), `.${basename6(targetPath)}.${process.pid}.${tempSequence}.${suffix}.refactor-id.tmp`);
   });
   let stage = "write";
   try {
@@ -11875,8 +12469,8 @@ async function refactorId(options) {
       if (options.__injectWriteFailure?.(path)) {
         throw Object.assign(new Error(`injected write failure: ${path}`), { code: "EINJECTED" });
       }
-      const original = fileContents.has(path) ? fileContents.get(path) : await readFile5(join12(root, path), "utf-8");
-      const targetPath = join12(root, path);
+      const original = fileContents.has(path) ? fileContents.get(path) : await readFile5(join13(root, path), "utf-8");
+      const targetPath = join13(root, path);
       const originalMode = (await stat2(targetPath)).mode & 4095;
       const tempPath = tempPathFor(targetPath);
       await writeFile5(tempPath, newContents.get(path), { encoding: "utf-8", flag: "wx" });
@@ -11899,8 +12493,8 @@ async function refactorId(options) {
         if (options.__injectRollbackFailure?.(entry.path)) {
           throw Object.assign(new Error(`injected rollback failure: ${entry.path}`), { code: "EROLLBACKINJECTED" });
         }
-        await writeFile5(join12(root, entry.path), entry.original, "utf-8");
-        await chmod2(join12(root, entry.path), entry.originalMode);
+        await writeFile5(join13(root, entry.path), entry.original, "utf-8");
+        await chmod2(join13(root, entry.path), entry.originalMode);
       } catch (rollbackError) {
         rollbackErrors.push({ path: entry.path, message: rollbackError.message });
       }
@@ -12033,8 +12627,8 @@ __export(cli_exports, {
 });
 import yaml3 from "js-yaml";
 import { realpathSync as realpathSync2 } from "fs";
-import { access as access2, mkdir as mkdir7, readFile as readFile6, writeFile as writeFile6 } from "fs/promises";
-import { dirname as dirname8, isAbsolute as isAbsolute6, join as join13 } from "path";
+import { access as access3, mkdir as mkdir7, readFile as readFile6, writeFile as writeFile6 } from "fs/promises";
+import { dirname as dirname9, isAbsolute as isAbsolute7, join as join14 } from "path";
 import { fileURLToPath as fileURLToPath3 } from "url";
 async function runCli(argv, io = {}) {
   const parsed = parseArgs(argv);
@@ -12062,7 +12656,7 @@ async function runCli(argv, io = {}) {
     switch (parsed.command) {
       case "init": {
         await initConfig(root);
-        out(`Created ${join13(root, "artifact-graph.config.yaml")}
+        out(`Created ${join14(root, "artifact-graph.config.yaml")}
 `);
         return 0;
       }
@@ -12074,6 +12668,53 @@ async function runCli(argv, io = {}) {
         out(`Scanned ${graph.nodes.length} artifacts and ${graph.edges.length} relations
 `);
         return 0;
+      }
+      case "check-professional": {
+        const format = typeof parsed.flags.format === "string" ? parsed.flags.format : "json";
+        if (format !== "json") {
+          err(`Invalid --format: "${String(parsed.flags.format)}". Allowed values: json
+`);
+          return 2;
+        }
+        const conclusionOutput = parsed.flags["conclusion-output"];
+        if (conclusionOutput === true || conclusionOutput !== void 0 && typeof conclusionOutput !== "string") {
+          err("Usage: artifact-graph check-professional --root <target> --format json [--conclusion-output <absolute-path>]\n");
+          return 1;
+        }
+        if (typeof conclusionOutput === "string" && !isAbsolute7(conclusionOutput)) {
+          err("--conclusion-output must be an absolute path\n");
+          return 1;
+        }
+        const { conclusion, writeError } = await runCheckProfessional({
+          root,
+          conclusionOutput: typeof conclusionOutput === "string" ? conclusionOutput : void 0
+        });
+        out(`${JSON.stringify(conclusion, null, 2)}
+`);
+        if (writeError) {
+          err(`${writeError}
+`);
+          return 1;
+        }
+        return 0;
+      }
+      case "read-proof": {
+        const format = typeof parsed.flags.format === "string" ? parsed.flags.format : "json";
+        if (format !== "json") {
+          err(`Invalid --format: "${String(parsed.flags.format)}". Allowed values: json
+`);
+          return 2;
+        }
+        const proofRoot = parsed.flags["proof-root"];
+        const proof = parsed.flags.proof;
+        if (typeof proofRoot !== "string" || typeof proof !== "string") {
+          err("Usage: artifact-graph read-proof --proof-root <root> --proof <relative> --format json\n");
+          return 1;
+        }
+        const { result, exitCode } = await runReadProof({ proofRoot, proof });
+        out(`${JSON.stringify(result, null, 2)}
+`);
+        return exitCode;
       }
       case "validate": {
         const includes = new Set(
@@ -13081,7 +13722,7 @@ async function runCli(argv, io = {}) {
           err("Usage: artifact-graph validate-review-result --file <path> [--format json]\n");
           return 1;
         }
-        const resolvedPath = isAbsolute6(filePath) ? filePath : join13(root, filePath);
+        const resolvedPath = isAbsolute7(filePath) ? filePath : join14(root, filePath);
         let content;
         try {
           content = await readFile6(resolvedPath, "utf-8");
@@ -13119,7 +13760,7 @@ async function runCli(argv, io = {}) {
         const deterministic = checkMode || parsed.flags.deterministic === true;
         const registry = await generateE2eRegistry(root, { deterministic });
         const output = JSON.stringify(registry, null, 2) + "\n";
-        const outPath = typeof parsed.flags.out === "string" ? parsed.flags.out : join13(root, "artifacts/tests/e2e/e2e-test-registry.json");
+        const outPath = typeof parsed.flags.out === "string" ? parsed.flags.out : join14(root, "artifacts/tests/e2e/e2e-test-registry.json");
         if (checkMode) {
           let existing = "";
           try {
@@ -13171,7 +13812,7 @@ async function runCli(argv, io = {}) {
 `);
             return 1;
           }
-          const planPath = isAbsolute6(planFlag) ? planFlag : join13(cwd, planFlag);
+          const planPath = isAbsolute7(planFlag) ? planFlag : join14(cwd, planFlag);
           let planDocument;
           try {
             planDocument = JSON.parse(await readFile6(planPath, "utf8"));
@@ -13238,7 +13879,7 @@ async function runCli(argv, io = {}) {
 `);
           return 1;
         }
-        const resolvedInput = isAbsolute6(inputPath) ? inputPath : join13(cwd, inputPath);
+        const resolvedInput = isAbsolute7(inputPath) ? inputPath : join14(cwd, inputPath);
         let input;
         try {
           input = JSON.parse(await readFile6(resolvedInput, "utf8"));
@@ -13266,8 +13907,8 @@ async function runCli(argv, io = {}) {
 `);
           return 1;
         }
-        const packageDir = dirname8(fileURLToPath3(import.meta.url));
-        const contractsDir = typeof parsed.flags["contracts-dir"] === "string" ? parsed.flags["contracts-dir"] : join13(packageDir, "..", "contracts");
+        const packageDir = dirname9(fileURLToPath3(import.meta.url));
+        const contractsDir = typeof parsed.flags["contracts-dir"] === "string" ? parsed.flags["contracts-dir"] : join14(packageDir, "..", "contracts");
         const revisionDigest = typeof parsed.flags["revision-digest"] === "string" ? parsed.flags["revision-digest"] : void 0;
         async function resolveContract(contractId) {
           const catalog = await loadContractCatalog(contractsDir);
@@ -13580,9 +14221,9 @@ function isGraphRelevantPath(path, schema) {
   return path === "artifact-graph.config.yaml" || path === VERSION_LOCK_PATH || matchesConfiguredArtifactPath(path, schema);
 }
 async function initConfig(root) {
-  const configPath = join13(root, "artifact-graph.config.yaml");
+  const configPath = join14(root, "artifact-graph.config.yaml");
   try {
-    await access2(configPath);
+    await access3(configPath);
     throw new Error(`Config already exists: ${configPath}`);
   } catch (error) {
     if (error.code !== "ENOENT") {
@@ -13634,9 +14275,9 @@ function parseTimeViewFlag(value, err) {
 }
 async function readReleaseInput(root, value) {
   if (value.includes(",")) return value.split(",");
-  const candidate = isAbsolute6(value) ? value : join13(root, value);
+  const candidate = isAbsolute7(value) ? value : join14(root, value);
   try {
-    await access2(candidate);
+    await access3(candidate);
   } catch {
     return [value];
   }
@@ -13655,6 +14296,12 @@ Commands:
   init
   scan
   validate [--format json] [--warning-only] [--include scenario-prd-links,e2e-coverage]
+  check-professional --root <target> --format json [--conclusion-output <absolute-path>]
+      Read-only composition of validate, version-lock audit, and coverage. Does not write graph cache.
+      Absent artifact-graph.config.yaml is GRAPH_CHECK_UNAVAILABLE / not-performed; default loadConfig is not used here.
+      Optional proof file is created exclusively and never overwrites an existing proof.
+  read-proof --proof-root <root> --proof <relative> --format json
+      Read one artifact-graph professional proof. Does not rescan the target or treat review-result as this contract.
   query [<target> | --from <code>] [--to <code>] [--depth <n>] [--view current|planned|history|all] [--format json]
   context (--target <type>:<id> | --feature <id> | --scenario <id> | --decision <id> | --design <id> | --e2e-test <id>) [--mode full|implementation] [--max-per-category <n>] [--view current|planned|history|all] [--format json]
   packet (--target <type>:<id> | --feature <id> | --scenario <id> | --decision <id> | --design <id> | --e2e-test <id>) [--mode full|implementation] [--max-per-category <n>] [--view current|planned|history|all] [--format json|markdown] [--out <path>] [--no-validate]
@@ -13742,6 +14389,7 @@ var init_cli = __esm({
     init_git_hook_path();
     init_hook_installer();
     init_versioned_traceability();
+    init_professional_conclusion();
     if (isCliEntrypoint(process.argv[1])) {
       void runCli(process.argv.slice(2)).then((code) => {
         process.exitCode = code;
