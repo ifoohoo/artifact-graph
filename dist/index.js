@@ -3386,11 +3386,10 @@ async function detectPnpmVersion() {
     return void 0;
   }
 }
-function bindingInstallBase(cli, root) {
+function bindingInstallBase(cli, _root) {
   if (!cli.path || !cli.source) return void 0;
   switch (cli.source) {
     case "node_modules":
-      return join5(root, "package.json");
     case "plugin-bundled":
     case "path":
     case "legacy":
@@ -3399,11 +3398,10 @@ function bindingInstallBase(cli, root) {
       return void 0;
   }
 }
-function bindingInstallRoot(cli, root) {
+function bindingInstallRoot(cli, _root) {
   if (!cli.path || !cli.source) return void 0;
   switch (cli.source) {
     case "node_modules":
-      return root;
     case "plugin-bundled":
     case "path":
     case "legacy":

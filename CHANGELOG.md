@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.14.1
+
+### Fixed
+
+- `doctor` resolves `better-sqlite3` from the installation that owns the selected `node_modules` CLI. A `.bin` shim or symlink is followed to the real package entry, and the nested dependency is loaded from that install. A pnpm consumer that installs only `artifact-graph` and allows the native build is reported from that install as a passing probe, `MISSING`, or `BUILD_DISABLED`.
+- PATH, legacy, and plugin-bundled sources keep their existing anchors. `scan` and `query` still classify the running install with the same cause enum.
+
+### Changed
+
+- Version lockstep with `artifact-chain-assistant` 0.14.1.
+
 ## 0.14.0
 
 ### Added
