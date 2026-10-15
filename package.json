@@ -1,6 +1,6 @@
 {
   "name": "artifact-graph",
-  "version": "0.14.1",
+  "version": "0.15.0",
   "description": "Git-native Markdown artifact graph scanner and validator",
   "license": "Apache-2.0",
   "type": "module",
@@ -30,6 +30,8 @@
       }
     },
     "./schemas/review-result.schema.json": "./schemas/review-result.schema.json",
+    "./schemas/project-artifact-profiles.schema.json": "./schemas/project-artifact-profiles.schema.json",
+    "./project-artifact-profiles": "./profiles/project-artifact-profiles.json",
     "./contracts/e2e-test/schema.json": "./contracts/e2e-test/schema.json"
   },
   "engines": {
@@ -77,6 +79,7 @@
     ".github",
     "dist",
     "schemas",
+    "profiles",
     "contracts",
     "scripts",
     "templates"

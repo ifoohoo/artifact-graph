@@ -78,6 +78,20 @@ Python 的 `#` 注释目前不受支持。
 见 [代码追溯接入说明](INSTALL.md#code-traceability-and-coverage-boundaries)。先确认索引中确有预期节点和关系，
 再运行 `refresh --all` 建立锁；不存在 `version-lock update --all` 操作。
 
+### 公开清单与采用边界
+
+包提供静态 JSON 清单，公开子路径是 `artifact-graph/project-artifact-profiles`，配套 Schema 是 `artifact-graph/schemas/project-artifact-profiles.schema.json`。字段 `schema_version` 的值是 `1.0`。该入口从 0.15.0 版本开始提供。
+
+```js
+const profiles = require('artifact-graph/project-artifact-profiles');
+```
+
+`common_minimum` 恰好三项：`feature`、`scenario`、`design`。`project_standards` 目前只有 `skill-plugin`：它 `extends` `common_minimum`，再加 `agent_skill`、`e2e_test`。
+
+`lifecycle` 与 `conditional` 是采用阶段和能力条件。阶段项和能力项只是候选。读到这份 JSON 不会启用项目类型。
+
+目标项目的 `artifact-graph.config.yaml` 拥有采用权。配置或既有方法绑定里已经声明的类型都要保留，包括清单里没有的追加类型。
+
 ### 自定义类型的 JSON 原文件
 
 内置类型继续使用各自的专用解析。`format: json` 只写在项目自己注册的自定义类型上，同一项还要给出 `idField`。省略 `format` 时，文件仍按 Markdown 解析，扫描路径写成 `*.json` 也不改变这一规则。类型声明 `format: json` 之后，才按 JSON 读取。

@@ -926,17 +926,22 @@ async function bootstrapVersionLock(root, options = {}) {
       source: sourceRefFromNode(source)
     });
   }
-  const artifactRelationEntries = [];
+  const artifactRelationEntries = /* @__PURE__ */ new Map();
   for (const edge2 of artifactRelationEdges(index)) {
     const source = nodeByUid.get(edge2.from);
     const target = nodeByUid.get(edge2.to);
     if (!source || !target) continue;
-    artifactRelationEntries.push(artifactRelationLockFromEdge(edge2, source, target));
+    const relationLock = artifactRelationLockFromEdge(edge2, source, target);
+    const identity = artifactRelationLockSortKey(relationLock);
+    if (artifactRelationEntries.has(identity)) {
+      continue;
+    }
+    artifactRelationEntries.set(identity, relationLock);
   }
   const next = {
     schemaVersion: VERSION_LOCK_SCHEMA_VERSION,
     locks: sortBy([...entries.values()], (item) => item.edgeId),
-    artifactRelations: sortBy(artifactRelationEntries, artifactRelationLockSortKey)
+    artifactRelations: sortBy([...artifactRelationEntries.values()], artifactRelationLockSortKey)
   };
   await writeVersionLock(root, lockPath, next);
   return next;

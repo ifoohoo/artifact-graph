@@ -1,0 +1,109 @@
+{
+  "schema_version": "1.0",
+  "common_minimum": [
+    "feature",
+    "scenario",
+    "design"
+  ],
+  "project_standards": {
+    "skill-plugin": {
+      "extends": "common_minimum",
+      "additional_types": [
+        "agent_skill",
+        "e2e_test"
+      ]
+    }
+  },
+  "lifecycle": [
+    {
+      "type": "requirement",
+      "adoption_stages": [
+        "initial",
+        "daily-iteration"
+      ],
+      "condition": "项目正在收集尚待处理的诉求时采用；读取清单不会启用该类型。"
+    },
+    {
+      "type": "spec",
+      "adoption_stages": [
+        "daily-iteration"
+      ],
+      "condition": "需要冻结本轮跨仓或复杂实施的范围与验收时采用；读取清单不会启用该类型。"
+    },
+    {
+      "type": "decision",
+      "adoption_stages": [
+        "initial",
+        "legacy-backfill",
+        "daily-iteration"
+      ],
+      "condition": "需要追溯方案取舍时采用；读取清单不会启用该类型。"
+    }
+  ],
+  "conditional": [
+    {
+      "type": "cli_contract",
+      "project_shapes": [
+        "cli-library"
+      ],
+      "condition": "项目有公开 CLI 或独立命令接口时采用；形态本身不证明已有该能力。"
+    },
+    {
+      "type": "api_contract",
+      "project_shapes": [
+        "web",
+        "desktop"
+      ],
+      "condition": "项目有公开 API 或独立服务接口时采用；形态本身不证明已有该能力。"
+    },
+    {
+      "type": "ui_contract",
+      "project_shapes": [
+        "web",
+        "desktop"
+      ],
+      "condition": "项目有独立界面流程或 UI 合同时采用；形态本身不证明已有该能力。"
+    },
+    {
+      "type": "ipc_contract",
+      "project_shapes": [
+        "desktop"
+      ],
+      "condition": "项目有独立进程间通道或前后端桥接合同时采用；形态本身不证明已有该能力。"
+    },
+    {
+      "type": "data_contract",
+      "project_shapes": [
+        "cli-library",
+        "web",
+        "desktop",
+        "skill-plugin"
+      ],
+      "condition": "项目有独立数据交换或数据模型合同时采用；读取清单不会启用该类型。"
+    },
+    {
+      "type": "hook_policy",
+      "project_shapes": [
+        "skill-plugin"
+      ],
+      "condition": "项目有钩子、门禁或独立 hook 合同时采用；技能族标准不包含此项。"
+    },
+    {
+      "type": "prompt_packet",
+      "project_shapes": [
+        "skill-plugin"
+      ],
+      "condition": "项目有独立提示或上下文组装合同时采用；技能族标准不包含此项。"
+    },
+    {
+      "type": "release_policy",
+      "project_shapes": [
+        "cli-library",
+        "web",
+        "desktop",
+        "skill-plugin"
+      ],
+      "condition": "项目承担发布与分发职责时采用适用的发布治理制品；读取清单不会启用该类型。"
+    }
+  ]
+}

@@ -81,6 +81,24 @@ See [Code Traceability And Coverage Boundaries](INSTALL.md#code-traceability-and
 for syntax, scan configuration, classification, exemptions and project isolation. Inspect the
 index before `refresh --all`; there is no `version-lock update --all` operation.
 
+### Published type profiles and schema
+
+The package exports a static JSON list at the subpath `artifact-graph/project-artifact-profiles`. The companion JSON Schema is `artifact-graph/schemas/project-artifact-profiles.schema.json`. The `schema_version` field is `1.0`.
+
+This export is available from version 0.15.0.
+
+```js
+const profiles = require('artifact-graph/project-artifact-profiles');
+```
+
+`common_minimum` contains exactly three types: `feature`, `scenario`, and `design`.
+
+The only approved `project_standards` key is `skill-plugin`. It `extends` `common_minimum` and adds exactly two types: `agent_skill` and `e2e_test`.
+
+`lifecycle` and `conditional` entries describe adoption-stage and capability conditions. Stage items and capability items remain candidates. Reading the JSON does not enable project types.
+
+The target project's `artifact-graph.config.yaml` owns adoption. Types already declared in that config or in existing method bindings stay, including extra types that are not on the published lists.
+
 ### JSON originals for custom types
 
 Built-in types keep their dedicated parsers. `format: json` belongs only on a custom type registered by the project, and that type must also set `idField`. Omitting `format` keeps Markdown parsing. A `*.json` scan path does not switch parsers until the type declares `format: json`.

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.15.0
+
+### Added
+
+- The package exports a static recommendation list at `artifact-graph/project-artifact-profiles`, with companion schema `artifact-graph/schemas/project-artifact-profiles.schema.json` and `schema_version` `1.0`. Common minimum types are `feature`, `scenario`, and `design`. The `skill-plugin` standard adds `agent_skill` and `e2e_test`. Lifecycle and capability entries are conditions, not auto-enable rules. Project configuration owns adoption and keeps extra types. Consumers can `require('artifact-graph/project-artifact-profiles')`.
+
+### Fixed
+
+- `version-lock bootstrap` and `refresh` write one `artifactRelations` lock per relation identity when the scan graph keeps multiple source occurrences of the same artifact-to-artifact relation. Scan-graph source evidence is unchanged. A lock file that already contains duplicate `artifactRelations` is still rejected. This release does not auto-repair historically damaged duplicate locks.
+
 ## 0.14.1
 
 ### Fixed
