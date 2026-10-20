@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.16.1
+
+### Changed
+
+- Released in lockstep with `artifact-chain-assistant` 0.16.1 for the assistant's correction of formal SPEC-contract adoption guidance. No Graph runtime, CLI, API, or contract behavior changes are introduced relative to 0.16.0.
+
 ## 0.16.0
 
 ### Added
