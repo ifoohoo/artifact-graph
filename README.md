@@ -99,6 +99,8 @@ The only approved `project_standards` key is `skill-plugin`. It `extends` `commo
 
 The target project's `artifact-graph.config.yaml` owns adoption. Types already declared in that config or in existing method bindings stay, including extra types that are not on the published lists.
 
+`loadConfig` and `artifact-graph doctor` diagnose declared field structure and types. A `statuses` value that should be a string array is rejected with a field path. Unknown top-level keys stay compatible and produce a locatable warning; they are not rejected as a class. `allowedEdges` is required on an existing config file. `[]`, `null`, or a YAML empty value adopts the built-in `DEFAULT_SCHEMA.allowedEdges`. A non-empty list replaces that table and is a strict from/to/kind whitelist; relations outside it are `DISALLOWED_EDGE`. `forbiddenEdges` still reports `FORBIDDEN_EDGE` first. A missing config file stays unconnected and is not turned into a valid project. `extraFields` remains optional index metadata. Markdown body contracts are not validated by `contract validate` in this round.
+
 ### JSON originals for custom types
 
 Built-in types keep their dedicated parsers. `format: json` belongs only on a custom type registered by the project, and that type must also set `idField`. Omitting `format` keeps Markdown parsing. A `*.json` scan path does not switch parsers until the type declares `format: json`.
@@ -111,7 +113,7 @@ Relations stay in `relationSemantics`, using the existing `kind`, `fields`, `tar
 
 A dot only separates exact property names. `*`, filters, JSONPath, and expressions are not path syntax in this batch. Records inside an array stay in the original object. This batch reads the id and configured relations; it does not select a title or status, and it does not join, prefix, or rewrite ids. Markdown fields are still looked up as one literal string. Diagnostics use line 1 because this batch does not map JSON tokens to source lines.
 
-A project can point a method at a capability and a release record at a method. The configuration below shows those two directions.
+A project can point a method at a capability and a release record at a method. The configuration below shows those two directions. A non-empty `allowedEdges` list replaces the built-in default table, so the two project relations must be listed; `[]` does not authorize these custom-type relations.
 
 ```yaml
 types:
@@ -140,6 +142,9 @@ relationSemantics:
     label: Release record points to method
     targetTypes: [method]
     fields: [methods]
+allowedEdges:
+  - { from: method, to: capability, kind: applies }
+  - { from: skill_release, to: method, kind: releases }
 ```
 
 A method file stores one capability id under nested properties. `capability.*` looks up a property named `*` and does not collect the neighboring properties.

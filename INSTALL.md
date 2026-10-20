@@ -379,6 +379,15 @@ With `false`, `resolveArtifactContext` skips baseline injection entirely. No `ba
 appears in the context manifest, and the manifest writes `baselinePolicy: false` so that
 packet validation (`validatePacket`) correctly allows `requiredBaseline.total=0`.
 
+### Allowed edges
+
+Existing `artifact-graph.config.yaml` files must declare `allowedEdges`. Use `[]`, `null`, or a YAML empty value to adopt the built-in `DEFAULT_SCHEMA.allowedEdges`. A non-empty list replaces that table and is a strict from/to/kind whitelist. Relations outside the effective list fail `validate` with `DISALLOWED_EDGE`. `forbiddenEdges` still wins. A missing file stays unconnected; `init` writes the filled default table.
+
+```yaml
+# artifact-graph.config.yaml
+allowedEdges: []
+```
+
 ### Config validation
 
 `loadConfig` rejects non-boolean values for `context.universal_baseline`:

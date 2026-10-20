@@ -1,0 +1,44 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "artifact.spec@1",
+  "title": "Artifact Contract: SPEC Increment",
+  "description": "Declarative semantic-marker contract for SPEC Markdown. Mechanical check uses comment markers only; JSON body fields are not required and are not validated as hard slots.",
+  "version": "1.0.0",
+  "contractIdentity": {
+    "major": "artifact.spec@1",
+    "authority": "artifact",
+    "namespace": "artifact",
+    "revisionDigest": "sha256:adbb6fd0d923d49463ee461038076858be0f01e54396ea65b82d084d32439060",
+    "semanticMarkers": {
+      "changes": {
+        "jsonPointer": "/changes",
+        "markdownMarker": "changes",
+        "required": true
+      },
+      "scope": {
+        "jsonPointer": "/scope",
+        "markdownMarker": "scope",
+        "required": true
+      },
+      "acceptance": {
+        "jsonPointer": "/acceptance",
+        "markdownMarker": "acceptance",
+        "required": true
+      },
+      "acceptance_record": {
+        "jsonPointer": "/acceptance_record",
+        "markdownMarker": "acceptance-record",
+        "required": false
+      },
+      "archive_record": {
+        "jsonPointer": "/archive_record",
+        "markdownMarker": "archive-record",
+        "required": false
+      }
+    }
+  },
+  "type": "object",
+  "required": [],
+  "properties": {},
+  "additionalProperties": true
+}

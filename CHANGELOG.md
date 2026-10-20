@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+## 0.16.0
+
+### Added
+
+- `loadConfig` and `artifact-graph doctor` diagnose declared graph-config field structure and types. A `statuses` value that should be a string array is rejected with a field path. Unknown top-level keys stay compatible and produce a locatable warning; they are not rejected as a class. `allowedEdges` is required on an existing config. `[]`, `null`, or a YAML empty value adopts the filled built-in `DEFAULT_SCHEMA.allowedEdges`. A non-empty list replaces the default table and is a strict from/to/kind whitelist; relations outside it are `DISALLOWED_EDGE`. `forbiddenEdges` still reports `FORBIDDEN_EDGE` first. A missing config file stays unconnected. `extraFields` remains optional index metadata.
+- The package ships the official `artifact.spec@1` Markdown semantic-marker contract at `contracts/spec/schema.json`. `artifact-graph contract explain --contract artifact.spec@1` reports `identity`, `revisionDigest`, and `semanticMarkers`. `artifact-graph contract validate-markers` checks a complete SPEC Markdown file for the required markers `changes`, `scope`, and `acceptance`, and accepts the optional markers `acceptance-record` and `archive-record`. `contract validate` remains JSON-instance validation and does not substitute for Markdown marker checks. Unknown, undefined, empty, or optional-only marker sets are not a mechanical pass.
+
+### Breaking Changes
+
+- Existing configs that omit `allowedEdges` now fail. `loadConfig` and `doctor` report a field-path diagnostic; the config does not load until the field is declared.
+- A non-empty `allowedEdges` list is now a strict from/to/kind whitelist. Relations outside that list are `DISALLOWED_EDGE` and fail validation. Previous releases accepted those relations unless `forbiddenEdges` matched.
+- `[]`, `null`, or a YAML empty `allowedEdges` value adopts the filled built-in `DEFAULT_SCHEMA.allowedEdges`. Custom project relations are not in that table unless the project writes them after analysing its own artifacts.
+- Migration: declare `allowedEdges` explicitly. Use an empty value only when the built-in default table is the intended contract. After project analysis, write a precise non-empty from/to/kind list for custom relations. Do not copy every scanned edge into the list as a pass-through. `forbiddenEdges` still reports `FORBIDDEN_EDGE` first.
+- Standing parent release policy maps breaking API changes to a major version (for example `0.9.0` → `1.0.0`). This release keeps `0.16.0` as a one-release maintainer exception and records the incompatible behavior. The standing major-version policy is unchanged.
+
+### Changed
+
+- Version lockstep with `artifact-chain-assistant` 0.16.0.
+
 ## 0.15.0
 
 ### Added

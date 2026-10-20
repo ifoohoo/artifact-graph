@@ -1,6 +1,11 @@
+var __defProp = Object.defineProperty;
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __esm = (fn, res) => function __init() {
   return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
+};
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
 };
 
 // src/packet-constants.ts
@@ -370,6 +375,505 @@ var init_file_walker = __esm({
   }
 });
 
+// src/doctor.ts
+import yaml from "js-yaml";
+import _AjvModule from "ajv";
+import { readFile } from "fs/promises";
+import { isAbsolute, join as join2 } from "path";
+function getShapeValidator() {
+  if (!_validateConfigShape) {
+    const AjvCtor = _AjvModule;
+    const ajv = new AjvCtor({ allErrors: true, strict: false });
+    _validateConfigShape = ajv.compile(CONFIG_SHAPE_SCHEMA);
+  }
+  return _validateConfigShape;
+}
+function instancePathToField(instancePath, params) {
+  const missing = typeof params?.missingProperty === "string" ? params.missingProperty : void 0;
+  if (!instancePath || instancePath === "") {
+    return missing && missing.length > 0 ? missing : "(root)";
+  }
+  const path = instancePath.replace(/^\//, "").replace(/\//g, ".");
+  return missing && missing.length > 0 ? `${path}.${missing}` : path;
+}
+function pushError(errors, path, message) {
+  errors.push({ path, message, severity: "error" });
+}
+function warnUnknownObjectKeys(value, path, knownKeys, warnings) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return;
+  for (const key of Object.keys(value)) {
+    if (knownKeys.has(key)) continue;
+    const field = path ? `${path}.${key}` : key;
+    warnings.push({
+      path: field,
+      message: `Unknown config key ${key} at ${field}: kept for compatibility and not treated as a declared field.`,
+      severity: "warning"
+    });
+  }
+}
+function warnUnknownArrayObjectKeys(value, path, knownKeys, warnings) {
+  if (!Array.isArray(value)) return;
+  value.forEach((entry, index) => {
+    warnUnknownObjectKeys(entry, `${path}.${index}`, knownKeys, warnings);
+  });
+}
+function collectNestedUnknownKeyWarnings(document, warnings) {
+  warnUnknownObjectKeys(document, "", KNOWN_TOP_LEVEL_KEYS, warnings);
+  const types = document.types;
+  if (types && typeof types === "object" && !Array.isArray(types)) {
+    for (const [typeName, definition] of Object.entries(types)) {
+      const typePath = `types.${typeName}`;
+      warnUnknownObjectKeys(definition, typePath, TYPE_OBJECT_KEYS, warnings);
+      if (definition && typeof definition === "object" && !Array.isArray(definition)) {
+        warnUnknownArrayObjectKeys(
+          definition.extraFields,
+          `${typePath}.extraFields`,
+          EXTRA_FIELD_KEYS,
+          warnings
+        );
+      }
+    }
+  }
+  warnUnknownArrayObjectKeys(document.allowedEdges, "allowedEdges", EDGE_RULE_KEYS, warnings);
+  warnUnknownArrayObjectKeys(document.forbiddenEdges, "forbiddenEdges", EDGE_RULE_KEYS, warnings);
+  warnUnknownObjectKeys(document.context, "context", CONTEXT_KEYS, warnings);
+  const idRanges = document.idRanges;
+  if (idRanges && typeof idRanges === "object" && !Array.isArray(idRanges)) {
+    for (const [layer, ranges] of Object.entries(idRanges)) {
+      if (!ranges || typeof ranges !== "object" || Array.isArray(ranges)) continue;
+      for (const [rangeName, entry] of Object.entries(ranges)) {
+        warnUnknownObjectKeys(entry, `idRanges.${layer}.${rangeName}`, ID_RANGE_ENTRY_KEYS, warnings);
+      }
+    }
+  }
+  const relationSemantics = document.relationSemantics;
+  if (relationSemantics && typeof relationSemantics === "object" && !Array.isArray(relationSemantics)) {
+    for (const [kind, spec] of Object.entries(relationSemantics)) {
+      const specPath = `relationSemantics.${kind}`;
+      warnUnknownObjectKeys(spec, specPath, RELATION_SEMANTICS_KEYS, warnings);
+      if (spec && typeof spec === "object" && !Array.isArray(spec)) {
+        warnUnknownObjectKeys(
+          spec.partial,
+          `${specPath}.partial`,
+          RELATION_PARTIAL_KEYS,
+          warnings
+        );
+      }
+    }
+  }
+  const e2e = document.e2e;
+  if (e2e && typeof e2e === "object" && !Array.isArray(e2e)) {
+    const e2eRecord = e2e;
+    warnUnknownObjectKeys(e2eRecord, "e2e", E2E_KEYS, warnings);
+    warnUnknownArrayObjectKeys(e2eRecord.scenario_waivers, "e2e.scenario_waivers", WAIVER_KEYS, warnings);
+    warnUnknownArrayObjectKeys(e2eRecord.feature_waivers, "e2e.feature_waivers", WAIVER_KEYS, warnings);
+    warnUnknownArrayObjectKeys(e2eRecord.runners, "e2e.runners", RUNNER_KEYS, warnings);
+  }
+}
+function typeHasDefaultPaths(typeName) {
+  const base = DEFAULT_SCHEMA.types[typeName];
+  return Array.isArray(base?.paths);
+}
+function collectCustomTypePathErrors(types, errors) {
+  if (types === void 0) return;
+  if (typeof types !== "object" || types === null || Array.isArray(types)) return;
+  for (const [typeName, definition] of Object.entries(types)) {
+    if (definition === void 0 || definition === null) {
+      if (!typeHasDefaultPaths(typeName)) {
+        pushError(errors, `types.${typeName}.paths`, `Invalid types.${typeName}.paths: must be array`);
+      }
+      continue;
+    }
+    if (typeof definition !== "object" || Array.isArray(definition)) continue;
+    const paths = definition.paths;
+    if (paths === void 0 && !typeHasDefaultPaths(typeName)) {
+      pushError(errors, `types.${typeName}.paths`, `Invalid types.${typeName}.paths: must be array`);
+    }
+  }
+}
+function collectRelationSemanticsErrors(value, errors) {
+  if (value === void 0) return;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    pushError(errors, "relationSemantics", "Invalid relationSemantics: must be an object keyed by relation kind.");
+    return;
+  }
+  for (const [kind, spec] of Object.entries(value)) {
+    const path = `relationSemantics.${kind}`;
+    if (!kind.trim() || typeof spec !== "object" || spec === null || Array.isArray(spec)) {
+      pushError(errors, path, `Invalid relationSemantics.${kind}: must be an object.`);
+      continue;
+    }
+    const record = spec;
+    if (typeof record.label !== "string" || !record.label.trim()) {
+      pushError(errors, `${path}.label`, `Invalid relationSemantics.${kind}.label: must be a non-empty string.`);
+    }
+    if (!Array.isArray(record.targetTypes) || record.targetTypes.some((item) => typeof item !== "string" || !item.trim())) {
+      pushError(errors, `${path}.targetTypes`, `Invalid relationSemantics.${kind}.targetTypes: must be an array of non-empty strings.`);
+    }
+    if (!Array.isArray(record.fields) || record.fields.length === 0 || record.fields.some((item) => typeof item !== "string" || !item.trim())) {
+      pushError(errors, `${path}.fields`, `Invalid relationSemantics.${kind}.fields: must be a non-empty array of strings.`);
+    }
+    if (record.partial !== void 0 && (typeof record.partial !== "object" || record.partial === null || Array.isArray(record.partial) || typeof record.partial.sectionField !== "string" || !record.partial.sectionField.trim())) {
+      pushError(
+        errors,
+        `${path}.partial.sectionField`,
+        `Invalid relationSemantics.${kind}.partial.sectionField: must be a non-empty string.`
+      );
+    }
+  }
+}
+function collectStatusViewsErrors(value, errors) {
+  if (value === void 0) return;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    pushError(errors, "statusViews", "Invalid statusViews: must be an object keyed by status.");
+    return;
+  }
+  for (const [status, bucket] of Object.entries(value)) {
+    if (!status.trim() || !["current", "planned", "history"].includes(bucket)) {
+      pushError(errors, `statusViews.${status}`, `Invalid statusViews.${status}: expected current, planned, or history.`);
+    }
+  }
+}
+function collectWaiverErrors(waivers, field, errors) {
+  if (waivers === void 0) return;
+  if (!Array.isArray(waivers)) {
+    pushError(errors, field, `Invalid ${field}: must be an array of {id, reason} objects.`);
+    return;
+  }
+  waivers.forEach((entry, index) => {
+    const path = `${field}.${index}`;
+    if (typeof entry !== "object" || entry === null || !("id" in entry) || !("reason" in entry)) {
+      pushError(errors, path, `Invalid ${field} entry: ${JSON.stringify(entry)}. Must be {id, reason} object.`);
+      return;
+    }
+    const record = entry;
+    if (typeof record.id !== "string" || !record.id.trim()) {
+      pushError(errors, `${path}.id`, `Invalid ${field} entry: id must be a non-empty string. Got: ${JSON.stringify(record.id)}`);
+    }
+    if (typeof record.reason !== "string" || !record.reason.trim()) {
+      pushError(errors, `${path}.reason`, `Invalid ${field} entry: reason must be a non-empty string. Got: ${JSON.stringify(record.reason)}`);
+    }
+  });
+}
+function collectE2eConfigErrors(e2e, errors) {
+  if (e2e === void 0) return;
+  if (typeof e2e !== "object" || e2e === null || Array.isArray(e2e)) {
+    pushError(errors, "e2e", "Invalid e2e: must be an object.");
+    return;
+  }
+  const record = e2e;
+  for (const field of ["report_uncovered_scenarios", "report_uncovered_features"]) {
+    if (record[field] !== void 0 && typeof record[field] !== "boolean") {
+      pushError(errors, `e2e.${field}`, `Invalid e2e.${field}: must be boolean.`);
+    }
+  }
+  if (record.executable_ref_warning !== void 0) {
+    if (typeof record.executable_ref_warning !== "number" || record.executable_ref_warning < 0 || record.executable_ref_warning > 1) {
+      pushError(
+        errors,
+        "e2e.executable_ref_warning",
+        `Invalid e2e.executable_ref_warning: ${JSON.stringify(record.executable_ref_warning)}. Must be a number between 0 and 1.`
+      );
+    }
+  }
+  if (record.executable_ref_error !== void 0) {
+    if (typeof record.executable_ref_error !== "number" || record.executable_ref_error < 0 || record.executable_ref_error > 1) {
+      pushError(
+        errors,
+        "e2e.executable_ref_error",
+        `Invalid e2e.executable_ref_error: ${JSON.stringify(record.executable_ref_error)}. Must be a number between 0 and 1.`
+      );
+    }
+  }
+  collectWaiverErrors(record.scenario_waivers, "e2e.scenario_waivers", errors);
+  collectWaiverErrors(record.feature_waivers, "e2e.feature_waivers", errors);
+  if (record.runners === void 0) return;
+  if (!Array.isArray(record.runners)) {
+    pushError(errors, "e2e.runners", "Invalid e2e.runners: must be an array.");
+    return;
+  }
+  record.runners.forEach((runner, index) => {
+    const runnerPath = `e2e.runners.${index}`;
+    if (typeof runner !== "object" || runner === null) {
+      pushError(errors, runnerPath, "Invalid e2e.runners entry: must be an object.");
+      return;
+    }
+    const runnerRecord = runner;
+    const name = runnerRecord.name;
+    if (typeof name !== "string" || !name.trim()) {
+      pushError(errors, `${runnerPath}.name`, "Invalid e2e.runners entry: name must be a non-empty string.");
+      return;
+    }
+    if (typeof runnerRecord.root !== "string" || !runnerRecord.root.trim()) {
+      pushError(errors, `${runnerPath}.root`, `Invalid e2e.runners[${name}].root: must be a non-empty string.`);
+    } else {
+      if (isAbsolute(runnerRecord.root)) {
+        pushError(errors, `${runnerPath}.root`, `Invalid e2e.runners[${name}].root: "${runnerRecord.root}" must not be an absolute path.`);
+      }
+      if (runnerRecord.root.replace(/\\/g, "/").split("/").includes("..")) {
+        pushError(errors, `${runnerPath}.root`, `Invalid e2e.runners[${name}].root: "${runnerRecord.root}" must not contain ".." segments.`);
+      }
+    }
+    if (!Array.isArray(runnerRecord.include) || runnerRecord.include.length === 0) {
+      pushError(errors, `${runnerPath}.include`, `Invalid e2e.runners[${name}].include: must be a non-empty array of glob patterns.`);
+    } else {
+      for (const pattern of runnerRecord.include) {
+        if (typeof pattern !== "string" || !pattern.trim()) {
+          pushError(errors, `${runnerPath}.include`, `Invalid e2e.runners[${name}].include: pattern must be a non-empty string.`);
+        }
+      }
+    }
+    if (runnerRecord.exclude !== void 0) {
+      if (!Array.isArray(runnerRecord.exclude)) {
+        pushError(errors, `${runnerPath}.exclude`, `Invalid e2e.runners[${name}].exclude: must be an array.`);
+      } else {
+        for (const pattern of runnerRecord.exclude) {
+          if (typeof pattern !== "string" || !pattern.trim()) {
+            pushError(errors, `${runnerPath}.exclude`, `Invalid e2e.runners[${name}].exclude: pattern must be a non-empty string.`);
+          }
+        }
+      }
+    }
+    if (runnerRecord.testIgnore !== void 0) {
+      if (!Array.isArray(runnerRecord.testIgnore)) {
+        pushError(errors, `${runnerPath}.testIgnore`, `Invalid e2e.runners[${name}].testIgnore: must be an array.`);
+      } else {
+        for (const pattern of runnerRecord.testIgnore) {
+          if (typeof pattern !== "string" || !pattern.trim()) {
+            pushError(errors, `${runnerPath}.testIgnore`, `Invalid e2e.runners[${name}].testIgnore: pattern must be a non-empty string.`);
+          }
+        }
+      }
+    }
+    if (runnerRecord.kind !== void 0) {
+      if (!["unit", "integration", "e2e"].includes(runnerRecord.kind)) {
+        pushError(errors, `${runnerPath}.kind`, `Invalid e2e.runners[${name}].kind: "${runnerRecord.kind}". Must be unit, integration, or e2e.`);
+      }
+    }
+  });
+}
+function collectAllowedEdgesPresenceError(document, errors) {
+  if (!Object.prototype.hasOwnProperty.call(document, "allowedEdges")) {
+    pushError(errors, "allowedEdges", ALLOWED_EDGES_REQUIRED_MESSAGE);
+  }
+}
+function collectExistingLoaderErrors(document, errors) {
+  collectCustomTypePathErrors(document.types, errors);
+  collectE2eConfigErrors(document.e2e, errors);
+  collectRelationSemanticsErrors(document.relationSemantics, errors);
+  collectStatusViewsErrors(document.statusViews, errors);
+  collectAllowedEdgesPresenceError(document, errors);
+}
+function diagnoseConfigDocument(parsed) {
+  const errors = [];
+  const warnings = [];
+  if (parsed === void 0 || parsed === null) {
+    return { errors, warnings };
+  }
+  if (typeof parsed !== "object" || Array.isArray(parsed)) {
+    errors.push({
+      path: "(root)",
+      message: `Invalid artifact-graph.config.yaml: expected an object, got ${Array.isArray(parsed) ? "array" : typeof parsed}.`,
+      severity: "error"
+    });
+    return { errors, warnings };
+  }
+  const document = parsed;
+  const validate = getShapeValidator();
+  const valid = validate(document);
+  if (!valid) {
+    for (const err of validate.errors ?? []) {
+      const path = instancePathToField(err.instancePath, err.params);
+      errors.push({
+        path,
+        message: `Invalid ${path}: ${err.message ?? "validation error"}`,
+        severity: "error"
+      });
+    }
+  }
+  collectExistingLoaderErrors(document, errors);
+  collectNestedUnknownKeyWarnings(document, warnings);
+  return { errors, warnings };
+}
+async function diagnoseProjectConfig(root) {
+  const configPath = join2(root, "artifact-graph.config.yaml");
+  let raw;
+  try {
+    raw = await readFile(configPath, "utf-8");
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return { exists: false, errors: [], warnings: [] };
+    }
+    return {
+      exists: true,
+      errors: [{
+        path: "artifact-graph.config.yaml",
+        message: `Unable to read artifact-graph.config.yaml: ${error.message}`,
+        severity: "error"
+      }],
+      warnings: []
+    };
+  }
+  let document;
+  try {
+    document = yaml.load(raw) ?? {};
+  } catch (error) {
+    return {
+      exists: true,
+      errors: [{
+        path: "artifact-graph.config.yaml",
+        message: `Invalid artifact-graph.config.yaml: ${error.message}`,
+        severity: "error"
+      }],
+      warnings: []
+    };
+  }
+  const diagnosis = diagnoseConfigDocument(document);
+  return { exists: true, errors: diagnosis.errors, warnings: diagnosis.warnings };
+}
+var KNOWN_TOP_LEVEL_KEYS, TYPE_OBJECT_KEYS, EXTRA_FIELD_KEYS, EDGE_RULE_KEYS, CONTEXT_KEYS, ID_RANGE_ENTRY_KEYS, RELATION_SEMANTICS_KEYS, RELATION_PARTIAL_KEYS, E2E_KEYS, WAIVER_KEYS, RUNNER_KEYS, EDGE_RULE_SCHEMA, EXTRA_FIELD_SCHEMA, ID_RANGE_ENTRY_SCHEMA, CONFIG_SHAPE_SCHEMA, _validateConfigShape, ALLOWED_EDGES_REQUIRED_MESSAGE;
+var init_doctor = __esm({
+  "src/doctor.ts"() {
+    "use strict";
+    init_index();
+    KNOWN_TOP_LEVEL_KEYS = /* @__PURE__ */ new Set([
+      "types",
+      "idPatterns",
+      "relationFields",
+      "allowedEdges",
+      "forbiddenEdges",
+      "statuses",
+      "idRanges",
+      "relationSemantics",
+      "statusViews",
+      "context",
+      "e2e"
+    ]);
+    TYPE_OBJECT_KEYS = /* @__PURE__ */ new Set([
+      "paths",
+      "idPattern",
+      "displayName",
+      "role",
+      "layer",
+      "aliases",
+      "target",
+      "extraFields",
+      "format",
+      "idField"
+    ]);
+    EXTRA_FIELD_KEYS = /* @__PURE__ */ new Set(["name", "type", "enum"]);
+    EDGE_RULE_KEYS = /* @__PURE__ */ new Set(["from", "to", "kind"]);
+    CONTEXT_KEYS = /* @__PURE__ */ new Set(["universal_baseline"]);
+    ID_RANGE_ENTRY_KEYS = /* @__PURE__ */ new Set(["prefix", "start", "end"]);
+    RELATION_SEMANTICS_KEYS = /* @__PURE__ */ new Set(["label", "targetTypes", "fields", "partial"]);
+    RELATION_PARTIAL_KEYS = /* @__PURE__ */ new Set(["sectionField"]);
+    E2E_KEYS = /* @__PURE__ */ new Set([
+      "executable_ref_warning",
+      "executable_ref_error",
+      "report_uncovered_scenarios",
+      "report_uncovered_features",
+      "scenario_waivers",
+      "feature_waivers",
+      "runners"
+    ]);
+    WAIVER_KEYS = /* @__PURE__ */ new Set(["id", "reason"]);
+    RUNNER_KEYS = /* @__PURE__ */ new Set(["name", "kind", "root", "include", "exclude", "testIgnore"]);
+    EDGE_RULE_SCHEMA = {
+      type: "object",
+      additionalProperties: true,
+      required: ["from", "to", "kind"],
+      properties: {
+        from: { type: "string", minLength: 1 },
+        to: { type: "string", minLength: 1 },
+        kind: { type: "string", minLength: 1 }
+      }
+    };
+    EXTRA_FIELD_SCHEMA = {
+      type: "object",
+      additionalProperties: true,
+      required: ["name", "type"],
+      properties: {
+        name: { type: "string", minLength: 1 },
+        type: { type: "string", enum: ["string", "number", "boolean", "enum"] },
+        enum: {
+          type: "array",
+          items: {
+            anyOf: [
+              { type: "string" },
+              { type: "number" },
+              { type: "boolean" }
+            ]
+          }
+        }
+      }
+    };
+    ID_RANGE_ENTRY_SCHEMA = {
+      type: "object",
+      additionalProperties: true,
+      required: ["prefix", "start", "end"],
+      properties: {
+        prefix: { type: "string" },
+        start: { type: "number" },
+        end: { type: "number" }
+      }
+    };
+    CONFIG_SHAPE_SCHEMA = {
+      type: "object",
+      additionalProperties: true,
+      properties: {
+        statuses: { type: "array", items: { type: "string" } },
+        allowedEdges: {
+          anyOf: [
+            { type: "null" },
+            { type: "array", items: EDGE_RULE_SCHEMA }
+          ]
+        },
+        forbiddenEdges: { type: "array", items: EDGE_RULE_SCHEMA },
+        idPatterns: {
+          type: "object",
+          additionalProperties: { type: "string" }
+        },
+        relationFields: {
+          type: "object",
+          additionalProperties: { type: "array", items: { type: "string" } }
+        },
+        context: {
+          type: "object",
+          additionalProperties: true,
+          properties: {
+            universal_baseline: { type: "boolean" }
+          }
+        },
+        idRanges: {
+          type: "object",
+          additionalProperties: {
+            type: "object",
+            additionalProperties: ID_RANGE_ENTRY_SCHEMA
+          }
+        },
+        types: {
+          type: "object",
+          additionalProperties: {
+            type: "object",
+            additionalProperties: true,
+            properties: {
+              paths: { type: "array", items: { type: "string" } },
+              idPattern: { type: "string" },
+              displayName: { type: "string" },
+              role: { type: "string" },
+              layer: { type: "string" },
+              aliases: { type: "array", items: { type: "string" } },
+              target: { type: "boolean" },
+              extraFields: { type: "array", items: EXTRA_FIELD_SCHEMA }
+            }
+          }
+        }
+      }
+    };
+    ALLOWED_EDGES_REQUIRED_MESSAGE = "Invalid allowedEdges: field is required. Use allowedEdges: [] or allowedEdges: null to adopt the built-in DEFAULT_SCHEMA.allowedEdges, or list explicit {from, to, kind} triples as a strict whitelist that replaces the default table.";
+  }
+});
+
 // src/target-selector.ts
 function parseTargetSelector(value) {
   const separator = value.indexOf(":");
@@ -502,8 +1006,8 @@ var init_git_changes = __esm({
 // src/versioned-traceability.ts
 import { createHash } from "crypto";
 import { existsSync } from "fs";
-import { mkdir, readFile, writeFile } from "fs/promises";
-import { dirname, join as join2, relative as relative2 } from "path";
+import { mkdir, readFile as readFile2, writeFile } from "fs/promises";
+import { dirname, join as join3, relative as relative2 } from "path";
 async function buildVersionIndex(root, graph) {
   const scannedGraph = graph ?? await scanArtifacts(root);
   const hashCache = /* @__PURE__ */ new Map();
@@ -639,7 +1143,7 @@ async function auditVersionLock(root, lockPath = VERSION_LOCK_PATH, graph, confi
   for (const entry of lock.locks) {
     if (entry.kind !== "verifies") continue;
     const sourcePath = entry.source.path;
-    const fullSourcePath = join2(root, sourcePath);
+    const fullSourcePath = join3(root, sourcePath);
     if (!existsSync(fullSourcePath)) continue;
     let liveness = livenessCache.get(sourcePath);
     if (liveness === void 0) {
@@ -734,14 +1238,14 @@ async function auditVersionLock(root, lockPath = VERSION_LOCK_PATH, graph, confi
         currentArtifactHash: targetNode.contentHash
       });
     }
-    if (!existsSync(join2(root, sourceNode.path))) {
+    if (!existsSync(join3(root, sourceNode.path))) {
       entryIssues.push({
         status: "orphan_lock",
         edgeId: relEdgeId,
         message: `Artifact relation source file ${sourceNode.path} no longer exists`
       });
     }
-    if (!existsSync(join2(root, targetNode.path))) {
+    if (!existsSync(join3(root, targetNode.path))) {
       entryIssues.push({
         status: "orphan_lock",
         edgeId: relEdgeId,
@@ -1348,7 +1852,7 @@ function renderTraceVersionMarkdown(result) {
 async function readVersionLock(root, lockPath) {
   const safeLockPath = normalizeRelativePath(root, lockPath);
   try {
-    const raw = await readFile(join2(root, safeLockPath), "utf-8");
+    const raw = await readFile2(join3(root, safeLockPath), "utf-8");
     let parsed;
     try {
       parsed = JSON.parse(raw);
@@ -1507,7 +2011,7 @@ function requireSafeRelativePath(value, path) {
 }
 async function writeVersionLock(root, lockPath, lock) {
   const safeLockPath = normalizeRelativePath(root, lockPath);
-  const fullPath = join2(root, safeLockPath);
+  const fullPath = join3(root, safeLockPath);
   await mkdir(dirname(fullPath), { recursive: true });
   await writeFile(fullPath, `${JSON.stringify(lock, null, 2)}
 `);
@@ -1690,7 +2194,7 @@ async function hashRelativePath(root, path, cache) {
   const normalized = normalizeRelativePath(root, path);
   const cached = cache.get(normalized);
   if (cached) return cached;
-  const content = await readFile(join2(root, normalized));
+  const content = await readFile2(join3(root, normalized));
   const hash = `sha256:${createHash("sha256").update(content).digest("hex")}`;
   cache.set(normalized, hash);
   return hash;
@@ -1713,10 +2217,10 @@ async function getTestFileRunnerLiveness(root, filePath, config) {
     if (!/e2e/i.test(filePath) && !/\.e2e\./i.test(filePath)) {
       return "active";
     }
-    const fullSourcePath = join2(root, filePath);
+    const fullSourcePath = join3(root, filePath);
     if (!existsSync(fullSourcePath)) return "inactive";
     try {
-      const content = await readFile(fullSourcePath, "utf-8");
+      const content = await readFile2(fullSourcePath, "utf-8");
       return /\/\/!?\s*@(?:e2e_test|tc)\s+/.test(content) ? "active" : "inactive";
     } catch {
       return "inactive";
@@ -1779,7 +2283,7 @@ var init_versioned_traceability = __esm({
 });
 
 // src/impact.ts
-import { isAbsolute, normalize, relative as relative3, resolve } from "path";
+import { isAbsolute as isAbsolute2, normalize, relative as relative3, resolve } from "path";
 async function computeImpact(root, options = {}) {
   const absoluteRoot = resolve(root);
   const mode = options.mode ?? "worktree";
@@ -1853,7 +2357,7 @@ function normalizeExplicitPaths(root, paths) {
   const normalized = paths.map((input) => {
     const value = input.trim();
     if (!value) return "";
-    const absolutePath = isAbsolute(value) ? normalize(value) : resolve(root, value);
+    const absolutePath = isAbsolute2(value) ? normalize(value) : resolve(root, value);
     const projectRelative = relative3(root, absolutePath);
     const result = projectRelative.replace(/\\/g, "/").replace(/^\.\//, "");
     if (result === ".." || result.startsWith("../") || result.startsWith("/")) {
@@ -2472,7 +2976,7 @@ var init_packet_assembler = __esm({
 
 // src/packet-audit.ts
 import { mkdir as mkdir2, writeFile as writeFile2 } from "fs/promises";
-import { join as join3 } from "path";
+import { join as join4 } from "path";
 function parseTargetsFile(content, schema) {
   const validTypes = schema ? new Set(getTargetArtifactTypes(schema)) : VALID_TYPES;
   const validTypesLabel = [...validTypes].join(", ");
@@ -2563,7 +3067,7 @@ async function auditSingleTarget(target, graph, options) {
       const fmt = options.format ?? "markdown";
       const ext = fmt === "json" ? "json" : "md";
       const filename = `${target.type}-${target.id}.packet.${ext}`;
-      const outPath = join3(options.outDir, filename);
+      const outPath = join4(options.outDir, filename);
       let content;
       if (fmt === "json") {
         content = JSON.stringify(packet, null, 2) + "\n";
@@ -2643,7 +3147,7 @@ async function auditPackets(root, targets, options, graph) {
     ...isCompact ? { summaryDetail: "compact", countsByType } : {}
   };
   if (options.outDir) {
-    const summaryPath = join3(options.outDir, "summary.json");
+    const summaryPath = join4(options.outDir, "summary.json");
     await writeFile2(summaryPath, JSON.stringify(summary, null, 2) + "\n", "utf-8");
   }
   return summary;
@@ -3014,7 +3518,7 @@ var init_packet_prompt_validator = __esm({
 // src/native-binding-diagnostics.ts
 import { existsSync as existsSync2, readdirSync } from "fs";
 import { createRequire } from "module";
-import { dirname as dirname2, join as join4 } from "path";
+import { dirname as dirname2, join as join5 } from "path";
 import { fileURLToPath } from "url";
 function parsePnpmVersion(stdout) {
   const trimmed = stdout.trim();
@@ -3155,7 +3659,7 @@ function buildNativeBindingSuccessDiagnostic(probeContext) {
 function findPackageRoot(anchorFile) {
   let dir = dirname2(anchorFile);
   for (; ; ) {
-    if (existsSync2(join4(dir, "package.json"))) return dir;
+    if (existsSync2(join5(dir, "package.json"))) return dir;
     const parent = dirname2(dir);
     if (parent === dir) return void 0;
     dir = parent;
@@ -3172,9 +3676,9 @@ function abiPrebuiltHint(detail) {
   return match ? `\uFF1Bprebuilt \u76EE\u6807 NODE_MODULE_VERSION=${match[1]}` : "";
 }
 function betterSqlite3PackagePresent(root) {
-  const direct = join4(root, "node_modules", "better-sqlite3", "package.json");
+  const direct = join5(root, "node_modules", "better-sqlite3", "package.json");
   if (existsSync2(direct)) return true;
-  const pnpmDir = join4(root, "node_modules", ".pnpm");
+  const pnpmDir = join5(root, "node_modules", ".pnpm");
   let entries;
   try {
     entries = readdirSync(pnpmDir);
@@ -3183,7 +3687,7 @@ function betterSqlite3PackagePresent(root) {
   }
   return entries.some((entry) => {
     if (!entry.startsWith("better-sqlite3@")) return false;
-    return existsSync2(join4(pnpmDir, entry, "node_modules", "better-sqlite3", "package.json"));
+    return existsSync2(join5(pnpmDir, entry, "node_modules", "better-sqlite3", "package.json"));
   });
 }
 var PNPM_ALLOW_BUILDS_SNIPPET;
@@ -3198,7 +3702,7 @@ var init_native_binding_diagnostics = __esm({
 import { execFile as execFile2 } from "child_process";
 import { constants, readFileSync, realpathSync } from "fs";
 import { access } from "fs/promises";
-import { basename, dirname as dirname3, isAbsolute as isAbsolute2, join as join5, resolve as resolve3 } from "path";
+import { basename, dirname as dirname3, isAbsolute as isAbsolute3, join as join6, resolve as resolve3 } from "path";
 import { promisify as promisify2 } from "util";
 async function resolveArtifactGraphCli(root, options = {}) {
   const pathCli = await findCommandOnPath("artifact-graph");
@@ -3206,7 +3710,7 @@ async function resolveArtifactGraphCli(root, options = {}) {
   const candidates = [
     {
       source: "node_modules",
-      path: join5(root, "node_modules/.bin/artifact-graph"),
+      path: join6(root, "node_modules/.bin/artifact-graph"),
       exists: false
     },
     {
@@ -3239,8 +3743,8 @@ async function resolveArtifactGraphCli(root, options = {}) {
 }
 async function doctorArtifactChain(root, options = {}) {
   const cli = await resolveArtifactGraphCli(root, options);
-  const configPath = join5(root, "artifact-graph.config.yaml");
-  const lockPath = join5(root, VERSION_LOCK_PATH);
+  const configPath = join6(root, "artifact-graph.config.yaml");
+  const lockPath = join6(root, VERSION_LOCK_PATH);
   const supportedCommands = cli.path ? await detectSupportedCommands(cli.path) : [];
   const nodeCompatible = isNodeCompatible(process.versions.node);
   const pnpmVersion = await detectPnpmVersion();
@@ -3260,12 +3764,28 @@ async function doctorArtifactChain(root, options = {}) {
     probedFrom
   };
   const nativeBinding = probe.ok ? { ok: true, ...buildNativeBindingSuccessDiagnostic(probeContext) } : { ok: false, ...buildNativeBindingDiagnostic(probe, probeContext) };
+  const configDiagnosis = await diagnoseProjectConfig(root);
+  const configShapeMessages = [
+    ...configDiagnosis.errors.map((item) => item.message),
+    ...configDiagnosis.warnings.map((item) => item.message)
+  ];
+  const loadConfigMessages = [];
+  if (configDiagnosis.exists && configDiagnosis.errors.length === 0) {
+    try {
+      const { loadConfig: loadConfig2 } = await Promise.resolve().then(() => (init_index(), index_exports));
+      await loadConfig2(root);
+    } catch (error) {
+      loadConfigMessages.push(error.message);
+    }
+  }
   const warnings = [
     ...cli.warnings,
     ...nodeCompatible ? [] : [`Node.js ${process.versions.node} does not satisfy ${REQUIRED_NODE_VERSION}.`],
     ...probe.ok ? [] : [
       `better-sqlite3 binding probe FAILED at stage "${probe.failedStage}" (cause ${probe.cause}): ${probe.suggestion}`
-    ]
+    ],
+    ...configShapeMessages,
+    ...loadConfigMessages
   ];
   return {
     schemaVersion: "1.0",
@@ -3375,7 +3895,7 @@ async function findCommandOnPath(command) {
   }
 }
 function resolveCandidatePath(root, candidatePath) {
-  return isAbsolute2(candidatePath) ? candidatePath : resolve3(root, candidatePath);
+  return isAbsolute3(candidatePath) ? candidatePath : resolve3(root, candidatePath);
 }
 function isNodeCompatible(version) {
   const match = /^(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.-]+)?$/.exec(version);
@@ -3445,6 +3965,7 @@ var init_cli_resolver = __esm({
   "src/cli-resolver.ts"() {
     "use strict";
     init_versioned_traceability();
+    init_doctor();
     init_native_binding_diagnostics();
     execFileAsync2 = promisify2(execFile2);
     REQUIRED_NODE_VERSION = ">=22.22.2 <23";
@@ -3476,7 +3997,7 @@ var init_cli_resolver = __esm({
 
 // src/git-hook-path.ts
 import { execFile as execFile3 } from "child_process";
-import { isAbsolute as isAbsolute3, resolve as resolve4 } from "path";
+import { isAbsolute as isAbsolute4, resolve as resolve4 } from "path";
 import { promisify as promisify3 } from "util";
 async function resolveGitHookPath(root, hookName) {
   const { stdout } = await execFileAsync3("git", [
@@ -3488,7 +4009,7 @@ async function resolveGitHookPath(root, hookName) {
   ]);
   const value = stdout.trim();
   if (!value) throw new Error(`Git returned an empty hook path for ${hookName}`);
-  return isAbsolute3(value) ? resolve4(value) : resolve4(root, value);
+  return isAbsolute4(value) ? resolve4(value) : resolve4(root, value);
 }
 var execFileAsync3;
 var init_git_hook_path = __esm({
@@ -3502,7 +4023,7 @@ var init_git_hook_path = __esm({
 import { constants as constants2 } from "fs";
 import { randomUUID } from "crypto";
 import { lstat, mkdir as mkdir3, open, readlink, rename, unlink } from "fs/promises";
-import { basename as basename2, dirname as dirname4, join as join6 } from "path";
+import { basename as basename2, dirname as dirname4, join as join7 } from "path";
 function detectHookInterpreter(content) {
   if (content.trim().length === 0) {
     return "empty";
@@ -3814,7 +4335,7 @@ async function removeHookAtomically(hookPath, snapshot) {
 }
 async function writeHookAtomically(hookPath, content, snapshot, mode) {
   await mkdir3(dirname4(hookPath), { recursive: true });
-  const temporaryPath = join6(dirname4(hookPath), `.${basename2(hookPath)}.${randomUUID()}.tmp`);
+  const temporaryPath = join7(dirname4(hookPath), `.${basename2(hookPath)}.${randomUUID()}.tmp`);
   let temporaryExists = false;
   try {
     const temporary = await open(temporaryPath, "wx", mode);
@@ -3932,7 +4453,7 @@ var init_hook_installer = __esm({
 // src/professional-conclusion.ts
 import { access as access2 } from "fs/promises";
 import { createRequire as createRequire2 } from "module";
-import { basename as basename3, dirname as dirname5, isAbsolute as isAbsolute4, join as join7, resolve as resolve5 } from "path";
+import { basename as basename3, dirname as dirname5, isAbsolute as isAbsolute5, join as join8, resolve as resolve5 } from "path";
 import { pathToFileURL } from "url";
 async function loadContracts() {
   return await import(CONTRACTS_PACKAGE_NAME);
@@ -3959,7 +4480,7 @@ function harnessKind(error) {
   return typeof details?.kind === "string" ? details.kind : void 0;
 }
 async function missingRequiredConfig(root) {
-  const configPath = join7(root, "artifact-graph.config.yaml");
+  const configPath = join8(root, "artifact-graph.config.yaml");
   try {
     await access2(configPath);
     return void 0;
@@ -4132,7 +4653,7 @@ async function assertConclusionShape(conclusion) {
   }
 }
 async function publishConclusion(absoluteOutput, conclusion) {
-  if (!isAbsolute4(absoluteOutput)) {
+  if (!isAbsolute5(absoluteOutput)) {
     return "--conclusion-output must be an absolute path";
   }
   const outputRoot = dirname5(absoluteOutput);
@@ -4170,7 +4691,7 @@ async function runCheckProfessional(options) {
   if (options.conclusionOutput === void 0) {
     return { conclusion };
   }
-  if (!isAbsolute4(options.conclusionOutput)) {
+  if (!isAbsolute5(options.conclusionOutput)) {
     return { conclusion, writeError: "--conclusion-output must be an absolute path" };
   }
   const writeError = await publishConclusion(resolve5(options.conclusionOutput), conclusion);
@@ -4624,9 +5145,9 @@ var init_review_result_validator = __esm({
 
 // src/contract-kernel.ts
 import { createHash as createHash2 } from "crypto";
-import { readFile as readFile2, readdir as readdir2 } from "fs/promises";
-import { join as join8 } from "path";
-import _AjvModule from "ajv";
+import { readFile as readFile3, readdir as readdir2 } from "fs/promises";
+import { join as join9 } from "path";
+import _AjvModule2 from "ajv";
 function isOfficialNamespace(namespace) {
   return OFFICIAL_NAMESPACE_PATTERN.test(namespace);
 }
@@ -4906,7 +5427,7 @@ function validatePolicyCompatibility(policy, baseContract) {
   };
 }
 async function loadContract(contractPath, options) {
-  const rawContent = await readFile2(contractPath, "utf-8");
+  const rawContent = await readFile3(contractPath, "utf-8");
   let schema;
   try {
     schema = JSON.parse(rawContent);
@@ -4957,7 +5478,7 @@ async function loadContractsFromDirectory(contractsDir, options) {
   const entries = await readdir2(contractsDir, { withFileTypes: true });
   for (const entry of entries) {
     if (entry.isDirectory()) {
-      const schemaPath = join8(contractsDir, entry.name, "schema.json");
+      const schemaPath = join9(contractsDir, entry.name, "schema.json");
       const contract = await loadContract(schemaPath, options);
       contracts.push(contract);
     }
@@ -4967,7 +5488,7 @@ async function loadContractsFromDirectory(contractsDir, options) {
 function getValidator(schema) {
   const key = `${schema.$id || "default"}#${computeRevisionDigest(JSON.stringify(schema))}`;
   if (!_validatorCache.has(key)) {
-    const AjvCtor = _AjvModule;
+    const AjvCtor = _AjvModule2;
     const ajv = new AjvCtor({ allErrors: true, strict: false });
     _validatorCache.set(key, ajv.compile(schema));
   }
@@ -5502,7 +6023,7 @@ var init_restructure_software = __esm({
 // src/restructure-file-set.ts
 import { createHash as createHash3 } from "crypto";
 import { chmod, lstat as lstat2, mkdir as mkdir4, realpath, statfs } from "fs/promises";
-import { join as join9, resolve as resolve6 } from "path";
+import { join as join10, resolve as resolve6 } from "path";
 async function loadFoundationModule() {
   return await import(FOUNDATION_PACKAGE_NAME);
 }
@@ -5599,7 +6120,7 @@ async function qualifyRestructureMechanism(root) {
   return { ok: true, data: { root: canonical.data, filesystem: RESTRUCTURE_QUALIFIED_FILESYSTEM } };
 }
 async function ensureRestructureMechanismRoot(canonicalRoot, options) {
-  const target = join9(canonicalRoot, RESTRUCTURE_RECOVERY_REL_PATH);
+  const target = join10(canonicalRoot, RESTRUCTURE_RECOVERY_REL_PATH);
   const current = async () => lstat2(target).catch((cause) => cause.code === "ENOENT" ? null : Promise.reject(cause));
   let info = await current();
   if (info === null) {
@@ -5713,7 +6234,7 @@ async function applyRestructureFileSet(canonicalRoot, plan, options) {
   return await verifyMechanismResult(raw);
 }
 async function observeRestructureJournal(canonicalRoot) {
-  const journalRoot = join9(canonicalRoot, RESTRUCTURE_RECOVERY_REL_PATH, "journal");
+  const journalRoot = join10(canonicalRoot, RESTRUCTURE_RECOVERY_REL_PATH, "journal");
   const module = await loadFoundationModule();
   try {
     return { ok: true, data: await module.inspectStateStoreLock(journalRoot, { recoveryObservation: true }) };
@@ -5922,8 +6443,8 @@ var init_restructure_file_set = __esm({
 
 // src/restructure.ts
 import { createHash as createHash4, randomUUID as randomUUID2 } from "crypto";
-import { lstat as lstat3, readFile as readFile3, readdir as readdir3, realpath as realpath2, stat } from "fs/promises";
-import { dirname as dirname6, isAbsolute as isAbsolute5, join as join10, posix, relative as relative4, resolve as resolve7 } from "path";
+import { lstat as lstat3, readFile as readFile4, readdir as readdir3, realpath as realpath2, stat } from "fs/promises";
+import { dirname as dirname6, isAbsolute as isAbsolute6, join as join11, posix, relative as relative4, resolve as resolve7 } from "path";
 import { fileURLToPath as fileURLToPath2 } from "url";
 function digestBytes(value) {
   return `sha256:${createHash4("sha256").update(value).digest("hex")}`;
@@ -5939,7 +6460,7 @@ function digestRestructureValue(value) {
   return digestBytes(canonicalJson(value));
 }
 function normalizeRelativePath2(value) {
-  if (!value || value.includes("\0") || isAbsolute5(value)) return void 0;
+  if (!value || value.includes("\0") || isAbsolute6(value)) return void 0;
   const normalized = value.replace(/\\/g, "/").replace(/^\.\//, "");
   if (!normalized || normalized === "." || normalized.split("/").some((part) => part === ".." || part === "")) return void 0;
   return normalized;
@@ -5959,7 +6480,7 @@ async function readContainedFileWithMode(root, path) {
   try {
     const info = await lstat3(absolutePath);
     if (info.isSymbolicLink() || !info.isFile()) throw new Error(`Path is not a regular file: ${path}`);
-    return { buffer: await readFile3(absolutePath), mode: info.mode & MAX_POSIX_MODE };
+    return { buffer: await readFile4(absolutePath), mode: info.mode & MAX_POSIX_MODE };
   } catch (error) {
     if (error.code === "ENOENT") return void 0;
     throw error;
@@ -5987,7 +6508,7 @@ async function configSnapshot(root) {
   return snapshotFile(root, "artifact-graph.config.yaml");
 }
 async function loadRestructureContract(name) {
-  return loadContract(join10(CONTRACT_ROOT, `restructure-${name}`, "schema.json"), { expectedAuthority: "artifact" });
+  return loadContract(join11(CONTRACT_ROOT, `restructure-${name}`, "schema.json"), { expectedAuthority: "artifact" });
 }
 async function validateDomainContract(name, value) {
   const contract = await loadRestructureContract(name);
@@ -6262,14 +6783,14 @@ async function scanUnsupportedReferences(root, sourcePaths, targetPaths) {
   async function visit(directory) {
     for (const entry of await readdir3(directory, { withFileTypes: true })) {
       if (entry.isDirectory() && SKIPPED_SCAN_DIRS.has(entry.name)) continue;
-      const absolute = join10(directory, entry.name);
+      const absolute = join11(directory, entry.name);
       if (entry.isDirectory()) {
         await visit(absolute);
         continue;
       }
       if (!entry.isFile() || !TEXT_EXTENSIONS.test(entry.name)) continue;
       const path = relative4(root, absolute).replace(/\\/g, "/");
-      const raw = await readFile3(absolute, "utf8");
+      const raw = await readFile4(absolute, "utf8");
       const namesTheMigration = migrationPaths.some((reference) => raw.includes(reference));
       const lines = raw.split(/\r?\n/);
       for (const [index, line] of lines.entries()) {
@@ -6334,13 +6855,13 @@ async function scanConsumerCandidates(root, references, excludedPaths = /* @__PU
   async function visit(directory) {
     for (const entry of await readdir3(directory, { withFileTypes: true })) {
       if (entry.isDirectory() && SKIPPED_SCAN_DIRS.has(entry.name)) continue;
-      const absolute = join10(directory, entry.name);
+      const absolute = join11(directory, entry.name);
       if (entry.isDirectory()) {
         await visit(absolute);
       } else if (entry.isFile() && TEXT_EXTENSIONS.test(entry.name)) {
         const path = relative4(root, absolute).replace(/\\/g, "/");
         if (excludedPaths.has(path)) continue;
-        const raw = await readFile3(absolute, "utf8");
+        const raw = await readFile4(absolute, "utf8");
         raw.split(/\r?\n/).forEach((line, index) => {
           for (const reference of references) {
             if (path !== reference && line.includes(reference)) results.push({ path, line: index + 1, reference });
@@ -6843,7 +7364,7 @@ async function loadRestructurePlanDocument(operation, canonicalRoot, planPath) {
   }
   let bytes;
   try {
-    bytes = await readFile3(absolute);
+    bytes = await readFile4(absolute);
   } catch (cause) {
     return refusal("PLAN_FILE_UNREADABLE", `Plan document cannot be read: ${absolute} (${cause.message})`);
   }
@@ -6875,7 +7396,7 @@ function planRootIdentityFindings(document) {
     findings.push(finding("ROOT_IDENTITY_MISMATCH", `The plan does not record this project's configuration file: ${document.plan.config_snapshot.path}`));
   }
   const relativePlan = relative4(document.root, document.realPath);
-  if (!relativePlan || relativePlan.startsWith("..") || isAbsolute5(relativePlan)) {
+  if (!relativePlan || relativePlan.startsWith("..") || isAbsolute6(relativePlan)) {
     findings.push(finding("ROOT_IDENTITY_MISMATCH", `The plan document is outside the project root: ${document.realPath}`, document.realPath));
   }
   return findings;
@@ -7066,7 +7587,7 @@ var init_restructure = __esm({
     MAX_POSIX_MODE = 511;
     CREATE_MODE_BASE = 438;
     MODULE_DIRECTORY = typeof __dirname === "string" ? __dirname : dirname6(fileURLToPath2(import.meta.url));
-    CONTRACT_ROOT = join10(MODULE_DIRECTORY, "..", "contracts");
+    CONTRACT_ROOT = join11(MODULE_DIRECTORY, "..", "contracts");
     SKIPPED_SCAN_DIRS = /* @__PURE__ */ new Set([".git", "node_modules", "dist", "coverage", ".tmp", ".codex", ".worktrees", ".foundation-file-apply", ".artifact-graph"]);
     TEXT_EXTENSIONS = /\.(?:md|markdown|json|ya?ml|[cm]?[jt]sx?)$/i;
     MARKDOWN_LINK_PATTERN = /!?\[([^\]\n]*)\]\(([^)\n]+)\)/g;
@@ -7077,11 +7598,176 @@ var init_restructure = __esm({
 });
 
 // src/index.ts
+var index_exports = {};
+__export(index_exports, {
+  ALWAYS_PRESENT: () => ALWAYS_PRESENT_ITEMS,
+  BASELINE_CONSTRAINTS: () => BASELINE_CONSTRAINTS,
+  BASELINE_CONSTRAINTS_COUNT: () => BASELINE_CONSTRAINTS_COUNT,
+  BASELINE_ITEMS_COUNT: () => BASELINE_ITEMS_COUNT,
+  CONTRACTS_PACKAGE_NAME: () => CONTRACTS_PACKAGE_NAME2,
+  CONTRACT_ERROR_CODES: () => CONTRACT_ERROR_CODES,
+  ContractCatalog: () => ContractCatalog,
+  ContractError: () => ContractError,
+  ContractRegistry: () => ContractRegistry,
+  DEFAULT_MAX_CHARS: () => DEFAULT_MAX_CHARS,
+  DEFAULT_SCHEMA: () => DEFAULT_SCHEMA,
+  E2E_NORMALIZER_CONFIG: () => E2E_NORMALIZER_CONFIG,
+  FILE_SET_RESULT_OBJECT: () => FILE_SET_RESULT_OBJECT,
+  FOUNDATION_PACKAGE_NAME: () => FOUNDATION_PACKAGE_NAME,
+  GRAPH_DOMAIN_CODES: () => GRAPH_DOMAIN_CODES,
+  GRAPH_PROVIDER_ENTRY: () => GRAPH_PROVIDER_ENTRY,
+  GRAPH_PROVIDER_ID: () => GRAPH_PROVIDER_ID,
+  MIN_PROMPT_CHARS: () => MIN_PROMPT_CHARS,
+  PROFESSIONAL_CONCLUSION_OBJECT: () => PROFESSIONAL_CONCLUSION_OBJECT,
+  RESTRUCTURE_MAX_OPERATIONS: () => RESTRUCTURE_MAX_OPERATIONS,
+  RESTRUCTURE_MAX_TOTAL_BYTES: () => RESTRUCTURE_MAX_TOTAL_BYTES,
+  RESTRUCTURE_PLAN_SCHEMA_VERSION: () => RESTRUCTURE_PLAN_SCHEMA_VERSION,
+  RESTRUCTURE_QUALIFIED_ARCH: () => RESTRUCTURE_QUALIFIED_ARCH,
+  RESTRUCTURE_QUALIFIED_FILESYSTEM: () => RESTRUCTURE_QUALIFIED_FILESYSTEM,
+  RESTRUCTURE_QUALIFIED_PLATFORM: () => RESTRUCTURE_QUALIFIED_PLATFORM,
+  RESTRUCTURE_RECOVERY_JOURNAL_REL_PATH: () => RESTRUCTURE_RECOVERY_JOURNAL_REL_PATH,
+  RESTRUCTURE_RECOVERY_REL_PATH: () => RESTRUCTURE_RECOVERY_REL_PATH,
+  RESTRUCTURE_RECOVERY_ROOT_MODE: () => RESTRUCTURE_RECOVERY_ROOT_MODE,
+  RESTRUCTURE_VALIDATION_TIMEOUT_MS: () => RESTRUCTURE_VALIDATION_TIMEOUT_MS,
+  TARGET_ARTIFACT_TYPES: () => TARGET_ARTIFACT_TYPES,
+  VALID_PACKET_TARGET_TYPES: () => VALID_PACKET_TARGET_TYPES,
+  VERSION_INDEX_SCHEMA_VERSION: () => VERSION_INDEX_SCHEMA_VERSION,
+  VERSION_LOCK_PATH: () => VERSION_LOCK_PATH,
+  VERSION_LOCK_SCHEMA_VERSION: () => VERSION_LOCK_SCHEMA_VERSION,
+  applyPreparedManagedHookBlocks: () => applyPreparedManagedHookBlocks,
+  applyRestructure: () => applyRestructure,
+  applyRestructureFileSet: () => applyRestructureFileSet,
+  assemblePacket: () => assemblePacket,
+  auditPackets: () => auditPackets,
+  auditVersionLock: () => auditVersionLock,
+  bootstrapVersionLock: () => bootstrapVersionLock,
+  buildFileSetApplyRequest: () => buildFileSetApplyRequest,
+  buildGraph: () => buildGraph,
+  buildVersionIndex: () => buildVersionIndex,
+  candidateByteDigest: () => candidateByteDigest,
+  collectChangedPaths: () => collectChangedPaths,
+  computeCoverageBoundary: () => computeCoverageBoundary,
+  computeE2eCoverageStats: () => computeE2eCoverageStats,
+  computeImpact: () => computeImpact,
+  computeRevisionDigest: () => computeRevisionDigest,
+  createModeForUmask: () => createModeForUmask,
+  createRestructureRootBinding: () => createRestructureRootBinding,
+  createRestructureValidationCallback: () => createRestructureValidationCallback,
+  diagnoseConfigDocument: () => diagnoseConfigDocument,
+  diagnoseProjectConfig: () => diagnoseProjectConfig,
+  digestRestructureValue: () => digestRestructureValue,
+  dirname: () => dirname7,
+  discoverAndAuditPackets: () => discoverAndAuditPackets,
+  discoverTargets: () => discoverTargets,
+  doctorArtifactChain: () => doctorArtifactChain,
+  ensureRestructureMechanismRoot: () => ensureRestructureMechanismRoot,
+  extname: () => extname,
+  filterGraphByView: () => filterGraphByView,
+  formatContextMarkdown: () => formatContextMarkdown,
+  gateRestructureOperationPlan: () => gateRestructureOperationPlan,
+  generateE2eRegistry: () => generateE2eRegistry,
+  getArtifactTypeMetadata: () => getArtifactTypeMetadata,
+  getConfigDiagnostics: () => getConfigDiagnostics,
+  getExternalEntryInfo: () => getExternalEntryInfo,
+  getTargetArtifactTypes: () => getTargetArtifactTypes,
+  inspectRestructure: () => inspectRestructure,
+  installManagedHookBlock: () => installManagedHookBlock,
+  isOfficialNamespace: () => isOfficialNamespace,
+  isPacketTargetType: () => isPacketTargetType,
+  isPacketTargetTypeDynamic: () => isPacketTargetTypeDynamic,
+  isTargetArtifactType: () => isTargetArtifactType,
+  isVersionLockIssueBlocking: () => isVersionLockIssueBlocking,
+  loadConfig: () => loadConfig,
+  loadContract: () => loadContract,
+  loadContractCatalog: () => loadContractCatalog,
+  loadContractsFromDirectory: () => loadContractsFromDirectory,
+  loadFoundationModule: () => loadFoundationModule,
+  locateSoftwareRecord: () => locateSoftwareRecord,
+  markdownRecordHeadings: () => markdownRecordHeadings,
+  matchesConfiguredArtifactPath: () => matchesConfiguredArtifactPath,
+  nextId: () => nextId,
+  normalizeE2eLegacyArtifact: () => normalizeE2eLegacyArtifact,
+  normalizeToCanonical: () => normalizeToCanonical,
+  observeRestructureJournal: () => observeRestructureJournal,
+  parseTargetSelector: () => parseTargetSelector,
+  parseTargetsFile: () => parseTargetsFile,
+  planRestructure: () => planRestructure,
+  planningUmask: () => planningUmask,
+  prepareManagedHookBlock: () => prepareManagedHookBlock,
+  projectRestructureFileSetResult: () => projectRestructureFileSetResult,
+  pruneRestructureFileSet: () => pruneRestructureFileSet,
+  pruneRestructureRecovery: () => pruneRestructureRecovery,
+  qualifyRestructureMechanism: () => qualifyRestructureMechanism,
+  queryGraph: () => queryGraph,
+  recoverRestructure: () => recoverRestructure,
+  recoverRestructureFileSet: () => recoverRestructureFileSet,
+  refreshVersionLock: () => refreshVersionLock,
+  renderCoverageBoundaryMarkdown: () => renderCoverageBoundaryMarkdown,
+  renderDoctorMarkdown: () => renderDoctorMarkdown,
+  renderImpactMarkdown: () => renderImpactMarkdown,
+  renderMermaid: () => renderMermaid,
+  renderPacketMarkdown: () => renderPacketMarkdown,
+  renderPacketPrompt: () => renderPacketPrompt,
+  renderTraceVersionMarkdown: () => renderTraceVersionMarkdown,
+  renderVersionLockAuditMarkdown: () => renderVersionLockAuditMarkdown,
+  renderVersionLockRefreshMarkdown: () => renderVersionLockRefreshMarkdown,
+  replaceSoftwareHeader: () => replaceSoftwareHeader,
+  resolveArtifactContext: () => resolveArtifactContext,
+  resolveArtifactGraphCli: () => resolveArtifactGraphCli,
+  resolveArtifactTypeName: () => resolveArtifactTypeName,
+  resolveCliTarget: () => resolveCliTarget,
+  resolveGitHookPath: () => resolveGitHookPath,
+  resolveMatrixEdges: () => resolveMatrixEdges,
+  resolveNodeTimeView: () => resolveNodeTimeView,
+  resolveRealRoot: () => resolveRealRoot,
+  restructureBoundaryFindings: () => restructureBoundaryFindings,
+  runCheckProfessional: () => runCheckProfessional,
+  runReadProof: () => runReadProof,
+  scanArtifacts: () => scanArtifacts,
+  traceVersion: () => traceVersion,
+  updateVersionLock: () => updateVersionLock,
+  validateContractAgainstSchema: () => validateContractAgainstSchema,
+  validateExecutableTraceability: () => validateExecutableTraceability,
+  validateGraph: () => validateGraph,
+  validateNamespaceAuthority: () => validateNamespaceAuthority,
+  validatePacket: () => validatePacket,
+  validatePacketMarkdown: () => validatePacketMarkdown,
+  validatePacketPrompt: () => validatePacketPrompt,
+  validatePolicyCompatibility: () => validatePolicyCompatibility,
+  validateReviewResult: () => validateReviewResult,
+  validateScenarioPrdLinkIndex: () => validateScenarioPrdLinkIndex,
+  validateScenarioPrdLinks: () => validateScenarioPrdLinks,
+  verifyDigest: () => verifyDigest,
+  verifyMechanismResult: () => verifyMechanismResult,
+  versionLockIssueSeverity: () => versionLockIssueSeverity,
+  writeGraphCache: () => writeGraphCache
+});
 import matter from "gray-matter";
-import yaml from "js-yaml";
+import yaml2 from "js-yaml";
 import { accessSync, constants as fsConstants, existsSync as existsSync3, statSync } from "fs";
-import { mkdir as mkdir5, readFile as readFile4, writeFile as writeFile3 } from "fs/promises";
-import { basename as basename5, dirname as dirname7, extname, isAbsolute as isAbsolute6, join as join11, resolve as resolve8 } from "path";
+import { mkdir as mkdir5, readFile as readFile5, writeFile as writeFile3 } from "fs/promises";
+import { basename as basename5, dirname as dirname7, extname, isAbsolute as isAbsolute7, join as join12, resolve as resolve8 } from "path";
+function getConfigDiagnostics(schema) {
+  return configDiagnosticsBySchema.get(schema);
+}
+function edgeRule(from, to, kind) {
+  return { from, to, kind };
+}
+function matchesEdgeRule(rule, fromType, toType, kind) {
+  return rule.from === fromType && rule.to === toType && rule.kind === kind;
+}
+function cloneEdgeRules(rules) {
+  return rules.map((rule) => ({ ...rule }));
+}
+function isEmptyAllowedEdgesValue(value) {
+  return value === null || Array.isArray(value) && value.length === 0;
+}
+function resolveAllowedEdges(value) {
+  if (isEmptyAllowedEdgesValue(value)) {
+    return cloneEdgeRules(DEFAULT_ALLOWED_EDGES);
+  }
+  return cloneEdgeRules(value);
+}
 function isTargetArtifactType(type) {
   return isPacketTargetType(type);
 }
@@ -7123,30 +7809,22 @@ function resolveArtifactTypeName(schema, token) {
   return void 0;
 }
 async function loadConfig(root) {
-  const configPath = join11(root, "artifact-graph.config.yaml");
-  let parsed = {};
+  const configPath = join12(root, "artifact-graph.config.yaml");
+  let raw;
   try {
-    const raw = await readFile4(configPath, "utf-8");
-    parsed = yaml.load(raw) ?? {};
+    raw = await readFile5(configPath, "utf-8");
   } catch (error) {
-    if (error.code !== "ENOENT") {
-      throw error;
+    if (error.code === "ENOENT") {
+      throw new Error(`required configuration is missing: ${configPath}`);
     }
+    throw error;
   }
-  const ub = parsed.context?.universal_baseline;
-  if (ub !== void 0 && typeof ub !== "boolean") {
-    throw new Error(
-      `Invalid context.universal_baseline: ${JSON.stringify(ub)}. Must be boolean (true or false).`
-    );
+  const document = yaml2.load(raw) ?? {};
+  const shapeDiagnosis = diagnoseConfigDocument(document);
+  if (shapeDiagnosis.errors.length > 0) {
+    throw new Error(shapeDiagnosis.errors[0].message);
   }
-  if (parsed.e2e !== void 0) {
-    if (typeof parsed.e2e !== "object" || parsed.e2e === null || Array.isArray(parsed.e2e)) {
-      throw new Error("Invalid e2e: must be an object.");
-    }
-    validateE2eConfig(parsed.e2e);
-  }
-  validateRelationSemanticsConfig(parsed.relationSemantics);
-  validateStatusViewsConfig(parsed.statusViews);
+  const parsed = document;
   const mergedE2e = parsed.e2e === void 0 ? DEFAULT_SCHEMA.e2e : {
     ...DEFAULT_SCHEMA.e2e,
     ...parsed.e2e,
@@ -7161,13 +7839,14 @@ async function loadConfig(root) {
     types: mergeArtifactTypes(DEFAULT_SCHEMA.types, parsed.types),
     idPatterns: mergeRecord(DEFAULT_SCHEMA.idPatterns, parsed.idPatterns),
     relationFields: mergeRecord(DEFAULT_SCHEMA.relationFields, parsed.relationFields),
-    allowedEdges: parsed.allowedEdges ?? DEFAULT_SCHEMA.allowedEdges,
+    allowedEdges: resolveAllowedEdges(parsed.allowedEdges),
     forbiddenEdges: parsed.forbiddenEdges ?? DEFAULT_SCHEMA.forbiddenEdges,
     statuses: parsed.statuses ?? DEFAULT_SCHEMA.statuses,
     idRanges: mergeRecord(DEFAULT_SCHEMA.idRanges, parsed.idRanges),
     e2e: mergedE2e
   };
   validateJsonArtifactTypes(merged.types);
+  configDiagnosticsBySchema.set(merged, shapeDiagnosis);
   return merged;
 }
 function validateJsonArtifactTypes(types) {
@@ -7189,131 +7868,6 @@ function validateJsonArtifactTypes(types) {
     }
     if (typeof idField !== "string" || idField.length === 0 || idField.trim() !== idField) {
       throw new Error(`Invalid types.${type}.idField: format json requires the name of one root property.`);
-    }
-  }
-}
-function validateRelationSemanticsConfig(value) {
-  if (value === void 0) return;
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new Error("Invalid relationSemantics: must be an object keyed by relation kind.");
-  }
-  for (const [kind, spec] of Object.entries(value)) {
-    if (!kind.trim() || typeof spec !== "object" || spec === null || Array.isArray(spec)) {
-      throw new Error(`Invalid relationSemantics.${kind}: must be an object.`);
-    }
-    if (typeof spec.label !== "string" || !spec.label.trim()) {
-      throw new Error(`Invalid relationSemantics.${kind}.label: must be a non-empty string.`);
-    }
-    if (!Array.isArray(spec.targetTypes) || spec.targetTypes.some((item) => typeof item !== "string" || !item.trim())) {
-      throw new Error(`Invalid relationSemantics.${kind}.targetTypes: must be an array of non-empty strings.`);
-    }
-    if (!Array.isArray(spec.fields) || spec.fields.length === 0 || spec.fields.some((item) => typeof item !== "string" || !item.trim())) {
-      throw new Error(`Invalid relationSemantics.${kind}.fields: must be a non-empty array of strings.`);
-    }
-    if (spec.partial !== void 0 && (typeof spec.partial !== "object" || spec.partial === null || typeof spec.partial.sectionField !== "string" || !spec.partial.sectionField.trim())) {
-      throw new Error(`Invalid relationSemantics.${kind}.partial.sectionField: must be a non-empty string.`);
-    }
-  }
-}
-function validateStatusViewsConfig(value) {
-  if (value === void 0) return;
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new Error("Invalid statusViews: must be an object keyed by status.");
-  }
-  for (const [status, bucket] of Object.entries(value)) {
-    if (!status.trim() || !["current", "planned", "history"].includes(bucket)) {
-      throw new Error(`Invalid statusViews.${status}: expected current, planned, or history.`);
-    }
-  }
-}
-function validateE2eConfig(e2e) {
-  for (const field of ["report_uncovered_scenarios", "report_uncovered_features"]) {
-    if (e2e[field] !== void 0 && typeof e2e[field] !== "boolean") {
-      throw new Error(`Invalid e2e.${field}: must be boolean.`);
-    }
-  }
-  if (e2e.executable_ref_warning !== void 0) {
-    if (typeof e2e.executable_ref_warning !== "number" || e2e.executable_ref_warning < 0 || e2e.executable_ref_warning > 1) {
-      throw new Error(`Invalid e2e.executable_ref_warning: ${JSON.stringify(e2e.executable_ref_warning)}. Must be a number between 0 and 1.`);
-    }
-  }
-  if (e2e.executable_ref_error !== void 0) {
-    if (typeof e2e.executable_ref_error !== "number" || e2e.executable_ref_error < 0 || e2e.executable_ref_error > 1) {
-      throw new Error(`Invalid e2e.executable_ref_error: ${JSON.stringify(e2e.executable_ref_error)}. Must be a number between 0 and 1.`);
-    }
-  }
-  const validateWaivers = (waivers, field) => {
-    if (waivers === void 0) return;
-    if (!Array.isArray(waivers)) {
-      throw new Error(`Invalid ${field}: must be an array of {id, reason} objects.`);
-    }
-    for (const w of waivers) {
-      if (typeof w !== "object" || w === null || !("id" in w) || !("reason" in w)) {
-        throw new Error(`Invalid ${field} entry: ${JSON.stringify(w)}. Must be {id, reason} object.`);
-      }
-      if (typeof w.id !== "string" || !w.id.trim()) {
-        throw new Error(`Invalid ${field} entry: id must be a non-empty string. Got: ${JSON.stringify(w.id)}`);
-      }
-      if (typeof w.reason !== "string" || !w.reason.trim()) {
-        throw new Error(`Invalid ${field} entry: reason must be a non-empty string. Got: ${JSON.stringify(w.reason)}`);
-      }
-    }
-  };
-  validateWaivers(e2e.scenario_waivers, "e2e.scenario_waivers");
-  validateWaivers(e2e.feature_waivers, "e2e.feature_waivers");
-  if (e2e.runners !== void 0) {
-    if (!Array.isArray(e2e.runners)) {
-      throw new Error(`Invalid e2e.runners: must be an array.`);
-    }
-    for (const runner of e2e.runners) {
-      if (typeof runner !== "object" || runner === null) {
-        throw new Error(`Invalid e2e.runners entry: must be an object.`);
-      }
-      if (typeof runner.name !== "string" || !runner.name.trim()) {
-        throw new Error(`Invalid e2e.runners entry: name must be a non-empty string.`);
-      }
-      if (typeof runner.root !== "string" || !runner.root.trim()) {
-        throw new Error(`Invalid e2e.runners[${runner.name}].root: must be a non-empty string.`);
-      }
-      if (isAbsolute6(runner.root)) {
-        throw new Error(`Invalid e2e.runners[${runner.name}].root: "${runner.root}" must not be an absolute path.`);
-      }
-      if (runner.root.replace(/\\/g, "/").split("/").includes("..")) {
-        throw new Error(`Invalid e2e.runners[${runner.name}].root: "${runner.root}" must not contain ".." segments.`);
-      }
-      if (!Array.isArray(runner.include) || runner.include.length === 0) {
-        throw new Error(`Invalid e2e.runners[${runner.name}].include: must be a non-empty array of glob patterns.`);
-      }
-      for (const pattern of runner.include) {
-        if (typeof pattern !== "string" || !pattern.trim()) {
-          throw new Error(`Invalid e2e.runners[${runner.name}].include: pattern must be a non-empty string.`);
-        }
-      }
-      if (runner.exclude !== void 0) {
-        if (!Array.isArray(runner.exclude)) {
-          throw new Error(`Invalid e2e.runners[${runner.name}].exclude: must be an array.`);
-        }
-        for (const pattern of runner.exclude) {
-          if (typeof pattern !== "string" || !pattern.trim()) {
-            throw new Error(`Invalid e2e.runners[${runner.name}].exclude: pattern must be a non-empty string.`);
-          }
-        }
-      }
-      if (runner.testIgnore !== void 0) {
-        if (!Array.isArray(runner.testIgnore)) {
-          throw new Error(`Invalid e2e.runners[${runner.name}].testIgnore: must be an array.`);
-        }
-        for (const pattern of runner.testIgnore) {
-          if (typeof pattern !== "string" || !pattern.trim()) {
-            throw new Error(`Invalid e2e.runners[${runner.name}].testIgnore: pattern must be a non-empty string.`);
-          }
-        }
-      }
-      if (runner.kind !== void 0) {
-        if (!["unit", "integration", "e2e"].includes(runner.kind)) {
-          throw new Error(`Invalid e2e.runners[${runner.name}].kind: "${runner.kind}". Must be unit, integration, or e2e.`);
-        }
-      }
     }
   }
 }
@@ -7364,7 +7918,7 @@ async function scanArtifacts(root, schema, options = {}) {
         continue;
       }
       scannedFiles.set(file, type);
-      const raw = contentOverrides.has(file) ? contentOverrides.get(file) : await readFile4(join11(root, file), "utf-8");
+      const raw = contentOverrides.has(file) ? contentOverrides.get(file) : await readFile5(join12(root, file), "utf-8");
       const parsed = parseFile(type, file, raw, config);
       const semantic = isJsonOriginalType(type, config) ? { edges: [], diagnostics: [] } : parseConfiguredRelations(type, file, raw, parsed.nodes, config);
       nodes.push(...parsed.nodes);
@@ -7372,7 +7926,7 @@ async function scanArtifacts(root, schema, options = {}) {
       scanDiagnostics.push(...parsed.diagnostics, ...semantic.diagnostics);
     }
   }
-  const absoluteRoot = isAbsolute6(root) ? root : resolve8(root);
+  const absoluteRoot = isAbsolute7(root) ? root : resolve8(root);
   const graph = buildGraph(nodes, edges, scanDiagnostics, absoluteRoot);
   return resolveMatrixEdges(graph);
 }
@@ -7519,8 +8073,16 @@ function validateGraph(graph, schema = DEFAULT_SCHEMA) {
         { edge: edge2 }
       ));
     }
-    if (schema.forbiddenEdges.some((rule) => rule.from === fromType && rule.to === toType && rule.kind === edge2.kind)) {
+    if (schema.forbiddenEdges.some((rule) => matchesEdgeRule(rule, fromType, toType, edge2.kind))) {
       issues.push(issue("FORBIDDEN_EDGE", `Forbidden ${fromType} -> ${toType} ${edge2.kind} relation`, edge2.sourcePath, edge2.sourceLine, { edge: edge2 }));
+    } else if (!schema.allowedEdges.some((rule) => matchesEdgeRule(rule, fromType, toType, edge2.kind))) {
+      issues.push(issue(
+        "DISALLOWED_EDGE",
+        `Disallowed ${fromType} -> ${toType} ${edge2.kind} relation`,
+        edge2.sourcePath,
+        edge2.sourceLine,
+        { edge: edge2 }
+      ));
     }
   }
   issues.push(...validateE2eTests(graph));
@@ -7711,7 +8273,7 @@ async function validateScenarioPrdLinkIndex(root, graph) {
   const indexPath = "artifacts/prd/feature-index.md";
   let raw = "";
   try {
-    raw = await readFile4(join11(root, indexPath), "utf-8");
+    raw = await readFile5(join12(root, indexPath), "utf-8");
   } catch (error) {
     if (error.code === "ENOENT") {
       return [];
@@ -7959,12 +8521,12 @@ function nextId(graph, schema, type, rangeName) {
   throw new Error(`ID range ${type}.${rangeName} is exhausted`);
 }
 async function writeGraphCache(root, graph) {
-  const cacheDir = join11(root, ".artifact-graph");
+  const cacheDir = join12(root, ".artifact-graph");
   await mkdir5(cacheDir, { recursive: true });
-  await writeFile3(join11(cacheDir, "index.json"), `${JSON.stringify(graph, null, 2)}
+  await writeFile3(join12(cacheDir, "index.json"), `${JSON.stringify(graph, null, 2)}
 `);
   const { default: Database } = await import("better-sqlite3");
-  const db = new Database(join11(cacheDir, "graph.sqlite"));
+  const db = new Database(join12(cacheDir, "graph.sqlite"));
   try {
     db.exec(`
       DROP TABLE IF EXISTS nodes;
@@ -10046,7 +10608,7 @@ async function validateExecutableTraceability(root, config) {
   const tcKeyToFields = /* @__PURE__ */ new Map();
   const mdBatches = /* @__PURE__ */ new Set();
   for (const relPath of e2eFiles) {
-    const raw = await readFile4(join11(root, relPath), "utf-8");
+    const raw = await readFile5(join12(root, relPath), "utf-8");
     const parsed = matter(raw);
     const data = parsed.data;
     const batch = String(data.test_batch ?? basename5(relPath, extname(relPath))).trim();
@@ -10088,10 +10650,10 @@ async function validateExecutableTraceability(root, config) {
   const tcAnnotationRegex = /\/\/!?\s*@(?:e2e_test|tc)\s+(\S+?)\s+\[(\w+)\]/;
   const tcAnnotationNoLevelRegex = /\/\/!?\s*@(?:e2e_test|tc)\s+(\S+)/;
   for (const specFile of specFiles) {
-    const fullSpecPath = join11(root, specFile);
+    const fullSpecPath = join12(root, specFile);
     let content;
     try {
-      content = await readFile4(fullSpecPath, "utf-8");
+      content = await readFile5(fullSpecPath, "utf-8");
     } catch {
       continue;
     }
@@ -10170,7 +10732,7 @@ async function validateExecutableTraceability(root, config) {
       if (entry.testId) {
         let content;
         try {
-          content = await readFile4(join11(root, normalizedRefFile), "utf-8");
+          content = await readFile5(join12(root, normalizedRefFile), "utf-8");
         } catch {
           continue;
         }
@@ -10405,7 +10967,7 @@ async function computeE2eCoverageStats(graph, root, thresholds = {}) {
     let hasActiveE2eRef = false;
     for (const entry of parseExecutableRefLines(execRef)) {
       const normalized = resolveExecutableRefFile(entry.file, allProjectFiles);
-      if (!normalized || !existsSync3(join11(root, normalized))) continue;
+      if (!normalized || !existsSync3(join12(root, normalized))) continue;
       const accepting = await getAcceptingRunners(root, normalized, runners);
       if (accepting.some((runner) => runner.kind === "e2e")) {
         hasActiveE2eRef = true;
@@ -10464,7 +11026,7 @@ async function computeE2eCoverageStats(graph, root, thresholds = {}) {
   const acCoverageRateByFeature = {};
   const featureAcMap = /* @__PURE__ */ new Map();
   for (const node of featureNodes) {
-    const acs = parseAcceptanceCriteria(await readFile4(join11(root, node.path), "utf-8"));
+    const acs = parseAcceptanceCriteria(await readFile5(join12(root, node.path), "utf-8"));
     featureAcMap.set(node.code, new Set(acs));
   }
   const coveredAcByFeature = /* @__PURE__ */ new Map();
@@ -10512,8 +11074,8 @@ async function generateE2eRegistry(root, opts) {
   const batchIds = /* @__PURE__ */ new Set();
   let totalTestCases = 0;
   for (const file of files) {
-    const filePath = join11(root, file);
-    const raw = await readFile4(filePath, "utf-8");
+    const filePath = join12(root, file);
+    const raw = await readFile5(filePath, "utf-8");
     const parsed = matter(raw);
     const data = parsed.data;
     const batch = String(data.test_batch ?? basename5(file, extname(file))).trim();
@@ -10638,10 +11200,10 @@ async function validatePartialRustEvidence(tcFields, tcKey, root, allFiles) {
     if (!normalizedPath) {
       return { hasValidPartialRust: false, detail: `partial_rust file not found: ${ref.file}` };
     }
-    const fullPath = join11(root, normalizedPath);
+    const fullPath = join12(root, normalizedPath);
     let content;
     try {
-      content = await readFile4(fullPath, "utf-8");
+      content = await readFile5(fullPath, "utf-8");
     } catch {
       return { hasValidPartialRust: false, detail: `partial_rust file not found: ${ref.file}` };
     }
@@ -10675,7 +11237,7 @@ function detectTestLevel(specFile, content) {
 }
 function resolveExecutableRefFile(refFile, allFiles) {
   const normalized = refFile.replace(/\\/g, "/").replace(/^\.\//, "");
-  if (!normalized || isAbsolute6(refFile) || normalized.split("/").includes("..")) {
+  if (!normalized || isAbsolute7(refFile) || normalized.split("/").includes("..")) {
     return void 0;
   }
   if (allFiles.includes(normalized)) {
@@ -11257,7 +11819,7 @@ function resolveArtifactContext(graph, opts) {
     }
     if (root) {
       for (const ap of ALWAYS_PRESENT_ITEMS) {
-        const fullPath = join11(root, ap.path);
+        const fullPath = join12(root, ap.path);
         let stat2;
         try {
           stat2 = statSync(fullPath);
@@ -11499,13 +12061,15 @@ function formatContextMarkdown(manifest) {
   }
   return lines.join("\n");
 }
-var TARGET_ARTIFACT_TYPES, NON_TARGET_ROLES, DEFAULT_SCHEMA, SPECIALIZED_PARSER_TYPES, EMPTY_RELATION_FIELD_VALUES, VALID_TC_STATUSES, VALID_CHAIN_TYPES, DEPRECATED_CHAIN_TYPE_ALIASES, CONTEXT_CATEGORIES, TIER_ORDER;
+var configDiagnosticsBySchema, DEFAULT_ALLOWED_EDGES, TARGET_ARTIFACT_TYPES, NON_TARGET_ROLES, DEFAULT_SCHEMA, SPECIALIZED_PARSER_TYPES, EMPTY_RELATION_FIELD_VALUES, VALID_TC_STATUSES, VALID_CHAIN_TYPES, DEPRECATED_CHAIN_TYPE_ALIASES, CONTEXT_CATEGORIES, TIER_ORDER;
 var init_index = __esm({
   "src/index.ts"() {
     init_packet_constants();
     init_packet_validator();
     init_glob_matcher();
     init_file_walker();
+    init_doctor();
+    init_doctor();
     init_packet_constants();
     init_target_selector();
     init_impact();
@@ -11526,6 +12090,44 @@ var init_index = __esm({
     init_restructure();
     init_restructure_file_set();
     init_restructure_software();
+    configDiagnosticsBySchema = /* @__PURE__ */ new WeakMap();
+    DEFAULT_ALLOWED_EDGES = [
+      edgeRule("feature", "scenario", "covers"),
+      edgeRule("feature", "decision", "references"),
+      edgeRule("feature", "feature", "depends_on"),
+      edgeRule("feature", "design", "references"),
+      edgeRule("scenario", "feature", "references"),
+      edgeRule("scenario", "decision", "references"),
+      edgeRule("scenario", "entity", "references"),
+      edgeRule("entity", "decision", "references"),
+      edgeRule("decision", "feature", "references"),
+      edgeRule("decision", "scenario", "references"),
+      edgeRule("design", "feature", "references"),
+      edgeRule("design", "scenario", "references"),
+      edgeRule("design", "decision", "references"),
+      edgeRule("design", "entity", "references"),
+      edgeRule("test", "feature", "verifies"),
+      edgeRule("test", "scenario", "verifies"),
+      edgeRule("test", "decision", "verifies"),
+      edgeRule("test", "entity", "verifies"),
+      edgeRule("implementation", "feature", "implements"),
+      edgeRule("implementation", "scenario", "implements"),
+      edgeRule("implementation", "decision", "implements"),
+      edgeRule("implementation", "entity", "implements"),
+      edgeRule("e2e_test", "scenario", "verifies"),
+      edgeRule("e2e_test", "feature", "verifies"),
+      edgeRule("e2e_test", "decision", "references"),
+      edgeRule("e2e_test", "entity", "references"),
+      edgeRule("rule-golden-cases", "design", "references"),
+      edgeRule("traceability-matrix-v2", "traceability-matrix-v2", "references"),
+      edgeRule("traceability-matrix-v2", "traceability-matrix-v2", "covers"),
+      edgeRule("traceability-matrix-v2", "resolve", "references"),
+      edgeRule("traceability-matrix-v2", "resolve", "covers"),
+      ...["feature", "scenario", "decision", "design", "entity", "test", "e2e_test"].flatMap((to) => [
+        edgeRule("traceability-matrix-v2", to, "references"),
+        edgeRule("traceability-matrix-v2", to, "covers")
+      ])
+    ];
     TARGET_ARTIFACT_TYPES = VALID_PACKET_TARGET_TYPES;
     NON_TARGET_ROLES = ["context", "candidate", "not-recommended"];
     DEFAULT_SCHEMA = {
@@ -11563,7 +12165,7 @@ var init_index = __esm({
         e2e_test: ["test_batch", "scope", "ac_coverage", "related_scenarios", "related_decisions", "related_entities", "\u8986\u76D6\u573A\u666F", "\u8986\u76D6\u529F\u80FD"],
         e2e_registry: ["batches"]
       },
-      allowedEdges: [],
+      allowedEdges: DEFAULT_ALLOWED_EDGES,
       forbiddenEdges: [{ from: "scenario", to: "entity", kind: "references" }],
       statuses: ["planned", "active", "done", "deprecated"],
       idRanges: {},
@@ -11696,6 +12298,8 @@ export {
   createModeForUmask,
   createRestructureRootBinding,
   createRestructureValidationCallback,
+  diagnoseConfigDocument,
+  diagnoseProjectConfig,
   digestRestructureValue,
   dirname7 as dirname,
   discoverAndAuditPackets,
@@ -11708,6 +12312,7 @@ export {
   gateRestructureOperationPlan,
   generateE2eRegistry,
   getArtifactTypeMetadata,
+  getConfigDiagnostics,
   getExternalEntryInfo,
   getTargetArtifactTypes,
   inspectRestructure,

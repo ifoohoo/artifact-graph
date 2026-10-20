@@ -92,6 +92,8 @@ const profiles = require('artifact-graph/project-artifact-profiles');
 
 目标项目的 `artifact-graph.config.yaml` 拥有采用权。配置或既有方法绑定里已经声明的类型都要保留，包括清单里没有的追加类型。
 
+`loadConfig`（配置加载入口）与 `artifact-graph doctor` 会检查已声明字段的结构与类型。`statuses` 应为字符串数组；写成字符串时按字段路径报错。未知顶层键会保留兼容，并给出可定位提示，不一律拒绝。已有配置文件必须写出 `allowedEdges`。写成 `[]`、`null` 或 YAML 空值时，采用内置 `DEFAULT_SCHEMA.allowedEdges`。非空清单完全替换默认表，按 from/to/kind 严格匹配；清单外关系报 `DISALLOWED_EDGE`。`forbiddenEdges` 仍优先报告 `FORBIDDEN_EDGE`。没有配置文件时保持未接入，不会伪装成有效项目。`extraFields` 仍是可选索引字段。本轮也尚未用 `contract validate` 校验 Markdown 正文合同。
+
 ### 自定义类型的 JSON 原文件
 
 内置类型继续使用各自的专用解析。`format: json` 只写在项目自己注册的自定义类型上，同一项还要给出 `idField`。省略 `format` 时，文件仍按 Markdown 解析，扫描路径写成 `*.json` 也不改变这一规则。类型声明 `format: json` 之后，才按 JSON 读取。
@@ -114,7 +116,7 @@ JSON 文件把 `fields` 中的点分字符串当成逐层属性名。
 
 点号只切开固定的属性名。`*`、筛选条件和 JSONPath 都不是路径语法；名为 `*` 的属性只按这个名字查找。数组里的记录留在原对象中。这一批读取编号，以及 `relationSemantics` 里已经声明的关系。标题、状态、编号拼接、前缀和改写都不在读取范围内。Markdown 字段仍按整个字符串查找，嵌套对象不会被点号拆开。诊断带原文件路径和字段名，行号记为 1。
 
-项目可以把方法指向能力，把发行记录指向方法。下面的配置只示范这两个方向。
+项目可以把方法指向能力，把发行记录指向方法。下面的配置只示范这两个方向。非空 `allowedEdges` 会完全替换内置默认表，所以这两条项目关系必须写进清单；只写 `[]` 不能授权这些自定义类型。
 
 ```yaml
 types:
@@ -143,6 +145,9 @@ relationSemantics:
     label: 发行记录对应的方法
     targetTypes: [method]
     fields: [methods]
+allowedEdges:
+  - { from: method, to: capability, kind: applies }
+  - { from: skill_release, to: method, kind: releases }
 ```
 
 方法文件把一个能力编号放在嵌套属性里。

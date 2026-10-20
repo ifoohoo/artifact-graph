@@ -397,6 +397,505 @@ var init_file_walker = __esm({
   }
 });
 
+// src/doctor.ts
+function getShapeValidator() {
+  if (!_validateConfigShape) {
+    const AjvCtor = import_ajv.default;
+    const ajv = new AjvCtor({ allErrors: true, strict: false });
+    _validateConfigShape = ajv.compile(CONFIG_SHAPE_SCHEMA);
+  }
+  return _validateConfigShape;
+}
+function instancePathToField(instancePath, params) {
+  const missing = typeof params?.missingProperty === "string" ? params.missingProperty : void 0;
+  if (!instancePath || instancePath === "") {
+    return missing && missing.length > 0 ? missing : "(root)";
+  }
+  const path = instancePath.replace(/^\//, "").replace(/\//g, ".");
+  return missing && missing.length > 0 ? `${path}.${missing}` : path;
+}
+function pushError(errors, path, message) {
+  errors.push({ path, message, severity: "error" });
+}
+function warnUnknownObjectKeys(value, path, knownKeys, warnings) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return;
+  for (const key of Object.keys(value)) {
+    if (knownKeys.has(key)) continue;
+    const field = path ? `${path}.${key}` : key;
+    warnings.push({
+      path: field,
+      message: `Unknown config key ${key} at ${field}: kept for compatibility and not treated as a declared field.`,
+      severity: "warning"
+    });
+  }
+}
+function warnUnknownArrayObjectKeys(value, path, knownKeys, warnings) {
+  if (!Array.isArray(value)) return;
+  value.forEach((entry, index) => {
+    warnUnknownObjectKeys(entry, `${path}.${index}`, knownKeys, warnings);
+  });
+}
+function collectNestedUnknownKeyWarnings(document, warnings) {
+  warnUnknownObjectKeys(document, "", KNOWN_TOP_LEVEL_KEYS, warnings);
+  const types = document.types;
+  if (types && typeof types === "object" && !Array.isArray(types)) {
+    for (const [typeName, definition] of Object.entries(types)) {
+      const typePath = `types.${typeName}`;
+      warnUnknownObjectKeys(definition, typePath, TYPE_OBJECT_KEYS, warnings);
+      if (definition && typeof definition === "object" && !Array.isArray(definition)) {
+        warnUnknownArrayObjectKeys(
+          definition.extraFields,
+          `${typePath}.extraFields`,
+          EXTRA_FIELD_KEYS,
+          warnings
+        );
+      }
+    }
+  }
+  warnUnknownArrayObjectKeys(document.allowedEdges, "allowedEdges", EDGE_RULE_KEYS, warnings);
+  warnUnknownArrayObjectKeys(document.forbiddenEdges, "forbiddenEdges", EDGE_RULE_KEYS, warnings);
+  warnUnknownObjectKeys(document.context, "context", CONTEXT_KEYS, warnings);
+  const idRanges = document.idRanges;
+  if (idRanges && typeof idRanges === "object" && !Array.isArray(idRanges)) {
+    for (const [layer, ranges] of Object.entries(idRanges)) {
+      if (!ranges || typeof ranges !== "object" || Array.isArray(ranges)) continue;
+      for (const [rangeName, entry] of Object.entries(ranges)) {
+        warnUnknownObjectKeys(entry, `idRanges.${layer}.${rangeName}`, ID_RANGE_ENTRY_KEYS, warnings);
+      }
+    }
+  }
+  const relationSemantics = document.relationSemantics;
+  if (relationSemantics && typeof relationSemantics === "object" && !Array.isArray(relationSemantics)) {
+    for (const [kind, spec] of Object.entries(relationSemantics)) {
+      const specPath = `relationSemantics.${kind}`;
+      warnUnknownObjectKeys(spec, specPath, RELATION_SEMANTICS_KEYS, warnings);
+      if (spec && typeof spec === "object" && !Array.isArray(spec)) {
+        warnUnknownObjectKeys(
+          spec.partial,
+          `${specPath}.partial`,
+          RELATION_PARTIAL_KEYS,
+          warnings
+        );
+      }
+    }
+  }
+  const e2e = document.e2e;
+  if (e2e && typeof e2e === "object" && !Array.isArray(e2e)) {
+    const e2eRecord = e2e;
+    warnUnknownObjectKeys(e2eRecord, "e2e", E2E_KEYS, warnings);
+    warnUnknownArrayObjectKeys(e2eRecord.scenario_waivers, "e2e.scenario_waivers", WAIVER_KEYS, warnings);
+    warnUnknownArrayObjectKeys(e2eRecord.feature_waivers, "e2e.feature_waivers", WAIVER_KEYS, warnings);
+    warnUnknownArrayObjectKeys(e2eRecord.runners, "e2e.runners", RUNNER_KEYS, warnings);
+  }
+}
+function typeHasDefaultPaths(typeName) {
+  const base = DEFAULT_SCHEMA.types[typeName];
+  return Array.isArray(base?.paths);
+}
+function collectCustomTypePathErrors(types, errors) {
+  if (types === void 0) return;
+  if (typeof types !== "object" || types === null || Array.isArray(types)) return;
+  for (const [typeName, definition] of Object.entries(types)) {
+    if (definition === void 0 || definition === null) {
+      if (!typeHasDefaultPaths(typeName)) {
+        pushError(errors, `types.${typeName}.paths`, `Invalid types.${typeName}.paths: must be array`);
+      }
+      continue;
+    }
+    if (typeof definition !== "object" || Array.isArray(definition)) continue;
+    const paths = definition.paths;
+    if (paths === void 0 && !typeHasDefaultPaths(typeName)) {
+      pushError(errors, `types.${typeName}.paths`, `Invalid types.${typeName}.paths: must be array`);
+    }
+  }
+}
+function collectRelationSemanticsErrors(value, errors) {
+  if (value === void 0) return;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    pushError(errors, "relationSemantics", "Invalid relationSemantics: must be an object keyed by relation kind.");
+    return;
+  }
+  for (const [kind, spec] of Object.entries(value)) {
+    const path = `relationSemantics.${kind}`;
+    if (!kind.trim() || typeof spec !== "object" || spec === null || Array.isArray(spec)) {
+      pushError(errors, path, `Invalid relationSemantics.${kind}: must be an object.`);
+      continue;
+    }
+    const record = spec;
+    if (typeof record.label !== "string" || !record.label.trim()) {
+      pushError(errors, `${path}.label`, `Invalid relationSemantics.${kind}.label: must be a non-empty string.`);
+    }
+    if (!Array.isArray(record.targetTypes) || record.targetTypes.some((item) => typeof item !== "string" || !item.trim())) {
+      pushError(errors, `${path}.targetTypes`, `Invalid relationSemantics.${kind}.targetTypes: must be an array of non-empty strings.`);
+    }
+    if (!Array.isArray(record.fields) || record.fields.length === 0 || record.fields.some((item) => typeof item !== "string" || !item.trim())) {
+      pushError(errors, `${path}.fields`, `Invalid relationSemantics.${kind}.fields: must be a non-empty array of strings.`);
+    }
+    if (record.partial !== void 0 && (typeof record.partial !== "object" || record.partial === null || Array.isArray(record.partial) || typeof record.partial.sectionField !== "string" || !record.partial.sectionField.trim())) {
+      pushError(
+        errors,
+        `${path}.partial.sectionField`,
+        `Invalid relationSemantics.${kind}.partial.sectionField: must be a non-empty string.`
+      );
+    }
+  }
+}
+function collectStatusViewsErrors(value, errors) {
+  if (value === void 0) return;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    pushError(errors, "statusViews", "Invalid statusViews: must be an object keyed by status.");
+    return;
+  }
+  for (const [status, bucket] of Object.entries(value)) {
+    if (!status.trim() || !["current", "planned", "history"].includes(bucket)) {
+      pushError(errors, `statusViews.${status}`, `Invalid statusViews.${status}: expected current, planned, or history.`);
+    }
+  }
+}
+function collectWaiverErrors(waivers, field, errors) {
+  if (waivers === void 0) return;
+  if (!Array.isArray(waivers)) {
+    pushError(errors, field, `Invalid ${field}: must be an array of {id, reason} objects.`);
+    return;
+  }
+  waivers.forEach((entry, index) => {
+    const path = `${field}.${index}`;
+    if (typeof entry !== "object" || entry === null || !("id" in entry) || !("reason" in entry)) {
+      pushError(errors, path, `Invalid ${field} entry: ${JSON.stringify(entry)}. Must be {id, reason} object.`);
+      return;
+    }
+    const record = entry;
+    if (typeof record.id !== "string" || !record.id.trim()) {
+      pushError(errors, `${path}.id`, `Invalid ${field} entry: id must be a non-empty string. Got: ${JSON.stringify(record.id)}`);
+    }
+    if (typeof record.reason !== "string" || !record.reason.trim()) {
+      pushError(errors, `${path}.reason`, `Invalid ${field} entry: reason must be a non-empty string. Got: ${JSON.stringify(record.reason)}`);
+    }
+  });
+}
+function collectE2eConfigErrors(e2e, errors) {
+  if (e2e === void 0) return;
+  if (typeof e2e !== "object" || e2e === null || Array.isArray(e2e)) {
+    pushError(errors, "e2e", "Invalid e2e: must be an object.");
+    return;
+  }
+  const record = e2e;
+  for (const field of ["report_uncovered_scenarios", "report_uncovered_features"]) {
+    if (record[field] !== void 0 && typeof record[field] !== "boolean") {
+      pushError(errors, `e2e.${field}`, `Invalid e2e.${field}: must be boolean.`);
+    }
+  }
+  if (record.executable_ref_warning !== void 0) {
+    if (typeof record.executable_ref_warning !== "number" || record.executable_ref_warning < 0 || record.executable_ref_warning > 1) {
+      pushError(
+        errors,
+        "e2e.executable_ref_warning",
+        `Invalid e2e.executable_ref_warning: ${JSON.stringify(record.executable_ref_warning)}. Must be a number between 0 and 1.`
+      );
+    }
+  }
+  if (record.executable_ref_error !== void 0) {
+    if (typeof record.executable_ref_error !== "number" || record.executable_ref_error < 0 || record.executable_ref_error > 1) {
+      pushError(
+        errors,
+        "e2e.executable_ref_error",
+        `Invalid e2e.executable_ref_error: ${JSON.stringify(record.executable_ref_error)}. Must be a number between 0 and 1.`
+      );
+    }
+  }
+  collectWaiverErrors(record.scenario_waivers, "e2e.scenario_waivers", errors);
+  collectWaiverErrors(record.feature_waivers, "e2e.feature_waivers", errors);
+  if (record.runners === void 0) return;
+  if (!Array.isArray(record.runners)) {
+    pushError(errors, "e2e.runners", "Invalid e2e.runners: must be an array.");
+    return;
+  }
+  record.runners.forEach((runner, index) => {
+    const runnerPath = `e2e.runners.${index}`;
+    if (typeof runner !== "object" || runner === null) {
+      pushError(errors, runnerPath, "Invalid e2e.runners entry: must be an object.");
+      return;
+    }
+    const runnerRecord = runner;
+    const name = runnerRecord.name;
+    if (typeof name !== "string" || !name.trim()) {
+      pushError(errors, `${runnerPath}.name`, "Invalid e2e.runners entry: name must be a non-empty string.");
+      return;
+    }
+    if (typeof runnerRecord.root !== "string" || !runnerRecord.root.trim()) {
+      pushError(errors, `${runnerPath}.root`, `Invalid e2e.runners[${name}].root: must be a non-empty string.`);
+    } else {
+      if ((0, import_node_path2.isAbsolute)(runnerRecord.root)) {
+        pushError(errors, `${runnerPath}.root`, `Invalid e2e.runners[${name}].root: "${runnerRecord.root}" must not be an absolute path.`);
+      }
+      if (runnerRecord.root.replace(/\\/g, "/").split("/").includes("..")) {
+        pushError(errors, `${runnerPath}.root`, `Invalid e2e.runners[${name}].root: "${runnerRecord.root}" must not contain ".." segments.`);
+      }
+    }
+    if (!Array.isArray(runnerRecord.include) || runnerRecord.include.length === 0) {
+      pushError(errors, `${runnerPath}.include`, `Invalid e2e.runners[${name}].include: must be a non-empty array of glob patterns.`);
+    } else {
+      for (const pattern of runnerRecord.include) {
+        if (typeof pattern !== "string" || !pattern.trim()) {
+          pushError(errors, `${runnerPath}.include`, `Invalid e2e.runners[${name}].include: pattern must be a non-empty string.`);
+        }
+      }
+    }
+    if (runnerRecord.exclude !== void 0) {
+      if (!Array.isArray(runnerRecord.exclude)) {
+        pushError(errors, `${runnerPath}.exclude`, `Invalid e2e.runners[${name}].exclude: must be an array.`);
+      } else {
+        for (const pattern of runnerRecord.exclude) {
+          if (typeof pattern !== "string" || !pattern.trim()) {
+            pushError(errors, `${runnerPath}.exclude`, `Invalid e2e.runners[${name}].exclude: pattern must be a non-empty string.`);
+          }
+        }
+      }
+    }
+    if (runnerRecord.testIgnore !== void 0) {
+      if (!Array.isArray(runnerRecord.testIgnore)) {
+        pushError(errors, `${runnerPath}.testIgnore`, `Invalid e2e.runners[${name}].testIgnore: must be an array.`);
+      } else {
+        for (const pattern of runnerRecord.testIgnore) {
+          if (typeof pattern !== "string" || !pattern.trim()) {
+            pushError(errors, `${runnerPath}.testIgnore`, `Invalid e2e.runners[${name}].testIgnore: pattern must be a non-empty string.`);
+          }
+        }
+      }
+    }
+    if (runnerRecord.kind !== void 0) {
+      if (!["unit", "integration", "e2e"].includes(runnerRecord.kind)) {
+        pushError(errors, `${runnerPath}.kind`, `Invalid e2e.runners[${name}].kind: "${runnerRecord.kind}". Must be unit, integration, or e2e.`);
+      }
+    }
+  });
+}
+function collectAllowedEdgesPresenceError(document, errors) {
+  if (!Object.prototype.hasOwnProperty.call(document, "allowedEdges")) {
+    pushError(errors, "allowedEdges", ALLOWED_EDGES_REQUIRED_MESSAGE);
+  }
+}
+function collectExistingLoaderErrors(document, errors) {
+  collectCustomTypePathErrors(document.types, errors);
+  collectE2eConfigErrors(document.e2e, errors);
+  collectRelationSemanticsErrors(document.relationSemantics, errors);
+  collectStatusViewsErrors(document.statusViews, errors);
+  collectAllowedEdgesPresenceError(document, errors);
+}
+function diagnoseConfigDocument(parsed) {
+  const errors = [];
+  const warnings = [];
+  if (parsed === void 0 || parsed === null) {
+    return { errors, warnings };
+  }
+  if (typeof parsed !== "object" || Array.isArray(parsed)) {
+    errors.push({
+      path: "(root)",
+      message: `Invalid artifact-graph.config.yaml: expected an object, got ${Array.isArray(parsed) ? "array" : typeof parsed}.`,
+      severity: "error"
+    });
+    return { errors, warnings };
+  }
+  const document = parsed;
+  const validate = getShapeValidator();
+  const valid = validate(document);
+  if (!valid) {
+    for (const err of validate.errors ?? []) {
+      const path = instancePathToField(err.instancePath, err.params);
+      errors.push({
+        path,
+        message: `Invalid ${path}: ${err.message ?? "validation error"}`,
+        severity: "error"
+      });
+    }
+  }
+  collectExistingLoaderErrors(document, errors);
+  collectNestedUnknownKeyWarnings(document, warnings);
+  return { errors, warnings };
+}
+async function diagnoseProjectConfig(root) {
+  const configPath = (0, import_node_path2.join)(root, "artifact-graph.config.yaml");
+  let raw;
+  try {
+    raw = await (0, import_promises2.readFile)(configPath, "utf-8");
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return { exists: false, errors: [], warnings: [] };
+    }
+    return {
+      exists: true,
+      errors: [{
+        path: "artifact-graph.config.yaml",
+        message: `Unable to read artifact-graph.config.yaml: ${error.message}`,
+        severity: "error"
+      }],
+      warnings: []
+    };
+  }
+  let document;
+  try {
+    document = import_js_yaml.default.load(raw) ?? {};
+  } catch (error) {
+    return {
+      exists: true,
+      errors: [{
+        path: "artifact-graph.config.yaml",
+        message: `Invalid artifact-graph.config.yaml: ${error.message}`,
+        severity: "error"
+      }],
+      warnings: []
+    };
+  }
+  const diagnosis = diagnoseConfigDocument(document);
+  return { exists: true, errors: diagnosis.errors, warnings: diagnosis.warnings };
+}
+var import_js_yaml, import_ajv, import_promises2, import_node_path2, KNOWN_TOP_LEVEL_KEYS, TYPE_OBJECT_KEYS, EXTRA_FIELD_KEYS, EDGE_RULE_KEYS, CONTEXT_KEYS, ID_RANGE_ENTRY_KEYS, RELATION_SEMANTICS_KEYS, RELATION_PARTIAL_KEYS, E2E_KEYS, WAIVER_KEYS, RUNNER_KEYS, EDGE_RULE_SCHEMA, EXTRA_FIELD_SCHEMA, ID_RANGE_ENTRY_SCHEMA, CONFIG_SHAPE_SCHEMA, _validateConfigShape, ALLOWED_EDGES_REQUIRED_MESSAGE;
+var init_doctor = __esm({
+  "src/doctor.ts"() {
+    "use strict";
+    import_js_yaml = __toESM(require("js-yaml"), 1);
+    import_ajv = __toESM(require("ajv"), 1);
+    import_promises2 = require("fs/promises");
+    import_node_path2 = require("path");
+    init_index();
+    KNOWN_TOP_LEVEL_KEYS = /* @__PURE__ */ new Set([
+      "types",
+      "idPatterns",
+      "relationFields",
+      "allowedEdges",
+      "forbiddenEdges",
+      "statuses",
+      "idRanges",
+      "relationSemantics",
+      "statusViews",
+      "context",
+      "e2e"
+    ]);
+    TYPE_OBJECT_KEYS = /* @__PURE__ */ new Set([
+      "paths",
+      "idPattern",
+      "displayName",
+      "role",
+      "layer",
+      "aliases",
+      "target",
+      "extraFields",
+      "format",
+      "idField"
+    ]);
+    EXTRA_FIELD_KEYS = /* @__PURE__ */ new Set(["name", "type", "enum"]);
+    EDGE_RULE_KEYS = /* @__PURE__ */ new Set(["from", "to", "kind"]);
+    CONTEXT_KEYS = /* @__PURE__ */ new Set(["universal_baseline"]);
+    ID_RANGE_ENTRY_KEYS = /* @__PURE__ */ new Set(["prefix", "start", "end"]);
+    RELATION_SEMANTICS_KEYS = /* @__PURE__ */ new Set(["label", "targetTypes", "fields", "partial"]);
+    RELATION_PARTIAL_KEYS = /* @__PURE__ */ new Set(["sectionField"]);
+    E2E_KEYS = /* @__PURE__ */ new Set([
+      "executable_ref_warning",
+      "executable_ref_error",
+      "report_uncovered_scenarios",
+      "report_uncovered_features",
+      "scenario_waivers",
+      "feature_waivers",
+      "runners"
+    ]);
+    WAIVER_KEYS = /* @__PURE__ */ new Set(["id", "reason"]);
+    RUNNER_KEYS = /* @__PURE__ */ new Set(["name", "kind", "root", "include", "exclude", "testIgnore"]);
+    EDGE_RULE_SCHEMA = {
+      type: "object",
+      additionalProperties: true,
+      required: ["from", "to", "kind"],
+      properties: {
+        from: { type: "string", minLength: 1 },
+        to: { type: "string", minLength: 1 },
+        kind: { type: "string", minLength: 1 }
+      }
+    };
+    EXTRA_FIELD_SCHEMA = {
+      type: "object",
+      additionalProperties: true,
+      required: ["name", "type"],
+      properties: {
+        name: { type: "string", minLength: 1 },
+        type: { type: "string", enum: ["string", "number", "boolean", "enum"] },
+        enum: {
+          type: "array",
+          items: {
+            anyOf: [
+              { type: "string" },
+              { type: "number" },
+              { type: "boolean" }
+            ]
+          }
+        }
+      }
+    };
+    ID_RANGE_ENTRY_SCHEMA = {
+      type: "object",
+      additionalProperties: true,
+      required: ["prefix", "start", "end"],
+      properties: {
+        prefix: { type: "string" },
+        start: { type: "number" },
+        end: { type: "number" }
+      }
+    };
+    CONFIG_SHAPE_SCHEMA = {
+      type: "object",
+      additionalProperties: true,
+      properties: {
+        statuses: { type: "array", items: { type: "string" } },
+        allowedEdges: {
+          anyOf: [
+            { type: "null" },
+            { type: "array", items: EDGE_RULE_SCHEMA }
+          ]
+        },
+        forbiddenEdges: { type: "array", items: EDGE_RULE_SCHEMA },
+        idPatterns: {
+          type: "object",
+          additionalProperties: { type: "string" }
+        },
+        relationFields: {
+          type: "object",
+          additionalProperties: { type: "array", items: { type: "string" } }
+        },
+        context: {
+          type: "object",
+          additionalProperties: true,
+          properties: {
+            universal_baseline: { type: "boolean" }
+          }
+        },
+        idRanges: {
+          type: "object",
+          additionalProperties: {
+            type: "object",
+            additionalProperties: ID_RANGE_ENTRY_SCHEMA
+          }
+        },
+        types: {
+          type: "object",
+          additionalProperties: {
+            type: "object",
+            additionalProperties: true,
+            properties: {
+              paths: { type: "array", items: { type: "string" } },
+              idPattern: { type: "string" },
+              displayName: { type: "string" },
+              role: { type: "string" },
+              layer: { type: "string" },
+              aliases: { type: "array", items: { type: "string" } },
+              target: { type: "boolean" },
+              extraFields: { type: "array", items: EXTRA_FIELD_SCHEMA }
+            }
+          }
+        }
+      }
+    };
+    ALLOWED_EDGES_REQUIRED_MESSAGE = "Invalid allowedEdges: field is required. Use allowedEdges: [] or allowedEdges: null to adopt the built-in DEFAULT_SCHEMA.allowedEdges, or list explicit {from, to, kind} triples as a strict whitelist that replaces the default table.";
+  }
+});
+
 // src/target-selector.ts
 function parseTargetSelector(value) {
   const separator = value.indexOf(":");
@@ -662,7 +1161,7 @@ async function auditVersionLock(root, lockPath = VERSION_LOCK_PATH, graph, confi
   for (const entry of lock.locks) {
     if (entry.kind !== "verifies") continue;
     const sourcePath = entry.source.path;
-    const fullSourcePath = (0, import_node_path2.join)(root, sourcePath);
+    const fullSourcePath = (0, import_node_path3.join)(root, sourcePath);
     if (!(0, import_node_fs.existsSync)(fullSourcePath)) continue;
     let liveness = livenessCache.get(sourcePath);
     if (liveness === void 0) {
@@ -757,14 +1256,14 @@ async function auditVersionLock(root, lockPath = VERSION_LOCK_PATH, graph, confi
         currentArtifactHash: targetNode.contentHash
       });
     }
-    if (!(0, import_node_fs.existsSync)((0, import_node_path2.join)(root, sourceNode.path))) {
+    if (!(0, import_node_fs.existsSync)((0, import_node_path3.join)(root, sourceNode.path))) {
       entryIssues.push({
         status: "orphan_lock",
         edgeId: relEdgeId,
         message: `Artifact relation source file ${sourceNode.path} no longer exists`
       });
     }
-    if (!(0, import_node_fs.existsSync)((0, import_node_path2.join)(root, targetNode.path))) {
+    if (!(0, import_node_fs.existsSync)((0, import_node_path3.join)(root, targetNode.path))) {
       entryIssues.push({
         status: "orphan_lock",
         edgeId: relEdgeId,
@@ -1371,7 +1870,7 @@ function renderTraceVersionMarkdown(result) {
 async function readVersionLock(root, lockPath) {
   const safeLockPath = normalizeRelativePath(root, lockPath);
   try {
-    const raw = await (0, import_promises2.readFile)((0, import_node_path2.join)(root, safeLockPath), "utf-8");
+    const raw = await (0, import_promises3.readFile)((0, import_node_path3.join)(root, safeLockPath), "utf-8");
     let parsed;
     try {
       parsed = JSON.parse(raw);
@@ -1530,9 +2029,9 @@ function requireSafeRelativePath(value, path) {
 }
 async function writeVersionLock(root, lockPath, lock) {
   const safeLockPath = normalizeRelativePath(root, lockPath);
-  const fullPath = (0, import_node_path2.join)(root, safeLockPath);
-  await (0, import_promises2.mkdir)((0, import_node_path2.dirname)(fullPath), { recursive: true });
-  await (0, import_promises2.writeFile)(fullPath, `${JSON.stringify(lock, null, 2)}
+  const fullPath = (0, import_node_path3.join)(root, safeLockPath);
+  await (0, import_promises3.mkdir)((0, import_node_path3.dirname)(fullPath), { recursive: true });
+  await (0, import_promises3.writeFile)(fullPath, `${JSON.stringify(lock, null, 2)}
 `);
 }
 function implementationEdges(index) {
@@ -1713,14 +2212,14 @@ async function hashRelativePath(root, path, cache) {
   const normalized = normalizeRelativePath(root, path);
   const cached = cache.get(normalized);
   if (cached) return cached;
-  const content = await (0, import_promises2.readFile)((0, import_node_path2.join)(root, normalized));
+  const content = await (0, import_promises3.readFile)((0, import_node_path3.join)(root, normalized));
   const hash = `sha256:${(0, import_node_crypto.createHash)("sha256").update(content).digest("hex")}`;
   cache.set(normalized, hash);
   return hash;
 }
 function normalizeRelativePath(root, path) {
   const normalized = path.replace(/\\/g, "/");
-  const relativePath = normalized.startsWith("/") ? (0, import_node_path2.relative)(root, normalized).replace(/\\/g, "/") : normalized.replace(/^\.\//, "");
+  const relativePath = normalized.startsWith("/") ? (0, import_node_path3.relative)(root, normalized).replace(/\\/g, "/") : normalized.replace(/^\.\//, "");
   if (relativePath === ".." || relativePath.startsWith("../")) {
     throw new Error(`Path is outside root: ${path}`);
   }
@@ -1736,10 +2235,10 @@ async function getTestFileRunnerLiveness(root, filePath, config) {
     if (!/e2e/i.test(filePath) && !/\.e2e\./i.test(filePath)) {
       return "active";
     }
-    const fullSourcePath = (0, import_node_path2.join)(root, filePath);
+    const fullSourcePath = (0, import_node_path3.join)(root, filePath);
     if (!(0, import_node_fs.existsSync)(fullSourcePath)) return "inactive";
     try {
-      const content = await (0, import_promises2.readFile)(fullSourcePath, "utf-8");
+      const content = await (0, import_promises3.readFile)(fullSourcePath, "utf-8");
       return /\/\/!?\s*@(?:e2e_test|tc)\s+/.test(content) ? "active" : "inactive";
     } catch {
       return "inactive";
@@ -1779,14 +2278,14 @@ async function isFileActiveInRunner(root, filePath, runner) {
 function sortUnique2(items) {
   return [...new Set(items)].sort((left, right) => left.localeCompare(right));
 }
-var import_node_crypto, import_node_fs, import_promises2, import_node_path2, VERSION_LOCK_PATH, VERSION_INDEX_SCHEMA_VERSION, VERSION_LOCK_SCHEMA_VERSION, LIVENESS_MESSAGE_PREFIX, VERSION_LOCK_STATUS_LABELS;
+var import_node_crypto, import_node_fs, import_promises3, import_node_path3, VERSION_LOCK_PATH, VERSION_INDEX_SCHEMA_VERSION, VERSION_LOCK_SCHEMA_VERSION, LIVENESS_MESSAGE_PREFIX, VERSION_LOCK_STATUS_LABELS;
 var init_versioned_traceability = __esm({
   "src/versioned-traceability.ts"() {
     "use strict";
     import_node_crypto = require("crypto");
     import_node_fs = require("fs");
-    import_promises2 = require("fs/promises");
-    import_node_path2 = require("path");
+    import_promises3 = require("fs/promises");
+    import_node_path3 = require("path");
     init_index();
     init_glob_matcher();
     VERSION_LOCK_PATH = "artifacts/traceability-version-lock.json";
@@ -1807,7 +2306,7 @@ var init_versioned_traceability = __esm({
 
 // src/impact.ts
 async function computeImpact(root, options = {}) {
-  const absoluteRoot = (0, import_node_path3.resolve)(root);
+  const absoluteRoot = (0, import_node_path4.resolve)(root);
   const mode = options.mode ?? "worktree";
   if (mode === "base" && !options.base) throw new Error("Impact mode base requires a base ref.");
   if (mode === "paths" && !options.paths) throw new Error("Impact mode paths requires paths.");
@@ -1879,8 +2378,8 @@ function normalizeExplicitPaths(root, paths) {
   const normalized = paths.map((input) => {
     const value = input.trim();
     if (!value) return "";
-    const absolutePath = (0, import_node_path3.isAbsolute)(value) ? (0, import_node_path3.normalize)(value) : (0, import_node_path3.resolve)(root, value);
-    const projectRelative = (0, import_node_path3.relative)(root, absolutePath);
+    const absolutePath = (0, import_node_path4.isAbsolute)(value) ? (0, import_node_path4.normalize)(value) : (0, import_node_path4.resolve)(root, value);
+    const projectRelative = (0, import_node_path4.relative)(root, absolutePath);
     const result = projectRelative.replace(/\\/g, "/").replace(/^\.\//, "");
     if (result === ".." || result.startsWith("../") || result.startsWith("/")) {
       throw new Error(`Impact path is outside project root: ${input}`);
@@ -1905,11 +2404,11 @@ function toEdgeRef(candidate) {
     ...candidate.attrs ? { attrs: candidate.attrs } : {}
   };
 }
-var import_node_path3;
+var import_node_path4;
 var init_impact = __esm({
   "src/impact.ts"() {
     "use strict";
-    import_node_path3 = require("path");
+    import_node_path4 = require("path");
     init_index();
     init_git_changes();
     init_versioned_traceability();
@@ -1918,7 +2417,7 @@ var init_impact = __esm({
 
 // src/coverage.ts
 async function computeCoverageBoundary(root, opts = {}) {
-  const absoluteRoot = (0, import_node_path4.resolve)(root);
+  const absoluteRoot = (0, import_node_path5.resolve)(root);
   const schema = opts.schema ?? await loadConfig(absoluteRoot);
   const graph = await scanArtifacts(absoluteRoot, schema);
   const issues = validateGraph(graph, schema);
@@ -2020,11 +2519,11 @@ function renderCoverageBoundaryMarkdown(report) {
 function normalizeInputList(input) {
   return [...new Set(input.map((item) => item.trim().replace(/\\/g, "/").replace(/^\.\//, "")).filter(Boolean))].sort((left, right) => left.localeCompare(right));
 }
-var import_node_path4;
+var import_node_path5;
 var init_coverage = __esm({
   "src/coverage.ts"() {
     "use strict";
-    import_node_path4 = require("path");
+    import_node_path5 = require("path");
     init_index();
     init_impact();
     init_versioned_traceability();
@@ -2590,14 +3089,14 @@ async function auditSingleTarget(target, graph, options) {
       const fmt = options.format ?? "markdown";
       const ext = fmt === "json" ? "json" : "md";
       const filename = `${target.type}-${target.id}.packet.${ext}`;
-      const outPath = (0, import_node_path5.join)(options.outDir, filename);
+      const outPath = (0, import_node_path6.join)(options.outDir, filename);
       let content;
       if (fmt === "json") {
         content = JSON.stringify(packet, null, 2) + "\n";
       } else {
         content = renderPacketMarkdown(packet);
       }
-      await (0, import_promises3.writeFile)(outPath, content, "utf-8");
+      await (0, import_promises4.writeFile)(outPath, content, "utf-8");
       entry.outputPath = outPath;
     }
   } catch (error) {
@@ -2618,7 +3117,7 @@ async function auditPackets(root, targets, options, graph) {
     }
   }
   if (options.outDir) {
-    await (0, import_promises3.mkdir)(options.outDir, { recursive: true });
+    await (0, import_promises4.mkdir)(options.outDir, { recursive: true });
   }
   const sampleSet = options.sampleTargets ? new Set(options.sampleTargets) : null;
   const sampleOutputPaths = [];
@@ -2670,8 +3169,8 @@ async function auditPackets(root, targets, options, graph) {
     ...isCompact ? { summaryDetail: "compact", countsByType } : {}
   };
   if (options.outDir) {
-    const summaryPath = (0, import_node_path5.join)(options.outDir, "summary.json");
-    await (0, import_promises3.writeFile)(summaryPath, JSON.stringify(summary, null, 2) + "\n", "utf-8");
+    const summaryPath = (0, import_node_path6.join)(options.outDir, "summary.json");
+    await (0, import_promises4.writeFile)(summaryPath, JSON.stringify(summary, null, 2) + "\n", "utf-8");
   }
   return summary;
 }
@@ -2697,14 +3196,14 @@ async function discoverAndAuditPackets(root, options) {
     universalBaseline: effectiveBaseline
   }, graph);
 }
-var import_promises3, import_node_path5, VALID_TYPES, VALID_TYPES_LABEL;
+var import_promises4, import_node_path6, VALID_TYPES, VALID_TYPES_LABEL;
 var init_packet_audit = __esm({
   "src/packet-audit.ts"() {
     "use strict";
     init_index();
     init_packet_validator();
-    import_promises3 = require("fs/promises");
-    import_node_path5 = require("path");
+    import_promises4 = require("fs/promises");
+    import_node_path6 = require("path");
     VALID_TYPES = new Set(VALID_PACKET_TARGET_TYPES);
     VALID_TYPES_LABEL = VALID_PACKET_TARGET_TYPES.join(", ");
   }
@@ -3178,10 +3677,10 @@ function buildNativeBindingSuccessDiagnostic(probeContext) {
   };
 }
 function findPackageRoot(anchorFile) {
-  let dir = (0, import_node_path6.dirname)(anchorFile);
+  let dir = (0, import_node_path7.dirname)(anchorFile);
   for (; ; ) {
-    if ((0, import_node_fs2.existsSync)((0, import_node_path6.join)(dir, "package.json"))) return dir;
-    const parent = (0, import_node_path6.dirname)(dir);
+    if ((0, import_node_fs2.existsSync)((0, import_node_path7.join)(dir, "package.json"))) return dir;
+    const parent = (0, import_node_path7.dirname)(dir);
     if (parent === dir) return void 0;
     dir = parent;
   }
@@ -3197,9 +3696,9 @@ function abiPrebuiltHint(detail) {
   return match ? `\uFF1Bprebuilt \u76EE\u6807 NODE_MODULE_VERSION=${match[1]}` : "";
 }
 function betterSqlite3PackagePresent(root) {
-  const direct = (0, import_node_path6.join)(root, "node_modules", "better-sqlite3", "package.json");
+  const direct = (0, import_node_path7.join)(root, "node_modules", "better-sqlite3", "package.json");
   if ((0, import_node_fs2.existsSync)(direct)) return true;
-  const pnpmDir = (0, import_node_path6.join)(root, "node_modules", ".pnpm");
+  const pnpmDir = (0, import_node_path7.join)(root, "node_modules", ".pnpm");
   let entries;
   try {
     entries = (0, import_node_fs2.readdirSync)(pnpmDir);
@@ -3208,16 +3707,16 @@ function betterSqlite3PackagePresent(root) {
   }
   return entries.some((entry) => {
     if (!entry.startsWith("better-sqlite3@")) return false;
-    return (0, import_node_fs2.existsSync)((0, import_node_path6.join)(pnpmDir, entry, "node_modules", "better-sqlite3", "package.json"));
+    return (0, import_node_fs2.existsSync)((0, import_node_path7.join)(pnpmDir, entry, "node_modules", "better-sqlite3", "package.json"));
   });
 }
-var import_node_fs2, import_node_module, import_node_path6, import_node_url, import_meta, PNPM_ALLOW_BUILDS_SNIPPET;
+var import_node_fs2, import_node_module, import_node_path7, import_node_url, import_meta, PNPM_ALLOW_BUILDS_SNIPPET;
 var init_native_binding_diagnostics = __esm({
   "src/native-binding-diagnostics.ts"() {
     "use strict";
     import_node_fs2 = require("fs");
     import_node_module = require("module");
-    import_node_path6 = require("path");
+    import_node_path7 = require("path");
     import_node_url = require("url");
     import_meta = {};
     PNPM_ALLOW_BUILDS_SNIPPET = "pnpm-workspace.yaml:\nallowBuilds:\n  better-sqlite3: true";
@@ -3231,7 +3730,7 @@ async function resolveArtifactGraphCli(root, options = {}) {
   const candidates = [
     {
       source: "node_modules",
-      path: (0, import_node_path7.join)(root, "node_modules/.bin/artifact-graph"),
+      path: (0, import_node_path8.join)(root, "node_modules/.bin/artifact-graph"),
       exists: false
     },
     {
@@ -3264,8 +3763,8 @@ async function resolveArtifactGraphCli(root, options = {}) {
 }
 async function doctorArtifactChain(root, options = {}) {
   const cli = await resolveArtifactGraphCli(root, options);
-  const configPath = (0, import_node_path7.join)(root, "artifact-graph.config.yaml");
-  const lockPath = (0, import_node_path7.join)(root, VERSION_LOCK_PATH);
+  const configPath = (0, import_node_path8.join)(root, "artifact-graph.config.yaml");
+  const lockPath = (0, import_node_path8.join)(root, VERSION_LOCK_PATH);
   const supportedCommands = cli.path ? await detectSupportedCommands(cli.path) : [];
   const nodeCompatible = isNodeCompatible(process.versions.node);
   const pnpmVersion = await detectPnpmVersion();
@@ -3285,12 +3784,28 @@ async function doctorArtifactChain(root, options = {}) {
     probedFrom
   };
   const nativeBinding = probe.ok ? { ok: true, ...buildNativeBindingSuccessDiagnostic(probeContext) } : { ok: false, ...buildNativeBindingDiagnostic(probe, probeContext) };
+  const configDiagnosis = await diagnoseProjectConfig(root);
+  const configShapeMessages = [
+    ...configDiagnosis.errors.map((item) => item.message),
+    ...configDiagnosis.warnings.map((item) => item.message)
+  ];
+  const loadConfigMessages = [];
+  if (configDiagnosis.exists && configDiagnosis.errors.length === 0) {
+    try {
+      const { loadConfig: loadConfig2 } = await Promise.resolve().then(() => (init_index(), index_exports));
+      await loadConfig2(root);
+    } catch (error) {
+      loadConfigMessages.push(error.message);
+    }
+  }
   const warnings = [
     ...cli.warnings,
     ...nodeCompatible ? [] : [`Node.js ${process.versions.node} does not satisfy ${REQUIRED_NODE_VERSION}.`],
     ...probe.ok ? [] : [
       `better-sqlite3 binding probe FAILED at stage "${probe.failedStage}" (cause ${probe.cause}): ${probe.suggestion}`
-    ]
+    ],
+    ...configShapeMessages,
+    ...loadConfigMessages
   ];
   return {
     schemaVersion: "1.0",
@@ -3384,7 +3899,7 @@ ${maybe.stderr ?? ""}`;
 }
 async function pathExists(path) {
   try {
-    await (0, import_promises4.access)(path, import_node_fs3.constants.R_OK);
+    await (0, import_promises5.access)(path, import_node_fs3.constants.R_OK);
     return true;
   } catch {
     return false;
@@ -3400,7 +3915,7 @@ async function findCommandOnPath(command) {
   }
 }
 function resolveCandidatePath(root, candidatePath) {
-  return (0, import_node_path7.isAbsolute)(candidatePath) ? candidatePath : (0, import_node_path7.resolve)(root, candidatePath);
+  return (0, import_node_path8.isAbsolute)(candidatePath) ? candidatePath : (0, import_node_path8.resolve)(root, candidatePath);
 }
 function isNodeCompatible(version) {
   const match = /^(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.-]+)?$/.exec(version);
@@ -3442,7 +3957,7 @@ function bindingInstallRoot(cli, _root) {
 }
 function resolveCliInstallAnchor(cliPath) {
   const real = safeRealpath(cliPath);
-  if ((0, import_node_path7.basename)((0, import_node_path7.dirname)(real)) !== ".bin") return real;
+  if ((0, import_node_path8.basename)((0, import_node_path8.dirname)(real)) !== ".bin") return real;
   const shimTarget = readBinShimTarget(real);
   return shimTarget ? safeRealpath(shimTarget) : real;
 }
@@ -3456,7 +3971,7 @@ function readBinShimTarget(shimPath) {
   if (!content.startsWith("#!")) return void 0;
   const match = /\$basedir\/(\.\.(?:\/[^"'\s]+)+\.js)/.exec(content);
   if (!match) return void 0;
-  return (0, import_node_path7.resolve)((0, import_node_path7.dirname)(shimPath), match[1]);
+  return (0, import_node_path8.resolve)((0, import_node_path8.dirname)(shimPath), match[1]);
 }
 function safeRealpath(path) {
   try {
@@ -3465,16 +3980,17 @@ function safeRealpath(path) {
     return path;
   }
 }
-var import_node_child_process2, import_node_fs3, import_promises4, import_node_path7, import_node_util2, execFileAsync2, REQUIRED_NODE_VERSION, KNOWN_COMMANDS;
+var import_node_child_process2, import_node_fs3, import_promises5, import_node_path8, import_node_util2, execFileAsync2, REQUIRED_NODE_VERSION, KNOWN_COMMANDS;
 var init_cli_resolver = __esm({
   "src/cli-resolver.ts"() {
     "use strict";
     import_node_child_process2 = require("child_process");
     import_node_fs3 = require("fs");
-    import_promises4 = require("fs/promises");
-    import_node_path7 = require("path");
+    import_promises5 = require("fs/promises");
+    import_node_path8 = require("path");
     import_node_util2 = require("util");
     init_versioned_traceability();
+    init_doctor();
     init_native_binding_diagnostics();
     execFileAsync2 = (0, import_node_util2.promisify)(import_node_child_process2.execFile);
     REQUIRED_NODE_VERSION = ">=22.22.2 <23";
@@ -3515,14 +4031,14 @@ async function resolveGitHookPath(root, hookName) {
   ]);
   const value = stdout.trim();
   if (!value) throw new Error(`Git returned an empty hook path for ${hookName}`);
-  return (0, import_node_path8.isAbsolute)(value) ? (0, import_node_path8.resolve)(value) : (0, import_node_path8.resolve)(root, value);
+  return (0, import_node_path9.isAbsolute)(value) ? (0, import_node_path9.resolve)(value) : (0, import_node_path9.resolve)(root, value);
 }
-var import_node_child_process3, import_node_path8, import_node_util3, execFileAsync3;
+var import_node_child_process3, import_node_path9, import_node_util3, execFileAsync3;
 var init_git_hook_path = __esm({
   "src/git-hook-path.ts"() {
     "use strict";
     import_node_child_process3 = require("child_process");
-    import_node_path8 = require("path");
+    import_node_path9 = require("path");
     import_node_util3 = require("util");
     execFileAsync3 = (0, import_node_util3.promisify)(import_node_child_process3.execFile);
   }
@@ -3745,7 +4261,7 @@ async function readHookSnapshot(hookPath) {
   for (let attempt = 0; attempt < 3; attempt += 1) {
     let metadata;
     try {
-      metadata = await (0, import_promises5.lstat)(hookPath, { bigint: true });
+      metadata = await (0, import_promises6.lstat)(hookPath, { bigint: true });
     } catch (error) {
       if (error.code === "ENOENT") {
         return { kind: "missing", bytes: Buffer.alloc(0) };
@@ -3761,7 +4277,7 @@ async function readHookSnapshot(hookPath) {
         size: metadata.size,
         mtimeNs: metadata.mtimeNs,
         mode: metadata.mode,
-        linkTarget: await (0, import_promises5.readlink)(hookPath)
+        linkTarget: await (0, import_promises6.readlink)(hookPath)
       };
     }
     if (!metadata.isFile()) {
@@ -3777,7 +4293,7 @@ async function readHookSnapshot(hookPath) {
     }
     let handle;
     try {
-      handle = await (0, import_promises5.open)(hookPath, import_node_fs4.constants.O_RDONLY | (import_node_fs4.constants.O_NOFOLLOW ?? 0));
+      handle = await (0, import_promises6.open)(hookPath, import_node_fs4.constants.O_RDONLY | (import_node_fs4.constants.O_NOFOLLOW ?? 0));
       const opened = await handle.stat({ bigint: true });
       if (opened.dev !== metadata.dev || opened.ino !== metadata.ino) {
         await handle.close();
@@ -3835,15 +4351,15 @@ async function removeHookAtomically(hookPath, snapshot) {
     throw new ConcurrentHookModificationError(hookPath);
   }
   if (current.kind !== "missing") {
-    await (0, import_promises5.unlink)(hookPath);
+    await (0, import_promises6.unlink)(hookPath);
   }
 }
 async function writeHookAtomically(hookPath, content, snapshot, mode) {
-  await (0, import_promises5.mkdir)((0, import_node_path9.dirname)(hookPath), { recursive: true });
-  const temporaryPath = (0, import_node_path9.join)((0, import_node_path9.dirname)(hookPath), `.${(0, import_node_path9.basename)(hookPath)}.${(0, import_node_crypto2.randomUUID)()}.tmp`);
+  await (0, import_promises6.mkdir)((0, import_node_path10.dirname)(hookPath), { recursive: true });
+  const temporaryPath = (0, import_node_path10.join)((0, import_node_path10.dirname)(hookPath), `.${(0, import_node_path10.basename)(hookPath)}.${(0, import_node_crypto2.randomUUID)()}.tmp`);
   let temporaryExists = false;
   try {
-    const temporary = await (0, import_promises5.open)(temporaryPath, "wx", mode);
+    const temporary = await (0, import_promises6.open)(temporaryPath, "wx", mode);
     temporaryExists = true;
     try {
       await temporary.writeFile(content);
@@ -3856,11 +4372,11 @@ async function writeHookAtomically(hookPath, content, snapshot, mode) {
     if (!sameHookSnapshot(snapshot, current)) {
       throw new ConcurrentHookModificationError(hookPath);
     }
-    await (0, import_promises5.rename)(temporaryPath, hookPath);
+    await (0, import_promises6.rename)(temporaryPath, hookPath);
     temporaryExists = false;
   } finally {
     if (temporaryExists) {
-      await (0, import_promises5.unlink)(temporaryPath).catch((error) => {
+      await (0, import_promises6.unlink)(temporaryPath).catch((error) => {
         if (error.code !== "ENOENT") {
           throw error;
         }
@@ -3886,14 +4402,14 @@ function findManagedRange(content, begin, end) {
     end: endLine < 0 ? content.length : endLine + 1
   };
 }
-var import_node_fs4, import_node_crypto2, import_promises5, import_node_path9, DEFAULT_MARKER_ID, MANAGED_STATE_PREFIX, UnsupportedHookInterpreterError, SymlinkHookUnsupportedError, UnsupportedHookTypeError, InvalidManagedHookStateError, ConcurrentHookModificationError, HookTransactionRollbackError;
+var import_node_fs4, import_node_crypto2, import_promises6, import_node_path10, DEFAULT_MARKER_ID, MANAGED_STATE_PREFIX, UnsupportedHookInterpreterError, SymlinkHookUnsupportedError, UnsupportedHookTypeError, InvalidManagedHookStateError, ConcurrentHookModificationError, HookTransactionRollbackError;
 var init_hook_installer = __esm({
   "src/hook-installer.ts"() {
     "use strict";
     import_node_fs4 = require("fs");
     import_node_crypto2 = require("crypto");
-    import_promises5 = require("fs/promises");
-    import_node_path9 = require("path");
+    import_promises6 = require("fs/promises");
+    import_node_path10 = require("path");
     DEFAULT_MARKER_ID = "artifact-chain-assistant";
     MANAGED_STATE_PREFIX = "# artifact-chain-assistant managed state v1:";
     UnsupportedHookInterpreterError = class extends Error {
@@ -3985,9 +4501,9 @@ function harnessKind(error) {
   return typeof details?.kind === "string" ? details.kind : void 0;
 }
 async function missingRequiredConfig(root) {
-  const configPath = (0, import_node_path10.join)(root, "artifact-graph.config.yaml");
+  const configPath = (0, import_node_path11.join)(root, "artifact-graph.config.yaml");
   try {
-    await (0, import_promises6.access)(configPath);
+    await (0, import_promises7.access)(configPath);
     return void 0;
   } catch (error) {
     if (error.code === "ENOENT") {
@@ -4105,7 +4621,7 @@ function buildLimitations(checks) {
   return [...new Set(limitations)];
 }
 function buildConclusion(root, checks) {
-  const absoluteRoot = (0, import_node_path10.resolve)(root);
+  const absoluteRoot = (0, import_node_path11.resolve)(root);
   const mapped = mapDomain(checks);
   const checked = checks.filter((check) => check.status === "completed").map((check) => check.name);
   const limitations = buildLimitations(checks);
@@ -4158,11 +4674,11 @@ async function assertConclusionShape(conclusion) {
   }
 }
 async function publishConclusion(absoluteOutput, conclusion) {
-  if (!(0, import_node_path10.isAbsolute)(absoluteOutput)) {
+  if (!(0, import_node_path11.isAbsolute)(absoluteOutput)) {
     return "--conclusion-output must be an absolute path";
   }
-  const outputRoot = (0, import_node_path10.dirname)(absoluteOutput);
-  const relPath = (0, import_node_path10.basename)(absoluteOutput);
+  const outputRoot = (0, import_node_path11.dirname)(absoluteOutput);
+  const relPath = (0, import_node_path11.basename)(absoluteOutput);
   if (relPath.length === 0 || relPath === "." || relPath === "..") {
     return "--conclusion-output must name a file";
   }
@@ -4180,7 +4696,7 @@ async function publishConclusion(absoluteOutput, conclusion) {
   }
 }
 async function runCheckProfessional(options) {
-  const root = (0, import_node_path10.resolve)(options.root);
+  const root = (0, import_node_path11.resolve)(options.root);
   const configGap = await missingRequiredConfig(root);
   const checks = configGap === void 0 ? await Promise.all([
     settleCheck(CHECK_VALIDATE, () => runValidate(root)),
@@ -4196,10 +4712,10 @@ async function runCheckProfessional(options) {
   if (options.conclusionOutput === void 0) {
     return { conclusion };
   }
-  if (!(0, import_node_path10.isAbsolute)(options.conclusionOutput)) {
+  if (!(0, import_node_path11.isAbsolute)(options.conclusionOutput)) {
     return { conclusion, writeError: "--conclusion-output must be an absolute path" };
   }
-  const writeError = await publishConclusion((0, import_node_path10.resolve)(options.conclusionOutput), conclusion);
+  const writeError = await publishConclusion((0, import_node_path11.resolve)(options.conclusionOutput), conclusion);
   return { conclusion, ...writeError ? { writeError } : {} };
 }
 function asRecord(value) {
@@ -4302,13 +4818,13 @@ async function runReadProof(options) {
   const exitCode = interpreted.status === "pass" ? 0 : interpreted.status === "not_pass" ? 1 : 2;
   return { result: interpreted, exitCode };
 }
-var import_promises6, import_node_module2, import_node_path10, import_node_url2, import_meta2, GRAPH_PROVIDER_ID, GRAPH_PROVIDER_ENTRY, PROFESSIONAL_CONCLUSION_OBJECT, GRAPH_DOMAIN_CODES, KNOWN_DOMAIN_CODES, CHECK_VALIDATE, CHECK_LOCK, CHECK_COVERAGE, STANDING_LIMITATION, CONTRACTS_PACKAGE_NAME;
+var import_promises7, import_node_module2, import_node_path11, import_node_url2, import_meta2, GRAPH_PROVIDER_ID, GRAPH_PROVIDER_ENTRY, PROFESSIONAL_CONCLUSION_OBJECT, GRAPH_DOMAIN_CODES, KNOWN_DOMAIN_CODES, CHECK_VALIDATE, CHECK_LOCK, CHECK_COVERAGE, STANDING_LIMITATION, CONTRACTS_PACKAGE_NAME;
 var init_professional_conclusion = __esm({
   "src/professional-conclusion.ts"() {
     "use strict";
-    import_promises6 = require("fs/promises");
+    import_promises7 = require("fs/promises");
     import_node_module2 = require("module");
-    import_node_path10 = require("path");
+    import_node_path11 = require("path");
     import_node_url2 = require("url");
     init_coverage();
     init_index();
@@ -4933,7 +5449,7 @@ function validatePolicyCompatibility(policy, baseContract) {
   };
 }
 async function loadContract(contractPath, options) {
-  const rawContent = await (0, import_promises7.readFile)(contractPath, "utf-8");
+  const rawContent = await (0, import_promises8.readFile)(contractPath, "utf-8");
   let schema;
   try {
     schema = JSON.parse(rawContent);
@@ -4981,10 +5497,10 @@ async function loadContract(contractPath, options) {
 }
 async function loadContractsFromDirectory(contractsDir, options) {
   const contracts = [];
-  const entries = await (0, import_promises7.readdir)(contractsDir, { withFileTypes: true });
+  const entries = await (0, import_promises8.readdir)(contractsDir, { withFileTypes: true });
   for (const entry of entries) {
     if (entry.isDirectory()) {
-      const schemaPath = (0, import_node_path11.join)(contractsDir, entry.name, "schema.json");
+      const schemaPath = (0, import_node_path12.join)(contractsDir, entry.name, "schema.json");
       const contract = await loadContract(schemaPath, options);
       contracts.push(contract);
     }
@@ -4994,7 +5510,7 @@ async function loadContractsFromDirectory(contractsDir, options) {
 function getValidator(schema) {
   const key = `${schema.$id || "default"}#${computeRevisionDigest(JSON.stringify(schema))}`;
   if (!_validatorCache.has(key)) {
-    const AjvCtor = import_ajv.default;
+    const AjvCtor = import_ajv2.default;
     const ajv = new AjvCtor({ allErrors: true, strict: false });
     _validatorCache.set(key, ajv.compile(schema));
   }
@@ -5099,14 +5615,14 @@ async function loadContractCatalog(contractsDir, options) {
   }
   return catalog;
 }
-var import_node_crypto3, import_promises7, import_node_path11, import_ajv, CONTRACT_ERROR_CODES, ContractError, OFFICIAL_AUTHORITY, OFFICIAL_NAMESPACE_PATTERN, ContractRegistry, _validatorCache, E2E_NORMALIZER_CONFIG, ContractCatalog;
+var import_node_crypto3, import_promises8, import_node_path12, import_ajv2, CONTRACT_ERROR_CODES, ContractError, OFFICIAL_AUTHORITY, OFFICIAL_NAMESPACE_PATTERN, ContractRegistry, _validatorCache, E2E_NORMALIZER_CONFIG, ContractCatalog;
 var init_contract_kernel = __esm({
   "src/contract-kernel.ts"() {
     "use strict";
     import_node_crypto3 = require("crypto");
-    import_promises7 = require("fs/promises");
-    import_node_path11 = require("path");
-    import_ajv = __toESM(require("ajv"), 1);
+    import_promises8 = require("fs/promises");
+    import_node_path12 = require("path");
+    import_ajv2 = __toESM(require("ajv"), 1);
     CONTRACT_ERROR_CODES = {
       /** Contract identity not found */
       CONTRACT_NOT_FOUND: "CONTRACT_NOT_FOUND",
@@ -5588,13 +6104,13 @@ function rawDigest(value, path) {
 async function resolveRealRoot(root) {
   let canonical;
   try {
-    canonical = await (0, import_promises8.realpath)((0, import_node_path12.resolve)(root));
+    canonical = await (0, import_promises9.realpath)((0, import_node_path13.resolve)(root));
   } catch (cause) {
     return failure("ROOT_INVALID", `Project root cannot be resolved: ${cause.message}`);
   }
   let info;
   try {
-    info = await (0, import_promises8.lstat)(canonical);
+    info = await (0, import_promises9.lstat)(canonical);
   } catch (cause) {
     return failure("ROOT_INVALID", `Project root cannot be inspected: ${cause.message}`);
   }
@@ -5614,7 +6130,7 @@ async function qualifyRestructureMechanism(root) {
   if (!canonical.ok) return canonical;
   let type;
   try {
-    type = (await (0, import_promises8.statfs)(canonical.data)).type;
+    type = (await (0, import_promises9.statfs)(canonical.data)).type;
   } catch (cause) {
     return failure("APPLY_ENVIRONMENT_UNSUPPORTED", `Project root filesystem cannot be inspected: ${cause.message}`);
   }
@@ -5627,8 +6143,8 @@ async function qualifyRestructureMechanism(root) {
   return { ok: true, data: { root: canonical.data, filesystem: RESTRUCTURE_QUALIFIED_FILESYSTEM } };
 }
 async function ensureRestructureMechanismRoot(canonicalRoot, options) {
-  const target = (0, import_node_path12.join)(canonicalRoot, RESTRUCTURE_RECOVERY_REL_PATH);
-  const current = async () => (0, import_promises8.lstat)(target).catch((cause) => cause.code === "ENOENT" ? null : Promise.reject(cause));
+  const target = (0, import_node_path13.join)(canonicalRoot, RESTRUCTURE_RECOVERY_REL_PATH);
+  const current = async () => (0, import_promises9.lstat)(target).catch((cause) => cause.code === "ENOENT" ? null : Promise.reject(cause));
   let info = await current();
   if (info === null) {
     if (!options.create) {
@@ -5639,7 +6155,7 @@ async function ensureRestructureMechanismRoot(canonicalRoot, options) {
     }
     let created = false;
     try {
-      await (0, import_promises8.mkdir)(target, { mode: RESTRUCTURE_RECOVERY_ROOT_MODE });
+      await (0, import_promises9.mkdir)(target, { mode: RESTRUCTURE_RECOVERY_ROOT_MODE });
       created = true;
     } catch (cause) {
       if (cause.code !== "EEXIST") {
@@ -5652,7 +6168,7 @@ async function ensureRestructureMechanismRoot(canonicalRoot, options) {
       return failure("MECHANISM_ROOT_UNSAFE", `${target} must be one real directory, not a link or special entry`);
     }
     if (created && (info.mode & 4095) !== RESTRUCTURE_RECOVERY_ROOT_MODE) {
-      await (0, import_promises8.chmod)(target, RESTRUCTURE_RECOVERY_ROOT_MODE);
+      await (0, import_promises9.chmod)(target, RESTRUCTURE_RECOVERY_ROOT_MODE);
       info = await current();
       if (info === null || info.isSymbolicLink() || !info.isDirectory()) {
         return failure("MECHANISM_ROOT_UNSAFE", `${target} must be one real directory, not a link or special entry`);
@@ -5741,7 +6257,7 @@ async function applyRestructureFileSet(canonicalRoot, plan, options) {
   return await verifyMechanismResult(raw);
 }
 async function observeRestructureJournal(canonicalRoot) {
-  const journalRoot = (0, import_node_path12.join)(canonicalRoot, RESTRUCTURE_RECOVERY_REL_PATH, "journal");
+  const journalRoot = (0, import_node_path13.join)(canonicalRoot, RESTRUCTURE_RECOVERY_REL_PATH, "journal");
   const module2 = await loadFoundationModule();
   try {
     return { ok: true, data: await module2.inspectStateStoreLock(journalRoot, { recoveryObservation: true }) };
@@ -5928,13 +6444,13 @@ function projectRestructureFileSetResult(result, planPath = "", planDigest = "")
   const reading = result.operation === "apply" ? applyProjection(result) : result.operation === "recover" ? recoverProjection(result) : pruneProjection(result);
   return { ...base, ...reading };
 }
-var import_node_crypto4, import_promises8, import_node_path12, RESTRUCTURE_RECOVERY_REL_PATH, RESTRUCTURE_RECOVERY_JOURNAL_REL_PATH, RESTRUCTURE_RECOVERY_ROOT_MODE, RESTRUCTURE_QUALIFIED_PLATFORM, RESTRUCTURE_QUALIFIED_ARCH, RESTRUCTURE_QUALIFIED_FILESYSTEM, APFS_STATFS_TYPE, DIGEST_PREFIX, RAW_SHA256_PATTERN, FOUNDATION_PACKAGE_NAME, CONTRACTS_PACKAGE_NAME2, FILE_SET_RESULT_OBJECT, APPLY_MAINTENANCE_ERROR_KINDS;
+var import_node_crypto4, import_promises9, import_node_path13, RESTRUCTURE_RECOVERY_REL_PATH, RESTRUCTURE_RECOVERY_JOURNAL_REL_PATH, RESTRUCTURE_RECOVERY_ROOT_MODE, RESTRUCTURE_QUALIFIED_PLATFORM, RESTRUCTURE_QUALIFIED_ARCH, RESTRUCTURE_QUALIFIED_FILESYSTEM, APFS_STATFS_TYPE, DIGEST_PREFIX, RAW_SHA256_PATTERN, FOUNDATION_PACKAGE_NAME, CONTRACTS_PACKAGE_NAME2, FILE_SET_RESULT_OBJECT, APPLY_MAINTENANCE_ERROR_KINDS;
 var init_restructure_file_set = __esm({
   "src/restructure-file-set.ts"() {
     "use strict";
     import_node_crypto4 = require("crypto");
-    import_promises8 = require("fs/promises");
-    import_node_path12 = require("path");
+    import_promises9 = require("fs/promises");
+    import_node_path13 = require("path");
     RESTRUCTURE_RECOVERY_REL_PATH = ".foundation-file-apply";
     RESTRUCTURE_RECOVERY_JOURNAL_REL_PATH = `${RESTRUCTURE_RECOVERY_REL_PATH}/journal`;
     RESTRUCTURE_RECOVERY_ROOT_MODE = 448;
@@ -5966,7 +6482,7 @@ function digestRestructureValue(value) {
   return digestBytes(canonicalJson(value));
 }
 function normalizeRelativePath2(value) {
-  if (!value || value.includes("\0") || (0, import_node_path13.isAbsolute)(value)) return void 0;
+  if (!value || value.includes("\0") || (0, import_node_path14.isAbsolute)(value)) return void 0;
   const normalized = value.replace(/\\/g, "/").replace(/^\.\//, "");
   if (!normalized || normalized === "." || normalized.split("/").some((part) => part === ".." || part === "")) return void 0;
   return normalized;
@@ -5980,13 +6496,13 @@ function isPathAllowed(path, allowed) {
 async function readContainedFileWithMode(root, path) {
   const normalized = normalizeRelativePath2(path);
   if (!normalized) throw new Error(`Path must be a project-relative path without traversal: ${path}`);
-  const absoluteRoot = (0, import_node_path13.resolve)(root);
-  const absolutePath = (0, import_node_path13.resolve)(absoluteRoot, normalized);
-  if ((0, import_node_path13.relative)(absoluteRoot, absolutePath).startsWith("..")) throw new Error(`Path escapes project root: ${path}`);
+  const absoluteRoot = (0, import_node_path14.resolve)(root);
+  const absolutePath = (0, import_node_path14.resolve)(absoluteRoot, normalized);
+  if ((0, import_node_path14.relative)(absoluteRoot, absolutePath).startsWith("..")) throw new Error(`Path escapes project root: ${path}`);
   try {
-    const info = await (0, import_promises9.lstat)(absolutePath);
+    const info = await (0, import_promises10.lstat)(absolutePath);
     if (info.isSymbolicLink() || !info.isFile()) throw new Error(`Path is not a regular file: ${path}`);
-    return { buffer: await (0, import_promises9.readFile)(absolutePath), mode: info.mode & MAX_POSIX_MODE };
+    return { buffer: await (0, import_promises10.readFile)(absolutePath), mode: info.mode & MAX_POSIX_MODE };
   } catch (error) {
     if (error.code === "ENOENT") return void 0;
     throw error;
@@ -6014,7 +6530,7 @@ async function configSnapshot(root) {
   return snapshotFile(root, "artifact-graph.config.yaml");
 }
 async function loadRestructureContract(name) {
-  return loadContract((0, import_node_path13.join)(CONTRACT_ROOT, `restructure-${name}`, "schema.json"), { expectedAuthority: "artifact" });
+  return loadContract((0, import_node_path14.join)(CONTRACT_ROOT, `restructure-${name}`, "schema.json"), { expectedAuthority: "artifact" });
 }
 async function validateDomainContract(name, value) {
   const contract = await loadRestructureContract(name);
@@ -6275,7 +6791,7 @@ function splitMarkdownTarget(target) {
 }
 async function pathExists2(absolutePath) {
   try {
-    await (0, import_promises9.lstat)(absolutePath);
+    await (0, import_promises10.lstat)(absolutePath);
     return true;
   } catch {
     return false;
@@ -6283,20 +6799,20 @@ async function pathExists2(absolutePath) {
 }
 async function scanUnsupportedReferences(root, sourcePaths, targetPaths) {
   const migrationPaths = [.../* @__PURE__ */ new Set([...sourcePaths, ...targetPaths])];
-  const migrationNames = new Set(migrationPaths.map((path) => import_node_path13.posix.basename(path)));
-  const directories = new Set(migrationPaths.map((path) => import_node_path13.posix.dirname(path)));
+  const migrationNames = new Set(migrationPaths.map((path) => import_node_path14.posix.basename(path)));
+  const directories = new Set(migrationPaths.map((path) => import_node_path14.posix.dirname(path)));
   const findings = [];
   async function visit(directory) {
-    for (const entry of await (0, import_promises9.readdir)(directory, { withFileTypes: true })) {
+    for (const entry of await (0, import_promises10.readdir)(directory, { withFileTypes: true })) {
       if (entry.isDirectory() && SKIPPED_SCAN_DIRS.has(entry.name)) continue;
-      const absolute = (0, import_node_path13.join)(directory, entry.name);
+      const absolute = (0, import_node_path14.join)(directory, entry.name);
       if (entry.isDirectory()) {
         await visit(absolute);
         continue;
       }
       if (!entry.isFile() || !TEXT_EXTENSIONS.test(entry.name)) continue;
-      const path = (0, import_node_path13.relative)(root, absolute).replace(/\\/g, "/");
-      const raw = await (0, import_promises9.readFile)(absolute, "utf8");
+      const path = (0, import_node_path14.relative)(root, absolute).replace(/\\/g, "/");
+      const raw = await (0, import_promises10.readFile)(absolute, "utf8");
       const namesTheMigration = migrationPaths.some((reference) => raw.includes(reference));
       const lines = raw.split(/\r?\n/);
       for (const [index, line] of lines.entries()) {
@@ -6308,8 +6824,8 @@ async function scanUnsupportedReferences(root, sourcePaths, targetPaths) {
             const literal = match[0];
             const { path: linkPath, anchor } = splitMarkdownTarget(match[2]);
             if (!linkPath || linkPath.startsWith("/") || /^[a-z][a-z0-9+.-]*:/i.test(linkPath)) continue;
-            if (!migrationNames.has(import_node_path13.posix.basename(linkPath))) continue;
-            const resolved = normalizeRelativePath2(import_node_path13.posix.join(import_node_path13.posix.dirname(path), linkPath));
+            if (!migrationNames.has(import_node_path14.posix.basename(linkPath))) continue;
+            const resolved = normalizeRelativePath2(import_node_path14.posix.join(import_node_path14.posix.dirname(path), linkPath));
             if (!resolved || targetPaths.includes(resolved)) continue;
             if (anchor) {
               findings.push(finding(
@@ -6318,7 +6834,7 @@ async function scanUnsupportedReferences(root, sourcePaths, targetPaths) {
                 path,
                 lineNumber
               ));
-            } else if (!await pathExists2((0, import_node_path13.resolve)(root, resolved))) {
+            } else if (!await pathExists2((0, import_node_path14.resolve)(root, resolved))) {
               findings.push(finding(
                 "SIBLING_RELATIVE_REFERENCE_UNRESOLVED",
                 `The relative reference "${literal}" does not resolve inside the project although its file name matches a migration path; its intended destination must be decided explicitly`,
@@ -6343,7 +6859,7 @@ async function scanUnsupportedReferences(root, sourcePaths, targetPaths) {
       }
     }
   }
-  await visit((0, import_node_path13.resolve)(root));
+  await visit((0, import_node_path14.resolve)(root));
   const unique = new Map(findings.map((item) => [`${item.code}	${item.path}	${item.line}	${item.message}`, item]));
   return [...unique.values()].sort((left, right) => (left.path ?? "").localeCompare(right.path ?? "") || (left.line ?? 0) - (right.line ?? 0) || left.code.localeCompare(right.code));
 }
@@ -6359,15 +6875,15 @@ function mergeFindings(target, additions) {
 async function scanConsumerCandidates(root, references, excludedPaths = /* @__PURE__ */ new Set()) {
   const results = [];
   async function visit(directory) {
-    for (const entry of await (0, import_promises9.readdir)(directory, { withFileTypes: true })) {
+    for (const entry of await (0, import_promises10.readdir)(directory, { withFileTypes: true })) {
       if (entry.isDirectory() && SKIPPED_SCAN_DIRS.has(entry.name)) continue;
-      const absolute = (0, import_node_path13.join)(directory, entry.name);
+      const absolute = (0, import_node_path14.join)(directory, entry.name);
       if (entry.isDirectory()) {
         await visit(absolute);
       } else if (entry.isFile() && TEXT_EXTENSIONS.test(entry.name)) {
-        const path = (0, import_node_path13.relative)(root, absolute).replace(/\\/g, "/");
+        const path = (0, import_node_path14.relative)(root, absolute).replace(/\\/g, "/");
         if (excludedPaths.has(path)) continue;
-        const raw = await (0, import_promises9.readFile)(absolute, "utf8");
+        const raw = await (0, import_promises10.readFile)(absolute, "utf8");
         raw.split(/\r?\n/).forEach((line, index) => {
           for (const reference of references) {
             if (path !== reference && line.includes(reference)) results.push({ path, line: index + 1, reference });
@@ -6376,7 +6892,7 @@ async function scanConsumerCandidates(root, references, excludedPaths = /* @__PU
       }
     }
   }
-  await visit((0, import_node_path13.resolve)(root));
+  await visit((0, import_node_path14.resolve)(root));
   return results.sort((left, right) => left.path.localeCompare(right.path) || left.line - right.line || left.reference.localeCompare(right.reference));
 }
 function expectedRelationTargets(mapping) {
@@ -6416,7 +6932,7 @@ function restructureBoundaryFindings(operations, limits) {
   const expectedCreateMode = createModeForUmask(limits.umask);
   const applyModeContract = limits.mode_contract === "apply";
   for (const operation of operations) {
-    const parent = (0, import_node_path13.dirname)(operation.path) || ".";
+    const parent = (0, import_node_path14.dirname)(operation.path) || ".";
     if (!operation.parent_exists) {
       findings.push(finding("PARENT_DIRECTORY_MISSING", `Parent directory does not exist or is not a directory: ${parent}`, operation.path));
     } else if (operation.parent_device !== null && operation.parent_device !== operation.root_device) {
@@ -6465,7 +6981,7 @@ function restructureBoundaryFindings(operations, limits) {
 }
 async function probeDirectory(absolutePath) {
   try {
-    const info = await (0, import_promises9.stat)(absolutePath);
+    const info = await (0, import_promises10.stat)(absolutePath);
     return { exists: info.isDirectory(), device: info.dev };
   } catch (error) {
     const code = error.code;
@@ -6607,7 +7123,7 @@ async function planRestructure(root, input) {
     }
     pathMoves.push(move);
     rangesByPath.set(sourcePath, pathMoves);
-    if ((0, import_node_path13.dirname)(sourcePath) !== (0, import_node_path13.dirname)(targetPath)) {
+    if ((0, import_node_path14.dirname)(sourcePath) !== (0, import_node_path14.dirname)(targetPath)) {
       for (const link of findRelativeLinks(fragment.toString("utf8"))) {
         const explicitlyEdited = mapping.prose_edits.some((edit) => edit.target_path === targetPath && edit.old_text.includes(link));
         if (!explicitlyEdited) blockers.push(finding("RELATIVE_LINK_REQUIRES_MAPPING", `Relative reference "${link}" changes base directory when moved to ${targetPath}`, sourcePath));
@@ -6724,15 +7240,15 @@ async function planRestructure(root, input) {
       diff: readableDiff(path, original?.toString("utf8"), deleteFile ? void 0 : candidate.toString("utf8"))
     });
   }
-  const rootDirectory = await probeDirectory((0, import_node_path13.resolve)(root));
+  const rootDirectory = await probeDirectory((0, import_node_path14.resolve)(root));
   const parentProbes = /* @__PURE__ */ new Map();
   for (const candidate of candidates) {
-    const parent = (0, import_node_path13.dirname)(candidate.path);
-    if (!parentProbes.has(parent)) parentProbes.set(parent, await probeDirectory((0, import_node_path13.resolve)(root, parent)));
+    const parent = (0, import_node_path14.dirname)(candidate.path);
+    if (!parentProbes.has(parent)) parentProbes.set(parent, await probeDirectory((0, import_node_path14.resolve)(root, parent)));
   }
   blockers.push(...restructureBoundaryFindings(
     candidates.map((candidate) => {
-      const parent = parentProbes.get((0, import_node_path13.dirname)(candidate.path));
+      const parent = parentProbes.get((0, import_node_path14.dirname)(candidate.path));
       return {
         path: candidate.path,
         action: candidate.action,
@@ -6858,10 +7374,10 @@ function refusal(code, message, findings = []) {
   return { ok: false, error: { code, message, ...findings.length === 0 ? {} : { details: findings } } };
 }
 async function loadRestructurePlanDocument(operation, canonicalRoot, planPath) {
-  const absolute = (0, import_node_path13.resolve)(planPath);
+  const absolute = (0, import_node_path14.resolve)(planPath);
   let info;
   try {
-    info = await (0, import_promises9.lstat)(absolute);
+    info = await (0, import_promises10.lstat)(absolute);
   } catch (cause) {
     return refusal("PLAN_FILE_UNREADABLE", `Plan document cannot be read: ${absolute} (${cause.message})`);
   }
@@ -6870,7 +7386,7 @@ async function loadRestructurePlanDocument(operation, canonicalRoot, planPath) {
   }
   let bytes;
   try {
-    bytes = await (0, import_promises9.readFile)(absolute);
+    bytes = await (0, import_promises10.readFile)(absolute);
   } catch (cause) {
     return refusal("PLAN_FILE_UNREADABLE", `Plan document cannot be read: ${absolute} (${cause.message})`);
   }
@@ -6882,7 +7398,7 @@ async function loadRestructurePlanDocument(operation, canonicalRoot, planPath) {
   }
   const gate = await gateRestructureOperationPlan(operation, parsed);
   if (!gate.ok) return gate;
-  return { ok: true, data: { path: absolute, realPath: await (0, import_promises9.realpath)(absolute), digest: digestBytes(bytes), root: canonicalRoot, plan: gate.data } };
+  return { ok: true, data: { path: absolute, realPath: await (0, import_promises10.realpath)(absolute), digest: digestBytes(bytes), root: canonicalRoot, plan: gate.data } };
 }
 function planRootIdentityFindings(document) {
   const findings = [];
@@ -6901,19 +7417,19 @@ function planRootIdentityFindings(document) {
   if (document.plan.config_snapshot.path !== "artifact-graph.config.yaml") {
     findings.push(finding("ROOT_IDENTITY_MISMATCH", `The plan does not record this project's configuration file: ${document.plan.config_snapshot.path}`));
   }
-  const relativePlan = (0, import_node_path13.relative)(document.root, document.realPath);
-  if (!relativePlan || relativePlan.startsWith("..") || (0, import_node_path13.isAbsolute)(relativePlan)) {
+  const relativePlan = (0, import_node_path14.relative)(document.root, document.realPath);
+  if (!relativePlan || relativePlan.startsWith("..") || (0, import_node_path14.isAbsolute)(relativePlan)) {
     findings.push(finding("ROOT_IDENTITY_MISMATCH", `The plan document is outside the project root: ${document.realPath}`, document.realPath));
   }
   return findings;
 }
 async function operationBoundaries(root, plan) {
-  const rootDirectory = await probeDirectory((0, import_node_path13.resolve)(root));
+  const rootDirectory = await probeDirectory((0, import_node_path14.resolve)(root));
   const parents = /* @__PURE__ */ new Map();
   const boundaries = [];
   for (const candidate of plan.candidates) {
-    const parent = (0, import_node_path13.dirname)(candidate.path) || ".";
-    if (!parents.has(parent)) parents.set(parent, await probeDirectory((0, import_node_path13.resolve)(root, parent)));
+    const parent = (0, import_node_path14.dirname)(candidate.path) || ".";
+    if (!parents.has(parent)) parents.set(parent, await probeDirectory((0, import_node_path14.resolve)(root, parent)));
     const probe = parents.get(parent);
     boundaries.push({
       path: candidate.path,
@@ -6938,7 +7454,7 @@ async function applyPreconditionFindings(root, document) {
     findings.push(finding("CONFIG_CHANGED", "artifact-graph configuration changed after planning", currentConfig.path));
   }
   for (const snapshot of plan.input_snapshots) await verifySnapshot(root, snapshot, findings);
-  const relativePlan = (0, import_node_path13.relative)(root, document.realPath).replace(/\\/g, "/");
+  const relativePlan = (0, import_node_path14.relative)(root, document.realPath).replace(/\\/g, "/");
   for (const candidate of plan.candidates) {
     if (candidate.path === relativePlan) {
       findings.push(finding("PLAN_IN_WRITE_SET", `The plan document is inside its own candidate write set: ${candidate.path}`, candidate.path));
@@ -7021,7 +7537,7 @@ async function applyRestructure(input) {
   if (drift.length > 0) return refusal("APPLY_PRECONDITION_FAILED", "The project drifted after planning; nothing was written", drift);
   const mechanismRoot = await ensureRestructureMechanismRoot(qualification.data.root, { create: true });
   if (!mechanismRoot.ok) return mechanismRoot;
-  const planRelPath = (0, import_node_path13.relative)(qualification.data.root, document.data.realPath).replace(/\\/g, "/");
+  const planRelPath = (0, import_node_path14.relative)(qualification.data.root, document.data.realPath).replace(/\\/g, "/");
   const applied = await applyRestructureFileSet(qualification.data.root, plan, {
     validate: createRestructureValidationCallback(plan, [planRelPath])
   });
@@ -7078,13 +7594,13 @@ async function pruneRestructureRecovery(input) {
   const projection = projectRestructureFileSetResult(pruned.data, document.data.realPath, document.data.digest);
   return projection.ok ? { ok: true, data: projection } : { ok: false, error: { code: projection.code, message: projection.message, details: projection } };
 }
-var import_node_crypto5, import_promises9, import_node_path13, import_node_url3, import_meta3, RESTRUCTURE_PLAN_SCHEMA_VERSION, RESTRUCTURE_VALIDATION_TIMEOUT_MS, RESTRUCTURE_MAX_OPERATIONS, RESTRUCTURE_MAX_TOTAL_BYTES, MAX_POSIX_MODE, CREATE_MODE_BASE, MODULE_DIRECTORY, CONTRACT_ROOT, SKIPPED_SCAN_DIRS, TEXT_EXTENSIONS, MARKDOWN_LINK_PATTERN, RUNTIME_PATH_MARKER, MARKDOWN_FILE_SUFFIX, SCRIPT_FILE_SUFFIX;
+var import_node_crypto5, import_promises10, import_node_path14, import_node_url3, import_meta3, RESTRUCTURE_PLAN_SCHEMA_VERSION, RESTRUCTURE_VALIDATION_TIMEOUT_MS, RESTRUCTURE_MAX_OPERATIONS, RESTRUCTURE_MAX_TOTAL_BYTES, MAX_POSIX_MODE, CREATE_MODE_BASE, MODULE_DIRECTORY, CONTRACT_ROOT, SKIPPED_SCAN_DIRS, TEXT_EXTENSIONS, MARKDOWN_LINK_PATTERN, RUNTIME_PATH_MARKER, MARKDOWN_FILE_SUFFIX, SCRIPT_FILE_SUFFIX;
 var init_restructure = __esm({
   "src/restructure.ts"() {
     "use strict";
     import_node_crypto5 = require("crypto");
-    import_promises9 = require("fs/promises");
-    import_node_path13 = require("path");
+    import_promises10 = require("fs/promises");
+    import_node_path14 = require("path");
     import_node_url3 = require("url");
     init_index();
     init_contract_kernel();
@@ -7097,8 +7613,8 @@ var init_restructure = __esm({
     RESTRUCTURE_MAX_TOTAL_BYTES = 256 * 1024 * 1024;
     MAX_POSIX_MODE = 511;
     CREATE_MODE_BASE = 438;
-    MODULE_DIRECTORY = typeof __dirname === "string" ? __dirname : (0, import_node_path13.dirname)((0, import_node_url3.fileURLToPath)(import_meta3.url));
-    CONTRACT_ROOT = (0, import_node_path13.join)(MODULE_DIRECTORY, "..", "contracts");
+    MODULE_DIRECTORY = typeof __dirname === "string" ? __dirname : (0, import_node_path14.dirname)((0, import_node_url3.fileURLToPath)(import_meta3.url));
+    CONTRACT_ROOT = (0, import_node_path14.join)(MODULE_DIRECTORY, "..", "contracts");
     SKIPPED_SCAN_DIRS = /* @__PURE__ */ new Set([".git", "node_modules", "dist", "coverage", ".tmp", ".codex", ".worktrees", ".foundation-file-apply", ".artifact-graph"]);
     TEXT_EXTENSIONS = /\.(?:md|markdown|json|ya?ml|[cm]?[jt]sx?)$/i;
     MARKDOWN_LINK_PATTERN = /!?\[([^\]\n]*)\]\(([^)\n]+)\)/g;
@@ -7164,18 +7680,21 @@ __export(index_exports, {
   createModeForUmask: () => createModeForUmask,
   createRestructureRootBinding: () => createRestructureRootBinding,
   createRestructureValidationCallback: () => createRestructureValidationCallback,
+  diagnoseConfigDocument: () => diagnoseConfigDocument,
+  diagnoseProjectConfig: () => diagnoseProjectConfig,
   digestRestructureValue: () => digestRestructureValue,
-  dirname: () => import_node_path14.dirname,
+  dirname: () => import_node_path15.dirname,
   discoverAndAuditPackets: () => discoverAndAuditPackets,
   discoverTargets: () => discoverTargets,
   doctorArtifactChain: () => doctorArtifactChain,
   ensureRestructureMechanismRoot: () => ensureRestructureMechanismRoot,
-  extname: () => import_node_path14.extname,
+  extname: () => import_node_path15.extname,
   filterGraphByView: () => filterGraphByView,
   formatContextMarkdown: () => formatContextMarkdown,
   gateRestructureOperationPlan: () => gateRestructureOperationPlan,
   generateE2eRegistry: () => generateE2eRegistry,
   getArtifactTypeMetadata: () => getArtifactTypeMetadata,
+  getConfigDiagnostics: () => getConfigDiagnostics,
   getExternalEntryInfo: () => getExternalEntryInfo,
   getTargetArtifactTypes: () => getTargetArtifactTypes,
   inspectRestructure: () => inspectRestructure,
@@ -7251,6 +7770,27 @@ __export(index_exports, {
   writeGraphCache: () => writeGraphCache
 });
 module.exports = __toCommonJS(index_exports);
+function getConfigDiagnostics(schema) {
+  return configDiagnosticsBySchema.get(schema);
+}
+function edgeRule(from, to, kind) {
+  return { from, to, kind };
+}
+function matchesEdgeRule(rule, fromType, toType, kind) {
+  return rule.from === fromType && rule.to === toType && rule.kind === kind;
+}
+function cloneEdgeRules(rules) {
+  return rules.map((rule) => ({ ...rule }));
+}
+function isEmptyAllowedEdgesValue(value) {
+  return value === null || Array.isArray(value) && value.length === 0;
+}
+function resolveAllowedEdges(value) {
+  if (isEmptyAllowedEdgesValue(value)) {
+    return cloneEdgeRules(DEFAULT_ALLOWED_EDGES);
+  }
+  return cloneEdgeRules(value);
+}
 function isTargetArtifactType(type) {
   return isPacketTargetType(type);
 }
@@ -7292,30 +7832,22 @@ function resolveArtifactTypeName(schema, token) {
   return void 0;
 }
 async function loadConfig(root) {
-  const configPath = (0, import_node_path14.join)(root, "artifact-graph.config.yaml");
-  let parsed = {};
+  const configPath = (0, import_node_path15.join)(root, "artifact-graph.config.yaml");
+  let raw;
   try {
-    const raw = await (0, import_promises10.readFile)(configPath, "utf-8");
-    parsed = import_js_yaml.default.load(raw) ?? {};
+    raw = await (0, import_promises11.readFile)(configPath, "utf-8");
   } catch (error) {
-    if (error.code !== "ENOENT") {
-      throw error;
+    if (error.code === "ENOENT") {
+      throw new Error(`required configuration is missing: ${configPath}`);
     }
+    throw error;
   }
-  const ub = parsed.context?.universal_baseline;
-  if (ub !== void 0 && typeof ub !== "boolean") {
-    throw new Error(
-      `Invalid context.universal_baseline: ${JSON.stringify(ub)}. Must be boolean (true or false).`
-    );
+  const document = import_js_yaml2.default.load(raw) ?? {};
+  const shapeDiagnosis = diagnoseConfigDocument(document);
+  if (shapeDiagnosis.errors.length > 0) {
+    throw new Error(shapeDiagnosis.errors[0].message);
   }
-  if (parsed.e2e !== void 0) {
-    if (typeof parsed.e2e !== "object" || parsed.e2e === null || Array.isArray(parsed.e2e)) {
-      throw new Error("Invalid e2e: must be an object.");
-    }
-    validateE2eConfig(parsed.e2e);
-  }
-  validateRelationSemanticsConfig(parsed.relationSemantics);
-  validateStatusViewsConfig(parsed.statusViews);
+  const parsed = document;
   const mergedE2e = parsed.e2e === void 0 ? DEFAULT_SCHEMA.e2e : {
     ...DEFAULT_SCHEMA.e2e,
     ...parsed.e2e,
@@ -7330,13 +7862,14 @@ async function loadConfig(root) {
     types: mergeArtifactTypes(DEFAULT_SCHEMA.types, parsed.types),
     idPatterns: mergeRecord(DEFAULT_SCHEMA.idPatterns, parsed.idPatterns),
     relationFields: mergeRecord(DEFAULT_SCHEMA.relationFields, parsed.relationFields),
-    allowedEdges: parsed.allowedEdges ?? DEFAULT_SCHEMA.allowedEdges,
+    allowedEdges: resolveAllowedEdges(parsed.allowedEdges),
     forbiddenEdges: parsed.forbiddenEdges ?? DEFAULT_SCHEMA.forbiddenEdges,
     statuses: parsed.statuses ?? DEFAULT_SCHEMA.statuses,
     idRanges: mergeRecord(DEFAULT_SCHEMA.idRanges, parsed.idRanges),
     e2e: mergedE2e
   };
   validateJsonArtifactTypes(merged.types);
+  configDiagnosticsBySchema.set(merged, shapeDiagnosis);
   return merged;
 }
 function validateJsonArtifactTypes(types) {
@@ -7358,131 +7891,6 @@ function validateJsonArtifactTypes(types) {
     }
     if (typeof idField !== "string" || idField.length === 0 || idField.trim() !== idField) {
       throw new Error(`Invalid types.${type}.idField: format json requires the name of one root property.`);
-    }
-  }
-}
-function validateRelationSemanticsConfig(value) {
-  if (value === void 0) return;
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new Error("Invalid relationSemantics: must be an object keyed by relation kind.");
-  }
-  for (const [kind, spec] of Object.entries(value)) {
-    if (!kind.trim() || typeof spec !== "object" || spec === null || Array.isArray(spec)) {
-      throw new Error(`Invalid relationSemantics.${kind}: must be an object.`);
-    }
-    if (typeof spec.label !== "string" || !spec.label.trim()) {
-      throw new Error(`Invalid relationSemantics.${kind}.label: must be a non-empty string.`);
-    }
-    if (!Array.isArray(spec.targetTypes) || spec.targetTypes.some((item) => typeof item !== "string" || !item.trim())) {
-      throw new Error(`Invalid relationSemantics.${kind}.targetTypes: must be an array of non-empty strings.`);
-    }
-    if (!Array.isArray(spec.fields) || spec.fields.length === 0 || spec.fields.some((item) => typeof item !== "string" || !item.trim())) {
-      throw new Error(`Invalid relationSemantics.${kind}.fields: must be a non-empty array of strings.`);
-    }
-    if (spec.partial !== void 0 && (typeof spec.partial !== "object" || spec.partial === null || typeof spec.partial.sectionField !== "string" || !spec.partial.sectionField.trim())) {
-      throw new Error(`Invalid relationSemantics.${kind}.partial.sectionField: must be a non-empty string.`);
-    }
-  }
-}
-function validateStatusViewsConfig(value) {
-  if (value === void 0) return;
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new Error("Invalid statusViews: must be an object keyed by status.");
-  }
-  for (const [status, bucket] of Object.entries(value)) {
-    if (!status.trim() || !["current", "planned", "history"].includes(bucket)) {
-      throw new Error(`Invalid statusViews.${status}: expected current, planned, or history.`);
-    }
-  }
-}
-function validateE2eConfig(e2e) {
-  for (const field of ["report_uncovered_scenarios", "report_uncovered_features"]) {
-    if (e2e[field] !== void 0 && typeof e2e[field] !== "boolean") {
-      throw new Error(`Invalid e2e.${field}: must be boolean.`);
-    }
-  }
-  if (e2e.executable_ref_warning !== void 0) {
-    if (typeof e2e.executable_ref_warning !== "number" || e2e.executable_ref_warning < 0 || e2e.executable_ref_warning > 1) {
-      throw new Error(`Invalid e2e.executable_ref_warning: ${JSON.stringify(e2e.executable_ref_warning)}. Must be a number between 0 and 1.`);
-    }
-  }
-  if (e2e.executable_ref_error !== void 0) {
-    if (typeof e2e.executable_ref_error !== "number" || e2e.executable_ref_error < 0 || e2e.executable_ref_error > 1) {
-      throw new Error(`Invalid e2e.executable_ref_error: ${JSON.stringify(e2e.executable_ref_error)}. Must be a number between 0 and 1.`);
-    }
-  }
-  const validateWaivers = (waivers, field) => {
-    if (waivers === void 0) return;
-    if (!Array.isArray(waivers)) {
-      throw new Error(`Invalid ${field}: must be an array of {id, reason} objects.`);
-    }
-    for (const w of waivers) {
-      if (typeof w !== "object" || w === null || !("id" in w) || !("reason" in w)) {
-        throw new Error(`Invalid ${field} entry: ${JSON.stringify(w)}. Must be {id, reason} object.`);
-      }
-      if (typeof w.id !== "string" || !w.id.trim()) {
-        throw new Error(`Invalid ${field} entry: id must be a non-empty string. Got: ${JSON.stringify(w.id)}`);
-      }
-      if (typeof w.reason !== "string" || !w.reason.trim()) {
-        throw new Error(`Invalid ${field} entry: reason must be a non-empty string. Got: ${JSON.stringify(w.reason)}`);
-      }
-    }
-  };
-  validateWaivers(e2e.scenario_waivers, "e2e.scenario_waivers");
-  validateWaivers(e2e.feature_waivers, "e2e.feature_waivers");
-  if (e2e.runners !== void 0) {
-    if (!Array.isArray(e2e.runners)) {
-      throw new Error(`Invalid e2e.runners: must be an array.`);
-    }
-    for (const runner of e2e.runners) {
-      if (typeof runner !== "object" || runner === null) {
-        throw new Error(`Invalid e2e.runners entry: must be an object.`);
-      }
-      if (typeof runner.name !== "string" || !runner.name.trim()) {
-        throw new Error(`Invalid e2e.runners entry: name must be a non-empty string.`);
-      }
-      if (typeof runner.root !== "string" || !runner.root.trim()) {
-        throw new Error(`Invalid e2e.runners[${runner.name}].root: must be a non-empty string.`);
-      }
-      if ((0, import_node_path14.isAbsolute)(runner.root)) {
-        throw new Error(`Invalid e2e.runners[${runner.name}].root: "${runner.root}" must not be an absolute path.`);
-      }
-      if (runner.root.replace(/\\/g, "/").split("/").includes("..")) {
-        throw new Error(`Invalid e2e.runners[${runner.name}].root: "${runner.root}" must not contain ".." segments.`);
-      }
-      if (!Array.isArray(runner.include) || runner.include.length === 0) {
-        throw new Error(`Invalid e2e.runners[${runner.name}].include: must be a non-empty array of glob patterns.`);
-      }
-      for (const pattern of runner.include) {
-        if (typeof pattern !== "string" || !pattern.trim()) {
-          throw new Error(`Invalid e2e.runners[${runner.name}].include: pattern must be a non-empty string.`);
-        }
-      }
-      if (runner.exclude !== void 0) {
-        if (!Array.isArray(runner.exclude)) {
-          throw new Error(`Invalid e2e.runners[${runner.name}].exclude: must be an array.`);
-        }
-        for (const pattern of runner.exclude) {
-          if (typeof pattern !== "string" || !pattern.trim()) {
-            throw new Error(`Invalid e2e.runners[${runner.name}].exclude: pattern must be a non-empty string.`);
-          }
-        }
-      }
-      if (runner.testIgnore !== void 0) {
-        if (!Array.isArray(runner.testIgnore)) {
-          throw new Error(`Invalid e2e.runners[${runner.name}].testIgnore: must be an array.`);
-        }
-        for (const pattern of runner.testIgnore) {
-          if (typeof pattern !== "string" || !pattern.trim()) {
-            throw new Error(`Invalid e2e.runners[${runner.name}].testIgnore: pattern must be a non-empty string.`);
-          }
-        }
-      }
-      if (runner.kind !== void 0) {
-        if (!["unit", "integration", "e2e"].includes(runner.kind)) {
-          throw new Error(`Invalid e2e.runners[${runner.name}].kind: "${runner.kind}". Must be unit, integration, or e2e.`);
-        }
-      }
     }
   }
 }
@@ -7533,7 +7941,7 @@ async function scanArtifacts(root, schema, options = {}) {
         continue;
       }
       scannedFiles.set(file, type);
-      const raw = contentOverrides.has(file) ? contentOverrides.get(file) : await (0, import_promises10.readFile)((0, import_node_path14.join)(root, file), "utf-8");
+      const raw = contentOverrides.has(file) ? contentOverrides.get(file) : await (0, import_promises11.readFile)((0, import_node_path15.join)(root, file), "utf-8");
       const parsed = parseFile(type, file, raw, config);
       const semantic = isJsonOriginalType(type, config) ? { edges: [], diagnostics: [] } : parseConfiguredRelations(type, file, raw, parsed.nodes, config);
       nodes.push(...parsed.nodes);
@@ -7541,7 +7949,7 @@ async function scanArtifacts(root, schema, options = {}) {
       scanDiagnostics.push(...parsed.diagnostics, ...semantic.diagnostics);
     }
   }
-  const absoluteRoot = (0, import_node_path14.isAbsolute)(root) ? root : (0, import_node_path14.resolve)(root);
+  const absoluteRoot = (0, import_node_path15.isAbsolute)(root) ? root : (0, import_node_path15.resolve)(root);
   const graph = buildGraph(nodes, edges, scanDiagnostics, absoluteRoot);
   return resolveMatrixEdges(graph);
 }
@@ -7688,8 +8096,16 @@ function validateGraph(graph, schema = DEFAULT_SCHEMA) {
         { edge: edge2 }
       ));
     }
-    if (schema.forbiddenEdges.some((rule) => rule.from === fromType && rule.to === toType && rule.kind === edge2.kind)) {
+    if (schema.forbiddenEdges.some((rule) => matchesEdgeRule(rule, fromType, toType, edge2.kind))) {
       issues.push(issue("FORBIDDEN_EDGE", `Forbidden ${fromType} -> ${toType} ${edge2.kind} relation`, edge2.sourcePath, edge2.sourceLine, { edge: edge2 }));
+    } else if (!schema.allowedEdges.some((rule) => matchesEdgeRule(rule, fromType, toType, edge2.kind))) {
+      issues.push(issue(
+        "DISALLOWED_EDGE",
+        `Disallowed ${fromType} -> ${toType} ${edge2.kind} relation`,
+        edge2.sourcePath,
+        edge2.sourceLine,
+        { edge: edge2 }
+      ));
     }
   }
   issues.push(...validateE2eTests(graph));
@@ -7880,7 +8296,7 @@ async function validateScenarioPrdLinkIndex(root, graph) {
   const indexPath = "artifacts/prd/feature-index.md";
   let raw = "";
   try {
-    raw = await (0, import_promises10.readFile)((0, import_node_path14.join)(root, indexPath), "utf-8");
+    raw = await (0, import_promises11.readFile)((0, import_node_path15.join)(root, indexPath), "utf-8");
   } catch (error) {
     if (error.code === "ENOENT") {
       return [];
@@ -8128,12 +8544,12 @@ function nextId(graph, schema, type, rangeName) {
   throw new Error(`ID range ${type}.${rangeName} is exhausted`);
 }
 async function writeGraphCache(root, graph) {
-  const cacheDir = (0, import_node_path14.join)(root, ".artifact-graph");
-  await (0, import_promises10.mkdir)(cacheDir, { recursive: true });
-  await (0, import_promises10.writeFile)((0, import_node_path14.join)(cacheDir, "index.json"), `${JSON.stringify(graph, null, 2)}
+  const cacheDir = (0, import_node_path15.join)(root, ".artifact-graph");
+  await (0, import_promises11.mkdir)(cacheDir, { recursive: true });
+  await (0, import_promises11.writeFile)((0, import_node_path15.join)(cacheDir, "index.json"), `${JSON.stringify(graph, null, 2)}
 `);
   const { default: Database } = await import("better-sqlite3");
-  const db = new Database((0, import_node_path14.join)(cacheDir, "graph.sqlite"));
+  const db = new Database((0, import_node_path15.join)(cacheDir, "graph.sqlite"));
   try {
     db.exec(`
       DROP TABLE IF EXISTS nodes;
@@ -8429,7 +8845,7 @@ function jsonConfiguredRelations(type, path, record, schema, sourceUid) {
 }
 function parseGenericMarkdown(type, path, raw, schema) {
   const diagnostics = [];
-  const ext = (0, import_node_path14.extname)(path).toLowerCase();
+  const ext = (0, import_node_path15.extname)(path).toLowerCase();
   if (ext !== ".md" && ext !== ".markdown") {
     diagnostics.push(issue(
       "UNSUPPORTED_FORMAT",
@@ -8799,7 +9215,7 @@ function parseDecisions(path, raw) {
 }
 function isTestFile(filePath) {
   const normalized = filePath.replace(/\\/g, "/");
-  const name = (0, import_node_path14.basename)(normalized);
+  const name = (0, import_node_path15.basename)(normalized);
   if (/\.(test|spec)\.[^.]+$/.test(name)) return true;
   if (/(^|\/)(tests|test|__tests__)\//.test(normalized)) return true;
   if (/\w+Tests?\.java$/.test(name)) return true;
@@ -9114,7 +9530,7 @@ function parseE2eTest(path, raw) {
   const starts = extractE2eTestCaseStarts(lines);
   const nodes = [];
   const edges = [];
-  const batch = String(data.test_batch ?? (0, import_node_path14.basename)(path, (0, import_node_path14.extname)(path))).trim();
+  const batch = String(data.test_batch ?? (0, import_node_path15.basename)(path, (0, import_node_path15.extname)(path))).trim();
   const frontmatterScenarios = toArray(data.related_scenarios).map((value) => String(value).trim()).filter(Boolean);
   const scopeFeatures = extractCodes(String(data.scope ?? ""), "feature");
   const frontmatterFeatures = [.../* @__PURE__ */ new Set([...Object.keys(asRecord2(data.ac_coverage)), ...scopeFeatures])];
@@ -9177,7 +9593,7 @@ function parseE2eRegistry(path, raw) {
     data = { parseError: error.message };
   }
   return {
-    nodes: [{ type: "e2e_registry", code: (0, import_node_path14.basename)(path, (0, import_node_path14.extname)(path)), title: "E2E Test Registry", path, line: 1, attrs: data }],
+    nodes: [{ type: "e2e_registry", code: (0, import_node_path15.basename)(path, (0, import_node_path15.extname)(path)), title: "E2E Test Registry", path, line: 1, attrs: data }],
     edges: []
   };
 }
@@ -10215,10 +10631,10 @@ async function validateExecutableTraceability(root, config) {
   const tcKeyToFields = /* @__PURE__ */ new Map();
   const mdBatches = /* @__PURE__ */ new Set();
   for (const relPath of e2eFiles) {
-    const raw = await (0, import_promises10.readFile)((0, import_node_path14.join)(root, relPath), "utf-8");
+    const raw = await (0, import_promises11.readFile)((0, import_node_path15.join)(root, relPath), "utf-8");
     const parsed = (0, import_gray_matter.default)(raw);
     const data = parsed.data;
-    const batch = String(data.test_batch ?? (0, import_node_path14.basename)(relPath, (0, import_node_path14.extname)(relPath))).trim();
+    const batch = String(data.test_batch ?? (0, import_node_path15.basename)(relPath, (0, import_node_path15.extname)(relPath))).trim();
     const lines = raw.split(/\r?\n/);
     const tcStarts = extractE2eTestCaseStarts(lines);
     for (let i = 0; i < tcStarts.length; i += 1) {
@@ -10257,10 +10673,10 @@ async function validateExecutableTraceability(root, config) {
   const tcAnnotationRegex = /\/\/!?\s*@(?:e2e_test|tc)\s+(\S+?)\s+\[(\w+)\]/;
   const tcAnnotationNoLevelRegex = /\/\/!?\s*@(?:e2e_test|tc)\s+(\S+)/;
   for (const specFile of specFiles) {
-    const fullSpecPath = (0, import_node_path14.join)(root, specFile);
+    const fullSpecPath = (0, import_node_path15.join)(root, specFile);
     let content;
     try {
-      content = await (0, import_promises10.readFile)(fullSpecPath, "utf-8");
+      content = await (0, import_promises11.readFile)(fullSpecPath, "utf-8");
     } catch {
       continue;
     }
@@ -10339,7 +10755,7 @@ async function validateExecutableTraceability(root, config) {
       if (entry.testId) {
         let content;
         try {
-          content = await (0, import_promises10.readFile)((0, import_node_path14.join)(root, normalizedRefFile), "utf-8");
+          content = await (0, import_promises11.readFile)((0, import_node_path15.join)(root, normalizedRefFile), "utf-8");
         } catch {
           continue;
         }
@@ -10574,7 +10990,7 @@ async function computeE2eCoverageStats(graph, root, thresholds = {}) {
     let hasActiveE2eRef = false;
     for (const entry of parseExecutableRefLines(execRef)) {
       const normalized = resolveExecutableRefFile(entry.file, allProjectFiles);
-      if (!normalized || !(0, import_node_fs5.existsSync)((0, import_node_path14.join)(root, normalized))) continue;
+      if (!normalized || !(0, import_node_fs5.existsSync)((0, import_node_path15.join)(root, normalized))) continue;
       const accepting = await getAcceptingRunners(root, normalized, runners);
       if (accepting.some((runner) => runner.kind === "e2e")) {
         hasActiveE2eRef = true;
@@ -10633,7 +11049,7 @@ async function computeE2eCoverageStats(graph, root, thresholds = {}) {
   const acCoverageRateByFeature = {};
   const featureAcMap = /* @__PURE__ */ new Map();
   for (const node of featureNodes) {
-    const acs = parseAcceptanceCriteria(await (0, import_promises10.readFile)((0, import_node_path14.join)(root, node.path), "utf-8"));
+    const acs = parseAcceptanceCriteria(await (0, import_promises11.readFile)((0, import_node_path15.join)(root, node.path), "utf-8"));
     featureAcMap.set(node.code, new Set(acs));
   }
   const coveredAcByFeature = /* @__PURE__ */ new Map();
@@ -10681,11 +11097,11 @@ async function generateE2eRegistry(root, opts) {
   const batchIds = /* @__PURE__ */ new Set();
   let totalTestCases = 0;
   for (const file of files) {
-    const filePath = (0, import_node_path14.join)(root, file);
-    const raw = await (0, import_promises10.readFile)(filePath, "utf-8");
+    const filePath = (0, import_node_path15.join)(root, file);
+    const raw = await (0, import_promises11.readFile)(filePath, "utf-8");
     const parsed = (0, import_gray_matter.default)(raw);
     const data = parsed.data;
-    const batch = String(data.test_batch ?? (0, import_node_path14.basename)(file, (0, import_node_path14.extname)(file))).trim();
+    const batch = String(data.test_batch ?? (0, import_node_path15.basename)(file, (0, import_node_path15.extname)(file))).trim();
     const relPath = file;
     const scope = String(data.scope ?? "").trim();
     const acCoverage = normalizeAcCoverageForRegistry(data.ac_coverage);
@@ -10807,10 +11223,10 @@ async function validatePartialRustEvidence(tcFields, tcKey, root, allFiles) {
     if (!normalizedPath) {
       return { hasValidPartialRust: false, detail: `partial_rust file not found: ${ref.file}` };
     }
-    const fullPath = (0, import_node_path14.join)(root, normalizedPath);
+    const fullPath = (0, import_node_path15.join)(root, normalizedPath);
     let content;
     try {
-      content = await (0, import_promises10.readFile)(fullPath, "utf-8");
+      content = await (0, import_promises11.readFile)(fullPath, "utf-8");
     } catch {
       return { hasValidPartialRust: false, detail: `partial_rust file not found: ${ref.file}` };
     }
@@ -10844,7 +11260,7 @@ function detectTestLevel(specFile, content) {
 }
 function resolveExecutableRefFile(refFile, allFiles) {
   const normalized = refFile.replace(/\\/g, "/").replace(/^\.\//, "");
-  if (!normalized || (0, import_node_path14.isAbsolute)(refFile) || normalized.split("/").includes("..")) {
+  if (!normalized || (0, import_node_path15.isAbsolute)(refFile) || normalized.split("/").includes("..")) {
     return void 0;
   }
   if (allFiles.includes(normalized)) {
@@ -11150,7 +11566,7 @@ function normalizeDesignCode(value) {
   if (!raw) {
     return "";
   }
-  return (0, import_node_path14.basename)(raw, (0, import_node_path14.extname)(raw));
+  return (0, import_node_path15.basename)(raw, (0, import_node_path15.extname)(raw));
 }
 function toUid(type, code) {
   return `${type}:${code}`;
@@ -11426,7 +11842,7 @@ function resolveArtifactContext(graph, opts) {
     }
     if (root) {
       for (const ap of ALWAYS_PRESENT_ITEMS) {
-        const fullPath = (0, import_node_path14.join)(root, ap.path);
+        const fullPath = (0, import_node_path15.join)(root, ap.path);
         let stat2;
         try {
           stat2 = (0, import_node_fs5.statSync)(fullPath);
@@ -11668,18 +12084,20 @@ function formatContextMarkdown(manifest) {
   }
   return lines.join("\n");
 }
-var import_gray_matter, import_js_yaml, import_node_fs5, import_promises10, import_node_path14, TARGET_ARTIFACT_TYPES, NON_TARGET_ROLES, DEFAULT_SCHEMA, SPECIALIZED_PARSER_TYPES, EMPTY_RELATION_FIELD_VALUES, VALID_TC_STATUSES, VALID_CHAIN_TYPES, DEPRECATED_CHAIN_TYPE_ALIASES, CONTEXT_CATEGORIES, TIER_ORDER;
+var import_gray_matter, import_js_yaml2, import_node_fs5, import_promises11, import_node_path15, configDiagnosticsBySchema, DEFAULT_ALLOWED_EDGES, TARGET_ARTIFACT_TYPES, NON_TARGET_ROLES, DEFAULT_SCHEMA, SPECIALIZED_PARSER_TYPES, EMPTY_RELATION_FIELD_VALUES, VALID_TC_STATUSES, VALID_CHAIN_TYPES, DEPRECATED_CHAIN_TYPE_ALIASES, CONTEXT_CATEGORIES, TIER_ORDER;
 var init_index = __esm({
   "src/index.ts"() {
     import_gray_matter = __toESM(require("gray-matter"), 1);
-    import_js_yaml = __toESM(require("js-yaml"), 1);
+    import_js_yaml2 = __toESM(require("js-yaml"), 1);
     import_node_fs5 = require("fs");
-    import_promises10 = require("fs/promises");
-    import_node_path14 = require("path");
+    import_promises11 = require("fs/promises");
+    import_node_path15 = require("path");
     init_packet_constants();
     init_packet_validator();
     init_glob_matcher();
     init_file_walker();
+    init_doctor();
+    init_doctor();
     init_packet_constants();
     init_target_selector();
     init_impact();
@@ -11700,6 +12118,44 @@ var init_index = __esm({
     init_restructure();
     init_restructure_file_set();
     init_restructure_software();
+    configDiagnosticsBySchema = /* @__PURE__ */ new WeakMap();
+    DEFAULT_ALLOWED_EDGES = [
+      edgeRule("feature", "scenario", "covers"),
+      edgeRule("feature", "decision", "references"),
+      edgeRule("feature", "feature", "depends_on"),
+      edgeRule("feature", "design", "references"),
+      edgeRule("scenario", "feature", "references"),
+      edgeRule("scenario", "decision", "references"),
+      edgeRule("scenario", "entity", "references"),
+      edgeRule("entity", "decision", "references"),
+      edgeRule("decision", "feature", "references"),
+      edgeRule("decision", "scenario", "references"),
+      edgeRule("design", "feature", "references"),
+      edgeRule("design", "scenario", "references"),
+      edgeRule("design", "decision", "references"),
+      edgeRule("design", "entity", "references"),
+      edgeRule("test", "feature", "verifies"),
+      edgeRule("test", "scenario", "verifies"),
+      edgeRule("test", "decision", "verifies"),
+      edgeRule("test", "entity", "verifies"),
+      edgeRule("implementation", "feature", "implements"),
+      edgeRule("implementation", "scenario", "implements"),
+      edgeRule("implementation", "decision", "implements"),
+      edgeRule("implementation", "entity", "implements"),
+      edgeRule("e2e_test", "scenario", "verifies"),
+      edgeRule("e2e_test", "feature", "verifies"),
+      edgeRule("e2e_test", "decision", "references"),
+      edgeRule("e2e_test", "entity", "references"),
+      edgeRule("rule-golden-cases", "design", "references"),
+      edgeRule("traceability-matrix-v2", "traceability-matrix-v2", "references"),
+      edgeRule("traceability-matrix-v2", "traceability-matrix-v2", "covers"),
+      edgeRule("traceability-matrix-v2", "resolve", "references"),
+      edgeRule("traceability-matrix-v2", "resolve", "covers"),
+      ...["feature", "scenario", "decision", "design", "entity", "test", "e2e_test"].flatMap((to) => [
+        edgeRule("traceability-matrix-v2", to, "references"),
+        edgeRule("traceability-matrix-v2", to, "covers")
+      ])
+    ];
     TARGET_ARTIFACT_TYPES = VALID_PACKET_TARGET_TYPES;
     NON_TARGET_ROLES = ["context", "candidate", "not-recommended"];
     DEFAULT_SCHEMA = {
@@ -11737,7 +12193,7 @@ var init_index = __esm({
         e2e_test: ["test_batch", "scope", "ac_coverage", "related_scenarios", "related_decisions", "related_entities", "\u8986\u76D6\u573A\u666F", "\u8986\u76D6\u529F\u80FD"],
         e2e_registry: ["batches"]
       },
-      allowedEdges: [],
+      allowedEdges: DEFAULT_ALLOWED_EDGES,
       forbiddenEdges: [{ from: "scenario", to: "entity", kind: "references" }],
       statuses: ["planned", "active", "done", "deprecated"],
       idRanges: {},
@@ -11871,6 +12327,8 @@ init_index();
   createModeForUmask,
   createRestructureRootBinding,
   createRestructureValidationCallback,
+  diagnoseConfigDocument,
+  diagnoseProjectConfig,
   digestRestructureValue,
   dirname,
   discoverAndAuditPackets,
@@ -11883,6 +12341,7 @@ init_index();
   gateRestructureOperationPlan,
   generateE2eRegistry,
   getArtifactTypeMetadata,
+  getConfigDiagnostics,
   getExternalEntryInfo,
   getTargetArtifactTypes,
   inspectRestructure,
