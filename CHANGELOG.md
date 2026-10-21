@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.0.0
+
+### Changed
+
+- Released in lockstep with artifact-chain-assistant 1.0.0, which introduces the new `spec-author` skill to replace the removed `spec-converger` skill in the public interface.
+- No runtime, CLI, API, or contract behavior changes in the Graph component compared to version 0.16.1.
+
 ## 0.16.1
 
 ### Changed
