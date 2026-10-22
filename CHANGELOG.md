@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 1.0.1
+
+### Fixed
+
+- Public CI now verifies the actual distributed package without requiring source code, tests, or a lockfile absent from the release snapshot. It packs the checkout and installs that tarball in a clean consumer environment with native dependency lifecycle scripts enabled, and validates CLI entry points, ESM/CJS imports, public resources, and graph operations. Full source checks remain in the parent workspace.
+
+### Changed
+
+- Ships in lockstep with artifact-chain-assistant 1.0.1. Graph runtime, CLI, API, and contract semantics are unchanged from 1.0.0.
+
 ## 1.0.0
 
 ### Changed
