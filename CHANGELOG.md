@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.1.0
+
+### Changed
+
+- Released in lockstep with artifact-chain-assistant 1.1.0 for its long-SPEC progressive disclosure capability. Graph runtime, CLI, API, and contract semantics are unchanged from 1.0.1.
+
 ## 1.0.1
 
 ### Fixed
