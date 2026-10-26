@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.2.0
+
+### Changed
+
+- Released in lockstep with artifact-chain-assistant 1.2.0 for its default testing handoff, selectable artifact methods, and requirement-pool workflow. Graph runtime, CLI, API, and contract semantics are unchanged from 1.1.0.
+
 ## 1.1.0
 
 ### Changed
