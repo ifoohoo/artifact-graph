@@ -1,6 +1,6 @@
 # artifact-graph
 
-[中文](README.zh-CN.md)
+[中文](README.zh-CN.md) · **Online Documentation (GitHub Pages):** [https://ifoohoo.github.io/artifact-chain-assistant-site/](https://ifoohoo.github.io/artifact-chain-assistant-site/)
 
 Git-native artifact graph scanner and validator for agentic coding workflows.
 Markdown stays the default parser. A custom type may set `format: json` and bring that original file into the same graph.
@@ -11,11 +11,12 @@ agent claims implementation work is complete.
 
 <!-- release-skill:capability:external-write-boundary -->
 > **External-write boundary:** Installing `artifact-graph` does not modify a project or write to
-> remote systems. Read-only commands such as `--help`, `doctor`, `validate`, `query`, `audit`,
-> `check-professional` (without `--conclusion-output`), and `read-proof` do not change project files.
-> `--conclusion-output` creates one new proof file at an explicit absolute path and never overwrites
-> an existing proof. Commands including `init`, `scan`, `version-lock refresh`, and
-> `hooks install-git` write locally only when explicitly invoked.
+> remote systems. Read-only commands such as `--help`, `doctor`, `validate`, `query`, `inbox list`,
+> `inbox match`, `audit`, `check-professional` (without `--conclusion-output`), and `read-proof` do
+> not change project files. `--conclusion-output` creates one new proof file at an explicit absolute
+> path and never overwrites an existing proof. Commands including `init`, `scan`, `inbox add`,
+> `version-lock refresh`, `hooks install-git`, and `hooks uninstall` write locally only when
+> explicitly invoked.
 
 <!-- release-skill:capability:safe-first-command -->
 > **Safe first command:** Inspect the installed CLI and project health before authorizing any
@@ -63,6 +64,16 @@ npx artifact-graph version-lock audit --root . --strict-missing-lock
 
 > Use `version-lock refresh --all` for the initial lock. The `--changed-only --staged` variant is for
 > pre-commit hooks on existing projects — not for first-time initialization.
+
+When capturing an unattached cross-project idea before choosing a repository or initializing configuration, use the zero-config workspace inbox:
+
+```bash
+npx artifact-graph inbox add "Bind review results to target file digests" --context "async review"
+npx artifact-graph inbox list
+npx artifact-graph inbox match "review target digests"
+```
+
+Ideas are recorded in `.artifact-inbox/ideas.jsonl` with `status: "captured"`, surface lexically related stories/requirements across the workspace, and never trigger project scaffolding automatically.
 
 ## Common Workflows
 
@@ -178,18 +189,19 @@ A release file stores several method ids in a string array. `method:METH-1` is r
   `GRAPH_CLEAR` with complete scope is `pass`; findings, incomplete checks, and recorded unavailability
   are `not_pass`. A missing, damaged, foreign, or unknown-code file is `unavailable`. This is not the
   Review Result Protocol.
-- Validate Review Result Protocol v1.0 documents with `artifact-graph validate-review-result --file <path>`.
+- Validate Review Result Protocol v1.0 documents with `artifact-graph validate-review-result --file <path>` (add `--verify-target-digests` and optional `--targets <p1,p2>` to verify target SHA-256 digests and prevent stale or cross-wired reviews).
 - Build implementation context with `artifact-graph context` or `artifact-graph packet`.
 - Add `--view current|planned|history|all` to `query`, `context`, or `packet` when a project maps
   statuses through `statusViews`. The default stays compatible with the unfiltered graph.
 - Inspect change impact without refreshing locks with `artifact-graph impact --worktree`.
 - Report graph health, scan mapping, and the limits of behavior/release evidence with
   `artifact-graph coverage`. The command does not infer successful verification or publication.
-- Keep traceability freshness with `artifact-graph version-lock refresh` and `audit`.
+- Keep traceability freshness with `artifact-graph version-lock refresh` and `audit`. Tagged `.ts`/`.tsx`/`.js`/`.jsx`/`.mjs`/`.cjs`/`.py` test files must contain real test cases or assertions; comment-only empty shells are rejected.
+- Audit intra-repo `implementationSurface` entry claims (`entryGlobs`, `excludeGlobs`, `requireCodeLocks`) and cross-repo bidirectional allocations (`artifacts/portfolio-allocations.json` / `artifacts/upstream-bindings.json`) with `artifact-graph alignment-audit [--root .] [--strict] [--format json|markdown]`. Portfolio `computedSatisfaction` strictly separates static double-lock readiness (`traceability_locked`, fresh `implements` + `verifies` locks scoped to each allocation's `targetUid` downstream lineage) from execution-backed completion (`verified_satisfied`, requiring real passing execution receipts or a valid `readonlyTarget` audit receipt), and supports retired targets marked `allocationStatus: "absorbed"` with an `absorbedBy` carrier. Synchronize mutual digests explicitly with `artifact-graph alignment-lock`.
 - Version lock covers both implementation/verification edges (`locks`) and artifact-to-artifact
   relations (`artifactRelations`). Old 1.0 lock files without `artifactRelations` are treated as
   having an empty relation list; run `refresh --all` once to establish the complete relation baseline.
-- Install opt-in Git hooks with `artifact-graph hooks install-git --hook all`.
+- Install opt-in Git hooks with `artifact-graph hooks install-git --hook all`, and remove managed hook blocks idempotently with `artifact-graph hooks uninstall --hook all` while preserving custom user hook lines.
 - Inspect and plan artifact restructuring with `artifact-graph restructure inspect` and
   `artifact-graph restructure plan`. These two are read-only compilations of a mapping you supply.
 
@@ -279,6 +291,7 @@ independence.
 
 ## Documentation
 
+- [Online Knowledge Site (GitHub Pages)](https://ifoohoo.github.io/artifact-chain-assistant-site/) — overview, 10-minute quickstart, alignment model, workflows, CLI reference, and troubleshooting
 - [INSTALL.md](INSTALL.md) — detailed installation and pnpm 10+ setup guide
 - [CHANGELOG.md](CHANGELOG.md) — release history
 - [CONTRIBUTING.md](CONTRIBUTING.md) — contribution guidelines

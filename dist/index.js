@@ -343,7 +343,20 @@ var init_glob_matcher = __esm({
 // src/file-walker.ts
 import { readdir } from "fs/promises";
 import { join, relative } from "path";
-async function walkFiles(root, current = root, readDirectory = defaultReadDirectory) {
+function collectExplicitHiddenDirSegments(patterns) {
+  const segments = /* @__PURE__ */ new Set();
+  for (const rawPattern of patterns) {
+    const parts = rawPattern.replace(/\\/g, "/").replace(/^\.\//, "").split("/");
+    for (let i = 0; i < parts.length - 1; i += 1) {
+      const part = parts[i];
+      if (part.startsWith(".") && part !== "." && part !== "..") {
+        segments.add(part);
+      }
+    }
+  }
+  return [...segments];
+}
+async function walkFiles(root, current = root, readDirectory = defaultReadDirectory, allowedHiddenDirSegments = []) {
   let entries;
   try {
     entries = await readDirectory(current, { withFileTypes: true });
@@ -355,23 +368,47 @@ async function walkFiles(root, current = root, readDirectory = defaultReadDirect
   }
   const files = [];
   for (const entry of entries) {
-    if (entry.name === "node_modules" || entry.name === "dist" || entry.name === ".git" || entry.name === ".artifact-graph") {
+    if (SKIPPED_WALK_DIRS.has(entry.name)) {
+      continue;
+    }
+    if (entry.isSymbolicLink()) {
       continue;
     }
     const fullPath = join(current, entry.name);
     if (entry.isDirectory()) {
-      files.push(...await walkFiles(root, fullPath, readDirectory));
-    } else {
+      if (entry.name.startsWith(".") && !allowedHiddenDirSegments.some((segPattern) => matchesRunnerGlob(entry.name, segPattern))) {
+        continue;
+      }
+      files.push(...await walkFiles(root, fullPath, readDirectory, allowedHiddenDirSegments));
+    } else if (entry.isFile()) {
       files.push(relative(root, fullPath).split("\\").join("/"));
     }
   }
   return files;
 }
-var defaultReadDirectory;
+var defaultReadDirectory, SKIPPED_WALK_DIRS;
 var init_file_walker = __esm({
   "src/file-walker.ts"() {
     "use strict";
+    init_glob_matcher();
     defaultReadDirectory = readdir;
+    SKIPPED_WALK_DIRS = /* @__PURE__ */ new Set([
+      "node_modules",
+      "dist",
+      ".git",
+      ".artifact-graph",
+      ".artifacts",
+      ".runs",
+      ".evidence",
+      ".cache",
+      ".release-skill",
+      ".foundation",
+      ".pytest_cache",
+      "coverage",
+      "_archives",
+      "_worktrees",
+      "_scratch"
+    ]);
   }
 });
 
@@ -469,6 +506,7 @@ function collectNestedUnknownKeyWarnings(document, warnings) {
     warnUnknownArrayObjectKeys(e2eRecord.feature_waivers, "e2e.feature_waivers", WAIVER_KEYS, warnings);
     warnUnknownArrayObjectKeys(e2eRecord.runners, "e2e.runners", RUNNER_KEYS, warnings);
   }
+  warnUnknownObjectKeys(document.implementationSurface, "implementationSurface", IMPLEMENTATION_SURFACE_KEYS, warnings);
 }
 function typeHasDefaultPaths(typeName) {
   const base = DEFAULT_SCHEMA.types[typeName];
@@ -657,11 +695,62 @@ function collectAllowedEdgesPresenceError(document, errors) {
     pushError(errors, "allowedEdges", ALLOWED_EDGES_REQUIRED_MESSAGE);
   }
 }
+function collectJsonArtifactTypeErrors(types, errors) {
+  if (types === void 0 || typeof types !== "object" || types === null || Array.isArray(types)) return;
+  for (const [typeName, definition] of Object.entries(types)) {
+    if (!definition || typeof definition !== "object" || Array.isArray(definition)) continue;
+    const raw = definition;
+    if (raw.format === void 0) {
+      if (raw.idField !== void 0) {
+        pushError(errors, `types.${typeName}.idField`, `Invalid types.${typeName}.idField: idField requires format json.`);
+      }
+      continue;
+    }
+    if (raw.format !== "json") {
+      pushError(errors, `types.${typeName}.format`, `Invalid types.${typeName}.format: only json is supported. Omit format to keep Markdown parsing.`);
+      continue;
+    }
+    if (SPECIALIZED_PARSER_TYPES.has(typeName)) {
+      pushError(errors, `types.${typeName}.format`, `Invalid types.${typeName}.format: JSON format applies only to custom types. ${typeName} keeps its dedicated parser.`);
+      continue;
+    }
+    if (typeof raw.idField !== "string" || raw.idField.length === 0 || raw.idField.trim() !== raw.idField) {
+      pushError(errors, `types.${typeName}.idField`, `Invalid types.${typeName}.idField: format json requires the name of one root property.`);
+    }
+  }
+}
+function collectImplementationSurfaceErrors(value, errors) {
+  if (value === void 0) return;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    pushError(errors, "implementationSurface", "implementationSurface \u914D\u7F6E\u65E0\u6548\uFF1A\u5FC5\u987B\u4E3A\u5305\u542B entryGlobs\u3001excludeGlobs \u6216 requireCodeLocks \u7684\u5BF9\u8C61\u3002");
+    return;
+  }
+  const record = value;
+  for (const field of ["entryGlobs", "excludeGlobs"]) {
+    if (record[field] !== void 0) {
+      if (!Array.isArray(record[field]) || record[field].some((item) => typeof item !== "string" || !item.trim())) {
+        pushError(errors, `implementationSurface.${field}`, `implementationSurface.${field} \u914D\u7F6E\u65E0\u6548\uFF1A\u5FC5\u987B\u7531\u975E\u7A7A glob \u5B57\u7B26\u4E32\u7EC4\u6210\u7684\u6570\u7EC4\u6784\u6210\u3002`);
+      }
+    }
+  }
+  if (record.requireCodeLocks !== void 0 && typeof record.requireCodeLocks !== "boolean") {
+    pushError(errors, "implementationSurface.requireCodeLocks", "implementationSurface.requireCodeLocks \u914D\u7F6E\u65E0\u6548\uFF1A\u5FC5\u987B\u4E3A\u5E03\u5C14\u503C\uFF08true \u6216 false\uFF09\u3002");
+  }
+}
+function collectStudioConfigErrors(value, errors) {
+  if (value === void 0) return;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    pushError(errors, "studio", "studio \u914D\u7F6E\u65E0\u6548\uFF1A\u5FC5\u987B\u4E3A\u952E\u503C\u5BF9\u8C61\uFF0C\u4F9B\u5DE5\u4F5C\u53F0\u58F0\u660E\u626B\u63CF\u76EE\u5F55\u4E0E\u5C55\u793A\u5206\u7EC4\u3002");
+  }
+}
 function collectExistingLoaderErrors(document, errors) {
   collectCustomTypePathErrors(document.types, errors);
+  collectJsonArtifactTypeErrors(document.types, errors);
   collectE2eConfigErrors(document.e2e, errors);
   collectRelationSemanticsErrors(document.relationSemantics, errors);
   collectStatusViewsErrors(document.statusViews, errors);
+  collectImplementationSurfaceErrors(document.implementationSurface, errors);
+  collectStudioConfigErrors(document.studio, errors);
   collectAllowedEdgesPresenceError(document, errors);
 }
 function diagnoseConfigDocument(parsed) {
@@ -731,7 +820,7 @@ async function diagnoseProjectConfig(root) {
   const diagnosis = diagnoseConfigDocument(document);
   return { exists: true, errors: diagnosis.errors, warnings: diagnosis.warnings };
 }
-var KNOWN_TOP_LEVEL_KEYS, TYPE_OBJECT_KEYS, EXTRA_FIELD_KEYS, EDGE_RULE_KEYS, CONTEXT_KEYS, ID_RANGE_ENTRY_KEYS, RELATION_SEMANTICS_KEYS, RELATION_PARTIAL_KEYS, E2E_KEYS, WAIVER_KEYS, RUNNER_KEYS, EDGE_RULE_SCHEMA, EXTRA_FIELD_SCHEMA, ID_RANGE_ENTRY_SCHEMA, CONFIG_SHAPE_SCHEMA, _validateConfigShape, ALLOWED_EDGES_REQUIRED_MESSAGE;
+var KNOWN_TOP_LEVEL_KEYS, IMPLEMENTATION_SURFACE_KEYS, TYPE_OBJECT_KEYS, EXTRA_FIELD_KEYS, EDGE_RULE_KEYS, CONTEXT_KEYS, ID_RANGE_ENTRY_KEYS, RELATION_SEMANTICS_KEYS, RELATION_PARTIAL_KEYS, E2E_KEYS, WAIVER_KEYS, RUNNER_KEYS, EDGE_RULE_SCHEMA, EXTRA_FIELD_SCHEMA, ID_RANGE_ENTRY_SCHEMA, CONFIG_SHAPE_SCHEMA, _validateConfigShape, ALLOWED_EDGES_REQUIRED_MESSAGE;
 var init_doctor = __esm({
   "src/doctor.ts"() {
     "use strict";
@@ -747,7 +836,14 @@ var init_doctor = __esm({
       "relationSemantics",
       "statusViews",
       "context",
-      "e2e"
+      "e2e",
+      "implementationSurface",
+      "studio"
+    ]);
+    IMPLEMENTATION_SURFACE_KEYS = /* @__PURE__ */ new Set([
+      "entryGlobs",
+      "excludeGlobs",
+      "requireCodeLocks"
     ]);
     TYPE_OBJECT_KEYS = /* @__PURE__ */ new Set([
       "paths",
@@ -959,15 +1055,19 @@ async function collectChangedPaths(root, options) {
 function gitDiffArgs(options) {
   const common = ["diff", "--name-only", "-z", "--diff-filter=ACDMRT"];
   if (options.mode === "staged") {
-    return [...common, "--cached"];
+    return [...common, "--cached", "--"];
   }
   if (options.mode === "worktree") {
-    return common;
+    return [...common, "--"];
   }
-  if (!options.base) {
+  const base = options.base?.trim();
+  if (!base) {
     throw new Error("--base requires a ref when collecting base changed paths");
   }
-  return [...common, `${options.base}...HEAD`];
+  if (base.startsWith("-") || /[\x00-\x1f\x7f\s]/.test(base)) {
+    throw new Error(`Invalid git base ref: ${options.base}`);
+  }
+  return [...common, `${base}...HEAD`, "--"];
 }
 async function collectUnstagedPaths(root) {
   try {
@@ -1005,9 +1105,9 @@ var init_git_changes = __esm({
 
 // src/versioned-traceability.ts
 import { createHash } from "crypto";
-import { existsSync } from "fs";
+import { existsSync, lstatSync, realpathSync } from "fs";
 import { mkdir, readFile as readFile2, writeFile } from "fs/promises";
-import { dirname, join as join3, relative as relative2 } from "path";
+import { dirname, isAbsolute as isAbsolute2, join as join3, relative as relative2, resolve } from "path";
 async function buildVersionIndex(root, graph) {
   const scannedGraph = graph ?? await scanArtifacts(root);
   const hashCache = /* @__PURE__ */ new Map();
@@ -1050,10 +1150,13 @@ async function auditVersionLock(root, lockPath = VERSION_LOCK_PATH, graph, confi
   const lock = await readVersionLock(root, safeLockPath);
   const nodeByArtifact = new Map(index.nodes.map((node) => [`${node.type}:${node.id}`, node]));
   const nodeByPath = new Map(index.nodes.map((node) => [node.path, node]));
+  const nodeByUid = new Map(index.nodes.map((node) => [node.uid, node]));
+  const emptyShellCache = /* @__PURE__ */ new Map();
   const currentEdges = implementationEdges(index);
-  const lockableEdges = await lockableImplementationEdges(root, index, schema);
+  const lockableEdges = await lockableImplementationEdges(root, index, schema, emptyShellCache);
   const currentEdgeIds = new Set(currentEdges.map((edge2) => edge2.edgeId));
   const issues = [];
+  const reportedShellEdgeIds = /* @__PURE__ */ new Set();
   let fresh = 0;
   for (const entry of lock.locks) {
     const artifactNode = nodeByArtifact.get(`${entry.artifact.type}:${entry.artifact.id}`);
@@ -1069,6 +1172,16 @@ async function auditVersionLock(root, lockPath = VERSION_LOCK_PATH, graph, confi
       continue;
     }
     const entryIssues = [];
+    if (entry.kind === "verifies" && await isEmptyShellTestFile(root, entry.source.path, emptyShellCache)) {
+      reportedShellEdgeIds.add(entry.edgeId);
+      entryIssues.push({
+        status: "invalid_test_shell",
+        edgeId: entry.edgeId,
+        message: `Empty-shell test file ${entry.source.path} lacks real test or assertion statements and cannot satisfy verifies lock`,
+        artifact: entry.artifact,
+        source: entry.source
+      });
+    }
     if (!currentEdgeIds.has(entry.edgeId)) {
       entryIssues.push({
         status: "orphan_lock",
@@ -1132,6 +1245,16 @@ async function auditVersionLock(root, lockPath = VERSION_LOCK_PATH, graph, confi
           verifiedByPath: verifiedBy.path
         });
       }
+      if (verifierNode.sourceKind === "test" && await isEmptyShellTestFile(root, verifiedBy.path, emptyShellCache)) {
+        entryIssues.push({
+          status: "invalid_test_shell",
+          edgeId: entry.edgeId,
+          message: `Verifier empty-shell test file ${verifiedBy.path} lacks real test or assertion statements`,
+          artifact: entry.artifact,
+          source: entry.source,
+          verifiedByPath: verifiedBy.path
+        });
+      }
     }
     if (entryIssues.length === 0) {
       fresh += 1;
@@ -1162,6 +1285,26 @@ async function auditVersionLock(root, lockPath = VERSION_LOCK_PATH, graph, confi
     }
   }
   const reportedMissingLocks = /* @__PURE__ */ new Set();
+  for (const edge2 of currentEdges) {
+    if (edge2.kind !== "verifies" || reportedShellEdgeIds.has(edge2.edgeId)) {
+      continue;
+    }
+    const source = nodeByUid.get(edge2.from);
+    if (!source || source.sourceKind !== "test") {
+      continue;
+    }
+    if (await isEmptyShellTestFile(root, source.path, emptyShellCache)) {
+      reportedShellEdgeIds.add(edge2.edgeId);
+      const artifact = nodeByUid.get(edge2.to);
+      issues.push({
+        status: "invalid_test_shell",
+        edgeId: edge2.edgeId,
+        message: `Empty-shell test file ${source.path} lacks real test or assertion statements and cannot be locked`,
+        artifact: artifact ? lockRefFromNode(artifact) : void 0,
+        source: sourceRefFromNode(source)
+      });
+    }
+  }
   for (const edge2 of lockableEdges) {
     const edgeId = edge2.edgeId;
     if (!lock.locks.some((entry) => entry.edgeId === edgeId)) {
@@ -1354,6 +1497,11 @@ function versionLockIssueRemediation(issue2) {
         "\u68C0\u67E5 `--target` \u7684 `type:id` \u662F\u5426\u62FC\u5199\u6B63\u786E\u3002",
         "\u5982\u679C\u8BE5\u5236\u54C1\u5DF2\u88AB\u5220\u9664\u6216\u6539\u540D\uFF0C\u6539\u7528\u5F53\u524D\u5B58\u5728\u7684\u5236\u54C1\u6807\u8BC6\u91CD\u8BD5\u3002"
       ];
+    case "invalid_test_shell":
+      return [
+        "\u88AB\u8FFD\u6EAF\u6CE8\u91CA\u6807\u8BB0\u7684\u6D4B\u8BD5\u6587\u4EF6\u5265\u79BB\u6CE8\u91CA\u540E\u7F3A\u5C11\u771F\u5B9E\u6D4B\u8BD5\u6216\u65AD\u8A00\u8BED\u53E5\uFF08\u5982 test/it/describe/expect/assert/def test_\uFF09\u3002",
+        "\u8BF7\u8865\u5145\u771F\u5B9E\u53EF\u6267\u884C\u7684\u6D4B\u8BD5\u4E0E\u65AD\u8A00\u4EE3\u7801\u540E\u518D\u8FD0\u884C `artifact-graph version-lock refresh --all` \u5EFA\u9501\u3002"
+      ];
     default:
       return [];
   }
@@ -1385,7 +1533,12 @@ async function updateVersionLock(root, options) {
   if (!matchingEdge) {
     throw new Error(`Source ${sourcePath} does not declare a traceability link to ${options.target}`);
   }
-  const verifiedBy = (options.verifiedBy ?? []).map((path) => {
+  const emptyShellCache = /* @__PURE__ */ new Map();
+  if (source.sourceKind === "test" && await isEmptyShellTestFile(root, sourcePath, emptyShellCache)) {
+    throw new Error(`Empty-shell test file ${sourcePath} lacks real test or assertion statements and cannot be locked`);
+  }
+  const verifiedBy = [];
+  for (const path of options.verifiedBy ?? []) {
     const verifierPath = normalizeRelativePath(root, path);
     const verifier = index.nodes.find((node) => node.path === verifierPath);
     if (!verifier) {
@@ -1398,8 +1551,11 @@ async function updateVersionLock(root, options) {
     if (!verifierEdge) {
       throw new Error(`Verifier ${verifierPath} does not declare a traceability link to ${options.target}`);
     }
-    return sourceRefFromNode(verifier);
-  });
+    if (verifier.sourceKind === "test" && await isEmptyShellTestFile(root, verifierPath, emptyShellCache)) {
+      throw new Error(`Empty-shell test file ${verifierPath} lacks real test or assertion statements and cannot be used as verifiedBy`);
+    }
+    verifiedBy.push(sourceRefFromNode(verifier));
+  }
   const kind = source.sourceKind === "test" ? "verifies" : "implements";
   const entry = {
     edgeId: lockEdgeIdFor(source, artifact, kind),
@@ -2003,11 +2159,15 @@ function requireHash(value, path) {
   return hash;
 }
 function requireSafeRelativePath(value, path) {
+  if (value.includes("\0")) {
+    throw new Error(`Invalid version lock entry at ${path}: path must not contain null byte`);
+  }
   const normalized = value.replace(/\\/g, "/").replace(/^\.\//, "");
-  if (normalized.startsWith("/") || normalized === ".." || normalized.startsWith("../")) {
+  const segments = normalized.split("/").filter((seg) => seg.length > 0 && seg !== ".");
+  if (normalized.startsWith("/") || segments.length === 0 || segments.includes("..")) {
     throw new Error(`Invalid version lock entry at ${path}: path must stay within root`);
   }
-  return normalized;
+  return segments.join("/");
 }
 async function writeVersionLock(root, lockPath, lock) {
   const safeLockPath = normalizeRelativePath(root, lockPath);
@@ -2032,7 +2192,7 @@ function implementationEdges(index) {
     };
   });
 }
-async function lockableImplementationEdges(root, index, config) {
+async function lockableImplementationEdges(root, index, config, emptyShellCache = /* @__PURE__ */ new Map()) {
   const edges = implementationEdges(index);
   const nodesByUid = new Map(index.nodes.map((node) => [node.uid, node]));
   const livenessByPath = /* @__PURE__ */ new Map();
@@ -2041,6 +2201,9 @@ async function lockableImplementationEdges(root, index, config) {
     const source = nodesByUid.get(edge2.from);
     if (source?.sourceKind !== "test") {
       result.push(edge2);
+      continue;
+    }
+    if (await isEmptyShellTestFile(root, source.path, emptyShellCache)) {
       continue;
     }
     let liveness = livenessByPath.get(source.path);
@@ -2199,13 +2362,164 @@ async function hashRelativePath(root, path, cache) {
   cache.set(normalized, hash);
   return hash;
 }
-function normalizeRelativePath(root, path) {
-  const normalized = path.replace(/\\/g, "/");
-  const relativePath = normalized.startsWith("/") ? relative2(root, normalized).replace(/\\/g, "/") : normalized.replace(/^\.\//, "");
-  if (relativePath === ".." || relativePath.startsWith("../")) {
-    throw new Error(`Path is outside root: ${path}`);
+function stripCodeComments(raw, isPython) {
+  if (isPython) {
+    let out2 = "";
+    let i2 = 0;
+    let quote2;
+    while (i2 < raw.length) {
+      if (quote2) {
+        if (quote2.length === 3) {
+          if (raw.startsWith(quote2, i2)) {
+            i2 += 3;
+            quote2 = void 0;
+            continue;
+          }
+          if (raw[i2] === "\\") {
+            i2 += 2;
+            continue;
+          }
+          i2 += 1;
+          continue;
+        }
+        const ch2 = raw[i2];
+        out2 += ch2;
+        if (ch2 === "\\") {
+          out2 += raw[i2 + 1] ?? "";
+          i2 += 2;
+          continue;
+        }
+        if (ch2 === quote2) {
+          quote2 = void 0;
+        }
+        i2 += 1;
+        continue;
+      }
+      if (raw.startsWith("'''", i2) || raw.startsWith('"""', i2)) {
+        quote2 = raw.slice(i2, i2 + 3);
+        i2 += 3;
+        continue;
+      }
+      const ch = raw[i2];
+      if (ch === "'" || ch === '"') {
+        quote2 = ch;
+        out2 += ch;
+        i2 += 1;
+        continue;
+      }
+      if (ch === "#") {
+        while (i2 < raw.length && raw[i2] !== "\n") i2 += 1;
+        continue;
+      }
+      out2 += ch;
+      i2 += 1;
+    }
+    return out2;
   }
-  return relativePath;
+  let out = "";
+  let i = 0;
+  let quote;
+  while (i < raw.length) {
+    const ch = raw[i];
+    if (quote) {
+      out += ch;
+      if (ch === "\\") {
+        out += raw[i + 1] ?? "";
+        i += 2;
+        continue;
+      }
+      if (ch === quote) {
+        quote = void 0;
+      }
+      i += 1;
+      continue;
+    }
+    if (ch === "'" || ch === '"' || ch === "`") {
+      quote = ch;
+      out += ch;
+      i += 1;
+      continue;
+    }
+    if (ch === "/" && raw[i + 1] === "/") {
+      while (i < raw.length && raw[i] !== "\n") i += 1;
+      continue;
+    }
+    if (ch === "/" && raw[i + 1] === "*") {
+      i += 2;
+      while (i < raw.length && !(raw[i] === "*" && raw[i + 1] === "/")) i += 1;
+      i += 2;
+      out += " ";
+      continue;
+    }
+    out += ch;
+    i += 1;
+  }
+  return out;
+}
+async function isEmptyShellTestFile(root, relPath, cache) {
+  const cached = cache.get(relPath);
+  if (cached !== void 0) return cached;
+  if (!CODE_TEST_FILE_EXT_RE.test(relPath)) {
+    cache.set(relPath, false);
+    return false;
+  }
+  try {
+    const safePath = normalizeRelativePath(root, relPath);
+    const raw = await readFile2(join3(root, safePath), "utf-8");
+    const stripped = stripCodeComments(raw, relPath.toLowerCase().endsWith(".py"));
+    const isEmpty = !REAL_TEST_OR_ASSERT_RE.test(stripped);
+    cache.set(relPath, isEmpty);
+    return isEmpty;
+  } catch {
+    cache.set(relPath, false);
+    return false;
+  }
+}
+function nearestExistingAncestorSync(absPath) {
+  let cursor = absPath;
+  while (!existsSync(cursor)) {
+    const parent = dirname(cursor);
+    if (parent === cursor) break;
+    cursor = parent;
+  }
+  return cursor;
+}
+function normalizeRelativePath(root, inputPath) {
+  if (typeof inputPath !== "string" || inputPath.trim().length === 0 || inputPath.includes("\0")) {
+    throw new Error(`Invalid path: ${inputPath}`);
+  }
+  const normalizedInput = inputPath.replace(/\\/g, "/");
+  const resolvedRoot = resolve(root);
+  const realRoot = existsSync(resolvedRoot) ? realpathSync(resolvedRoot) : resolvedRoot;
+  const resolvedTarget = isAbsolute2(normalizedInput) ? (() => {
+    const abs = resolve(normalizedInput);
+    const anc = nearestExistingAncestorSync(abs);
+    if (!existsSync(anc)) return abs;
+    const tail = relative2(anc, abs);
+    return tail ? join3(realpathSync(anc), tail) : realpathSync(anc);
+  })() : resolve(realRoot, normalizedInput);
+  const rel = relative2(realRoot, resolvedTarget).replace(/\\/g, "/");
+  if (rel === "" || rel === ".." || rel.startsWith("../") || isAbsolute2(rel)) {
+    throw new Error(`Path is outside root: ${inputPath}`);
+  }
+  const ancestor = nearestExistingAncestorSync(resolvedTarget);
+  if (existsSync(ancestor)) {
+    const realAncestor = realpathSync(ancestor);
+    const relAncestor = relative2(realRoot, realAncestor).replace(/\\/g, "/");
+    if (relAncestor === ".." || relAncestor.startsWith("../") || isAbsolute2(relAncestor)) {
+      throw new Error(`Path escapes root via symlink: ${inputPath}`);
+    }
+  }
+  try {
+    if (lstatSync(resolvedTarget).isSymbolicLink()) {
+      throw new Error(`Symlink path is outside allowed policy: ${inputPath}`);
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      throw error;
+    }
+  }
+  return rel;
 }
 function sortBy(items, keyFn) {
   return [...items].sort((left, right) => keyFn(left).localeCompare(keyFn(right)));
@@ -2260,7 +2574,7 @@ async function isFileActiveInRunner(root, filePath, runner) {
 function sortUnique2(items) {
   return [...new Set(items)].sort((left, right) => left.localeCompare(right));
 }
-var VERSION_LOCK_PATH, VERSION_INDEX_SCHEMA_VERSION, VERSION_LOCK_SCHEMA_VERSION, LIVENESS_MESSAGE_PREFIX, VERSION_LOCK_STATUS_LABELS;
+var VERSION_LOCK_PATH, VERSION_INDEX_SCHEMA_VERSION, VERSION_LOCK_SCHEMA_VERSION, LIVENESS_MESSAGE_PREFIX, VERSION_LOCK_STATUS_LABELS, CODE_TEST_FILE_EXT_RE, REAL_TEST_OR_ASSERT_RE;
 var init_versioned_traceability = __esm({
   "src/versioned-traceability.ts"() {
     "use strict";
@@ -2277,15 +2591,18 @@ var init_versioned_traceability = __esm({
       source_changed: "\u6E90\u7801/\u6D4B\u8BD5\u5DF2\u53D8\u5316",
       verified_by_changed: "\u9A8C\u8BC1\u6587\u4EF6\u5DF2\u53D8\u5316",
       missing_lock: "\u7F3A\u5C11\u7248\u672C\u9501",
-      orphan_lock: "\u5B64\u7ACB\u9501"
+      orphan_lock: "\u5B64\u7ACB\u9501",
+      invalid_test_shell: "\u65E0\u6548\u7A7A\u58F3\u6D4B\u8BD5"
     };
+    CODE_TEST_FILE_EXT_RE = /\.(?:ts|tsx|js|jsx|mjs|cjs|py)$/i;
+    REAL_TEST_OR_ASSERT_RE = /(?:^|[^A-Za-z0-9_$])(?:test|it|describe|expect)\s*\(|(?:^|[^A-Za-z0-9_$])assert(?:[A-Za-z0-9_]*\s*\(|\.[A-Za-z_][A-Za-z0-9_]*|\s+(?![:=]))|(?:^|[^A-Za-z0-9_$])def\s+test_[A-Za-z0-9_]*\s*\(/m;
   }
 });
 
 // src/impact.ts
-import { isAbsolute as isAbsolute2, normalize, relative as relative3, resolve } from "path";
+import { isAbsolute as isAbsolute3, normalize, relative as relative3, resolve as resolve2 } from "path";
 async function computeImpact(root, options = {}) {
-  const absoluteRoot = resolve(root);
+  const absoluteRoot = resolve2(root);
   const mode = options.mode ?? "worktree";
   if (mode === "base" && !options.base) throw new Error("Impact mode base requires a base ref.");
   if (mode === "paths" && !options.paths) throw new Error("Impact mode paths requires paths.");
@@ -2357,7 +2674,7 @@ function normalizeExplicitPaths(root, paths) {
   const normalized = paths.map((input) => {
     const value = input.trim();
     if (!value) return "";
-    const absolutePath = isAbsolute2(value) ? normalize(value) : resolve(root, value);
+    const absolutePath = isAbsolute3(value) ? normalize(value) : resolve2(root, value);
     const projectRelative = relative3(root, absolutePath);
     const result = projectRelative.replace(/\\/g, "/").replace(/^\.\//, "");
     if (result === ".." || result.startsWith("../") || result.startsWith("/")) {
@@ -2393,9 +2710,9 @@ var init_impact = __esm({
 });
 
 // src/coverage.ts
-import { resolve as resolve2 } from "path";
+import { resolve as resolve3 } from "path";
 async function computeCoverageBoundary(root, opts = {}) {
-  const absoluteRoot = resolve2(root);
+  const absoluteRoot = resolve3(root);
   const schema = opts.schema ?? await loadConfig(absoluteRoot);
   const graph = await scanArtifacts(absoluteRoot, schema);
   const issues = validateGraph(graph, schema);
@@ -2417,7 +2734,8 @@ async function computeCoverageBoundary(root, opts = {}) {
     ...graph.edges.map((candidate) => candidate.sourcePath)
   ]);
   const configuredTypes = Object.keys(schema.types).sort((left, right) => left.localeCompare(right));
-  const scannedFiles = (await walkFiles(absoluteRoot)).filter((path) => matchesConfiguredArtifactPath(path, schema));
+  const allTypePatterns = Object.values(schema.types).flatMap((def) => def.paths);
+  const scannedFiles = (await walkFiles(absoluteRoot, absoluteRoot, void 0, collectExplicitHiddenDirSegments(allTypePatterns))).filter((path) => matchesConfiguredArtifactPath(path, schema));
   const declaredReferences = graph.edges.filter((candidate) => ["implements", "verifies", "evidence"].includes(candidate.kind)).map((candidate) => ({
     from: candidate.from,
     to: candidate.to,
@@ -3700,9 +4018,9 @@ var init_native_binding_diagnostics = __esm({
 
 // src/cli-resolver.ts
 import { execFile as execFile2 } from "child_process";
-import { constants, readFileSync, realpathSync } from "fs";
+import { constants, readFileSync, realpathSync as realpathSync2 } from "fs";
 import { access } from "fs/promises";
-import { basename, dirname as dirname3, isAbsolute as isAbsolute3, join as join6, resolve as resolve3 } from "path";
+import { basename, dirname as dirname3, isAbsolute as isAbsolute4, join as join6, resolve as resolve4 } from "path";
 import { promisify as promisify2 } from "util";
 async function resolveArtifactGraphCli(root, options = {}) {
   const pathCli = await findCommandOnPath("artifact-graph");
@@ -3895,7 +4213,7 @@ async function findCommandOnPath(command) {
   }
 }
 function resolveCandidatePath(root, candidatePath) {
-  return isAbsolute3(candidatePath) ? candidatePath : resolve3(root, candidatePath);
+  return isAbsolute4(candidatePath) ? candidatePath : resolve4(root, candidatePath);
 }
 function isNodeCompatible(version) {
   const match = /^(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.-]+)?$/.exec(version);
@@ -3951,11 +4269,11 @@ function readBinShimTarget(shimPath) {
   if (!content.startsWith("#!")) return void 0;
   const match = /\$basedir\/(\.\.(?:\/[^"'\s]+)+\.js)/.exec(content);
   if (!match) return void 0;
-  return resolve3(dirname3(shimPath), match[1]);
+  return resolve4(dirname3(shimPath), match[1]);
 }
 function safeRealpath(path) {
   try {
-    return realpathSync(path);
+    return realpathSync2(path);
   } catch {
     return path;
   }
@@ -3986,6 +4304,8 @@ var init_cli_resolver = __esm({
       "version-lock update",
       "version-lock bootstrap",
       "version-lock refresh",
+      "alignment-audit",
+      "alignment-lock",
       "trace-version",
       "next-id",
       "refactor-id",
@@ -3997,7 +4317,7 @@ var init_cli_resolver = __esm({
 
 // src/git-hook-path.ts
 import { execFile as execFile3 } from "child_process";
-import { isAbsolute as isAbsolute4, resolve as resolve4 } from "path";
+import { isAbsolute as isAbsolute5, resolve as resolve5 } from "path";
 import { promisify as promisify3 } from "util";
 async function resolveGitHookPath(root, hookName) {
   const { stdout } = await execFileAsync3("git", [
@@ -4009,7 +4329,7 @@ async function resolveGitHookPath(root, hookName) {
   ]);
   const value = stdout.trim();
   if (!value) throw new Error(`Git returned an empty hook path for ${hookName}`);
-  return isAbsolute4(value) ? resolve4(value) : resolve4(root, value);
+  return isAbsolute5(value) ? resolve5(value) : resolve5(root, value);
 }
 var execFileAsync3;
 var init_git_hook_path = __esm({
@@ -4133,6 +4453,15 @@ async function installManagedHookBlock(options) {
   const prepared = await prepareManagedHookBlock(options);
   return (await applyPreparedManagedHookBlocks([prepared]))[0];
 }
+async function uninstallManagedHookBlock(options) {
+  const prepared = await prepareManagedHookBlock({
+    hookPath: options.hookPath,
+    block: "",
+    markerId: options.markerId,
+    uninstall: true
+  });
+  return (await applyPreparedManagedHookBlocks([prepared]))[0];
+}
 function beginMarker(markerId) {
   return `# >>> ${markerId} managed block >>>`;
 }
@@ -4196,16 +4525,18 @@ function restoreManagedHook(content, range, currentMode, hookPath) {
     throw new InvalidManagedHookStateError(hookPath, "managed prefix does not match the recorded state");
   }
   const displaced = state.displacedBytes === null ? Buffer.alloc(0) : decodeBase64(state.displacedBytes, hookPath, "displacedBytes");
-  const bytes = Buffer.concat([
+  const rawRestored = Buffer.concat([
     content.subarray(0, prefixStart),
     displaced,
     content.subarray(range.end)
   ]);
+  const needsRetainedShebang = !state.originalExists && rawRestored.toString("utf8").trim().length > 0 && !rawRestored.toString("utf8").startsWith("#!") && managedPrefix.toString("utf8").startsWith("#!");
+  const bytes = needsRetainedShebang ? Buffer.concat([managedPrefix, rawRestored]) : rawRestored;
   const exists = state.originalExists || bytes.length > 0;
   return {
     exists,
     bytes,
-    mode: state.originalExists ? state.originalMode ?? void 0 : exists ? currentMode : void 0,
+    mode: state.originalExists ? state.originalMode ?? void 0 : exists ? executableHookMode(currentMode) : void 0,
     insertionOffset: prefixStart + displaced.length,
     managedPrefix
   };
@@ -4450,10 +4781,546 @@ var init_hook_installer = __esm({
   }
 });
 
+// src/inbox.ts
+import { lstatSync as lstatSync2, readlinkSync, realpathSync as realpathSync3 } from "fs";
+import { lstat as lstat2, mkdir as mkdir4, open as open2, readFile as readFile3, readdir as readdir2 } from "fs/promises";
+import { basename as basename3, dirname as dirname5, isAbsolute as isAbsolute6, join as join8, relative as relative4, resolve as resolve6, sep } from "path";
+function canonicalizePathWithMissingTail(targetPath, depth = 0) {
+  if (depth > 16) {
+    throw new Error(`\u6536\u4EF6\u7BB1\u8DEF\u5F84\u7B26\u53F7\u94FE\u63A5\u5C42\u7EA7\u8FC7\u6DF1\u6216\u5B58\u5728\u5FAA\u73AF\u5F15\u7528\uFF1A${targetPath}`);
+  }
+  let current = resolve6(targetPath);
+  const missingSegments = [];
+  while (true) {
+    try {
+      const statInfo = lstatSync2(current);
+      try {
+        const realExisting = realpathSync3(current);
+        return missingSegments.length > 0 ? join8(realExisting, ...missingSegments) : realExisting;
+      } catch (realErr) {
+        const code = realErr.code;
+        if (code === "ENOENT" && statInfo.isSymbolicLink()) {
+          const linkTarget = readlinkSync(current);
+          const resolvedLink = isAbsolute6(linkTarget) ? linkTarget : resolve6(dirname5(current), linkTarget);
+          const nextPath = missingSegments.length > 0 ? join8(resolvedLink, ...missingSegments) : resolvedLink;
+          return canonicalizePathWithMissingTail(nextPath, depth + 1);
+        }
+        if (code !== "ENOENT" && code !== "ENOTDIR") {
+          throw realErr;
+        }
+      }
+    } catch (statErr) {
+      const code = statErr.code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") {
+        throw statErr;
+      }
+    }
+    const parent = dirname5(current);
+    if (parent === current) {
+      return missingSegments.length > 0 ? join8(current, ...missingSegments) : current;
+    }
+    missingSegments.unshift(basename3(current));
+    current = parent;
+  }
+}
+function validatePositiveIntegerLimit(limit) {
+  if (limit === void 0) return void 0;
+  if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1) {
+    throw new Error(`\u53C2\u6570 --limit \u5FC5\u987B\u4E3A\u6B63\u6574\u6570\uFF08\u6536\u5230\uFF1A${String(limit)}\uFF09\uFF0C\u4F8B\u5982 --limit 5\u3002`);
+  }
+  return limit;
+}
+function validateMinScore(minScore, defaultValue = 0.15) {
+  if (minScore === void 0) return defaultValue;
+  if (typeof minScore !== "number" || !Number.isFinite(minScore) || minScore < 0 || minScore > 1) {
+    throw new Error(`\u53C2\u6570 --min-score \u5FC5\u987B\u4E3A 0 \u5230 1 \u4E4B\u95F4\u7684\u5408\u6CD5\u6570\u503C\uFF08\u6536\u5230\uFF1A${String(minScore)}\uFF09\uFF0C\u4F8B\u5982 --min-score 0.2\u3002`);
+  }
+  return minScore;
+}
+function resolveInboxFilePath(root = process.cwd(), inboxPath) {
+  const workspaceRoot = resolve6(root);
+  const candidate = !inboxPath ? join8(workspaceRoot, DEFAULT_INBOX_RELATIVE_PATH) : isAbsolute6(inboxPath) ? resolve6(inboxPath) : resolve6(workspaceRoot, inboxPath);
+  const realWorkspaceRoot = canonicalizePathWithMissingTail(workspaceRoot);
+  const realCandidate = canonicalizePathWithMissingTail(candidate);
+  const rel = relative4(realWorkspaceRoot, realCandidate);
+  if (rel === "") {
+    throw new Error(`\u6536\u4EF6\u7BB1\u6587\u4EF6\u8DEF\u5F84\u4E0D\u80FD\u76F4\u63A5\u6307\u5411\u5DE5\u4F5C\u533A\u6839\u76EE\u5F55\uFF1A${inboxPath ?? DEFAULT_INBOX_RELATIVE_PATH}`);
+  }
+  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute6(rel)) {
+    throw new Error(
+      `\u6536\u4EF6\u7BB1\u8DEF\u5F84\u4E0D\u80FD\u8D8A\u51FA\u5DE5\u4F5C\u533A\u6839\u76EE\u5F55\uFF08\u5DE5\u4F5C\u533A\uFF1A${workspaceRoot}\uFF0C\u4F20\u5165\u8DEF\u5F84\uFF1A${inboxPath ?? DEFAULT_INBOX_RELATIVE_PATH}\uFF09\u3002\u8BF7\u6539\u7528\u5DE5\u4F5C\u533A\u5185\u7684\u6587\u4EF6\u8DEF\u5F84\u3002`
+    );
+  }
+  return candidate;
+}
+async function readInboxIdeasFile(inboxFilePath) {
+  let raw;
+  try {
+    raw = await readFile3(inboxFilePath, "utf-8");
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
+  const ideas = [];
+  const lines = raw.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    let parsed;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      throw new Error(`\u6536\u4EF6\u7BB1\u6587\u4EF6 ${inboxFilePath} \u7B2C ${i + 1} \u884C\u4E0D\u662F\u5408\u6CD5 JSON\uFF0C\u8BF7\u5148\u68C0\u67E5\u6216\u4FEE\u590D\u8BE5\u884C\u3002`);
+    }
+    if (!parsed || typeof parsed !== "object" || typeof parsed.id !== "string" || typeof parsed.text !== "string") {
+      throw new Error(`\u6536\u4EF6\u7BB1\u6587\u4EF6 ${inboxFilePath} \u7B2C ${i + 1} \u884C\u7F3A\u5C11\u5FC5\u586B\u5B57\u7B26\u4E32\u5B57\u6BB5 id \u6216 text\u3002`);
+    }
+    ideas.push({
+      id: parsed.id,
+      text: parsed.text,
+      ...typeof parsed.context === "string" && parsed.context.length > 0 ? { context: parsed.context } : {},
+      ...Array.isArray(parsed.tags) ? { tags: parsed.tags.filter((t) => typeof t === "string") } : {},
+      source: typeof parsed.source === "string" && parsed.source.length > 0 ? parsed.source : "workspace-inbox",
+      createdAt: typeof parsed.createdAt === "string" ? parsed.createdAt : "",
+      status: "captured"
+    });
+  }
+  return ideas;
+}
+function nextIdeaId(existing) {
+  let maxNumber = 0;
+  for (const item of existing) {
+    const match = /^IDEA-(\d+)$/i.exec(item.id);
+    if (match) {
+      const value = Number.parseInt(match[1], 10);
+      if (Number.isInteger(value) && value > maxNumber) maxNumber = value;
+    }
+  }
+  return `IDEA-${String(maxNumber + 1).padStart(4, "0")}`;
+}
+async function addInboxIdea(options) {
+  const workspaceRoot = resolve6(options.root ?? process.cwd());
+  const text = typeof options.text === "string" ? options.text.trim() : "";
+  if (!text) {
+    throw new Error('\u60F3\u6CD5\u5185\u5BB9\u4E0D\u80FD\u4E3A\u7A7A\uFF1B\u8BF7\u4F20\u5165\u4E00\u53E5\u539F\u59CB\u60F3\u6CD5\u6587\u672C\uFF08\u4F8B\u5982\uFF1Aartifact-graph inbox add "\u5148\u4FDD\u5B58\u8DE8\u9879\u76EE\u60F3\u6CD5"\uFF09\u3002');
+  }
+  const inboxPath = resolveInboxFilePath(workspaceRoot, options.inboxPath);
+  const existing = await readInboxIdeasFile(inboxPath);
+  const matchResult = await matchInboxIdea({
+    root: workspaceRoot,
+    inboxPath,
+    query: text,
+    context: options.context,
+    limit: options.limit,
+    minScore: options.minScore
+  });
+  const tags = options.tags?.map((tag) => tag.trim()).filter((tag) => tag.length > 0);
+  const uniqueTags = tags && tags.length > 0 ? [...new Set(tags)] : void 0;
+  const context = typeof options.context === "string" && options.context.trim().length > 0 ? options.context.trim() : void 0;
+  const idea = {
+    id: nextIdeaId(existing),
+    text,
+    ...context ? { context } : {},
+    ...uniqueTags ? { tags: uniqueTags } : {},
+    source: typeof options.source === "string" && options.source.trim().length > 0 ? options.source.trim() : "workspace-inbox",
+    createdAt: typeof options.createdAt === "string" && options.createdAt.trim().length > 0 ? options.createdAt.trim() : (/* @__PURE__ */ new Date()).toISOString(),
+    status: "captured"
+  };
+  await mkdir4(dirname5(inboxPath), { recursive: true });
+  const handle = await open2(inboxPath, "a");
+  try {
+    await handle.writeFile(`${JSON.stringify(idea)}
+`, "utf-8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  return {
+    ok: true,
+    idea,
+    inboxPath,
+    related: matchResult.related,
+    scaffoldTriggered: false,
+    note: "\u60F3\u6CD5\u5DF2\u6309 captured \u72B6\u6001\u4FDD\u5B58\u5728\u5DE5\u4F5C\u533A\u6536\u4EF6\u7BB1\u4E2D\uFF0C\u672A\u81EA\u52A8\u521D\u59CB\u5316\u5DE5\u7A0B\u914D\u7F6E\u3001\u89C4\u683C\u6216\u542F\u52A8\u5F00\u53D1\u3002"
+  };
+}
+async function listInboxIdeas(options = {}) {
+  const workspaceRoot = resolve6(options.root ?? process.cwd());
+  const limit = validatePositiveIntegerLimit(options.limit);
+  const inboxPath = resolveInboxFilePath(workspaceRoot, options.inboxPath);
+  let ideas = await readInboxIdeasFile(inboxPath);
+  const total = ideas.length;
+  if (options.status) {
+    ideas = ideas.filter((item) => item.status === options.status);
+  }
+  if (options.tag) {
+    const wanted = options.tag.trim();
+    ideas = ideas.filter((item) => item.tags?.includes(wanted));
+  }
+  if (limit !== void 0) {
+    ideas = ideas.slice(-limit);
+  }
+  return {
+    ok: true,
+    inboxPath,
+    total,
+    ideas
+  };
+}
+async function matchInboxIdea(options) {
+  const workspaceRoot = resolve6(options.root ?? process.cwd());
+  const query = typeof options.query === "string" ? options.query.trim() : "";
+  if (!query) {
+    throw new Error("\u68C0\u7D22\u5185\u5BB9\u4E0D\u80FD\u4E3A\u7A7A\uFF1B\u8BF7\u63D0\u4F9B\u5F85\u6BD4\u5BF9\u7684\u60F3\u6CD5\u6216\u5173\u952E\u8BCD\u3002");
+  }
+  const limit = validatePositiveIntegerLimit(options.limit) ?? 5;
+  const minScore = validateMinScore(options.minScore, 0.15);
+  const inboxPath = resolveInboxFilePath(workspaceRoot, options.inboxPath);
+  const queryFull = options.context ? `${query} ${options.context}` : query;
+  const queryTerms = extractInformativeTerms(queryFull);
+  const normalizedQuery = normalizeCompact(query);
+  const docs = await collectWorkspaceCandidates(workspaceRoot, inboxPath);
+  const scored = [];
+  for (const doc of docs) {
+    if (options.excludeIdeaId && doc.kind === "inbox-idea" && doc.id === options.excludeIdeaId) {
+      continue;
+    }
+    const titleTerms = extractInformativeTerms(doc.title);
+    const bodyTerms = extractInformativeTerms(`${doc.title} ${doc.body}`);
+    const matchedTerms = [...queryTerms].filter((term) => bodyTerms.has(term));
+    const compactCandidate = normalizeCompact(`${doc.title} ${doc.body}`);
+    const exactSubstring = normalizedQuery.length >= 3 && compactCandidate.includes(normalizedQuery);
+    if (matchedTerms.length === 0 && !exactSubstring) {
+      continue;
+    }
+    let score = 0;
+    if (queryTerms.size > 0 && bodyTerms.size > 0) {
+      const titleHits = [...queryTerms].filter((term) => titleTerms.has(term)).length;
+      const fullRecall = matchedTerms.length / queryTerms.size;
+      const titleRecall = titleHits / queryTerms.size;
+      const dice = 2 * matchedTerms.length / (queryTerms.size + bodyTerms.size);
+      score = 0.45 * fullRecall + 0.35 * titleRecall + 0.2 * dice;
+    }
+    if (exactSubstring) {
+      score = Math.max(score, 0.65) + 0.2;
+    }
+    const rounded = Math.min(1, Number(score.toFixed(4)));
+    if (rounded < minScore) {
+      continue;
+    }
+    scored.push({
+      kind: doc.kind,
+      id: doc.id,
+      title: doc.title,
+      path: doc.path,
+      ...doc.status ? { status: doc.status } : {},
+      score: rounded,
+      matchedTerms: matchedTerms.slice(0, 8)
+    });
+  }
+  scored.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path) || a.id.localeCompare(b.id));
+  return {
+    ok: true,
+    query,
+    scannedSources: docs.length,
+    related: scored.slice(0, limit),
+    scaffoldTriggered: false,
+    note: "\u4EC5\u505A\u53EA\u8BFB\u8BCD\u6CD5\u76F8\u4F3C\u5EA6\u68C0\u7D22\u4EE5\u63D0\u793A\u6F5C\u5728\u91CD\u590D\u6216\u5173\u8054\u9879\uFF0C\u4E0D\u4F1A\u4FEE\u6539\u4EFB\u4F55\u4ED3\u5E93\u6587\u4EF6\u3002"
+  };
+}
+function normalizeCompact(text) {
+  return text.toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, "");
+}
+function extractInformativeTerms(text) {
+  const terms = /* @__PURE__ */ new Set();
+  const lowered = text.toLowerCase();
+  for (const match of lowered.matchAll(/[a-z0-9][a-z0-9_-]{1,}/g)) {
+    const token = match[0];
+    if (!ASCII_STOPWORDS.has(token) && !/^\d+$/.test(token)) {
+      terms.add(token);
+    }
+  }
+  for (const runMatch of text.matchAll(/[\u4e00-\u9fff]{2,}/g)) {
+    const chunks = runMatch[0].split(/[的了是在有和与或把被让给对从向到于及等个这那我你他它要能可会就都更最很也还只但而并且先再暂未已将用按为中上下前后里外]/g).filter((chunk) => chunk.length >= 2);
+    for (const chunk of chunks) {
+      if (chunk.length === 2) {
+        if (!CJK_BOILERPLATE.has(chunk)) terms.add(chunk);
+        continue;
+      }
+      if (chunk.length <= 4 && !CJK_BOILERPLATE.has(chunk)) {
+        terms.add(chunk);
+      }
+      for (let i = 0; i <= chunk.length - 2; i += 1) {
+        const bigram = chunk.slice(i, i + 2);
+        if (!CJK_BOILERPLATE.has(bigram)) {
+          terms.add(bigram);
+        }
+      }
+    }
+  }
+  return terms;
+}
+async function collectWorkspaceCandidates(workspaceRoot, primaryInboxPath) {
+  const docs = [];
+  const visitedFiles = /* @__PURE__ */ new Set();
+  const toRelPath = (absPath) => {
+    const rel = relative4(workspaceRoot, absPath);
+    return rel && !rel.startsWith("..") ? rel.split(sep).join("/") : absPath;
+  };
+  const loadInboxDoc = async (filePath) => {
+    const normalized = resolve6(filePath);
+    if (visitedFiles.has(normalized)) return;
+    visitedFiles.add(normalized);
+    try {
+      const ideas = await readInboxIdeasFile(normalized);
+      const relPath = toRelPath(normalized);
+      for (const idea of ideas) {
+        docs.push({
+          kind: "inbox-idea",
+          id: idea.id,
+          title: idea.text,
+          body: [idea.context, ...idea.tags ?? []].filter(Boolean).join(" "),
+          path: relPath,
+          status: idea.status
+        });
+      }
+    } catch {
+    }
+  };
+  await loadInboxDoc(primaryInboxPath);
+  const walk = async (dir, depth, segments) => {
+    if (depth > 5) return;
+    let entries;
+    try {
+      entries = await readdir2(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) continue;
+      const fullPath = join8(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name === ".artifact-inbox") {
+          await loadInboxDoc(join8(fullPath, "ideas.jsonl"));
+          continue;
+        }
+        if (entry.name.startsWith(".") || SKIP_DIRS.has(entry.name)) continue;
+        await walk(fullPath, depth + 1, [...segments, entry.name.toLowerCase()]);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      if (entry.name === "stories.json") {
+        await loadStoriesJson(fullPath, toRelPath(fullPath), visitedFiles, docs);
+      } else if (entry.name.endsWith(".md") && !/^README(?:\..+)?\.md$/i.test(entry.name) && !entry.name.endsWith(".starter.md") && !/^TEMPLATE/i.test(entry.name) && segments.some((seg) => ARTIFACT_DIR_HINTS.has(seg))) {
+        await loadMarkdownArtifact(fullPath, toRelPath(fullPath), visitedFiles, docs);
+      }
+    }
+  };
+  await walk(workspaceRoot, 0, []);
+  return docs;
+}
+async function loadStoriesJson(fullPath, relPath, visitedFiles, docs) {
+  const normalized = resolve6(fullPath);
+  if (visitedFiles.has(normalized)) return;
+  visitedFiles.add(normalized);
+  try {
+    const statInfo = await lstat2(normalized);
+    if (!statInfo.isFile() || statInfo.size > 2 * 1024 * 1024) return;
+    const parsed = JSON.parse(await readFile3(normalized, "utf-8"));
+    const list = Array.isArray(parsed) ? parsed : parsed && typeof parsed === "object" && Array.isArray(parsed.stories) ? parsed.stories : [];
+    for (const raw of list) {
+      if (!raw || typeof raw !== "object") continue;
+      const item = raw;
+      const id = typeof item.id === "string" ? item.id : typeof item.storyId === "string" ? item.storyId : "";
+      const title = [item.title, item.name, item.action, item.iWant].find((v) => typeof v === "string" && v.trim().length > 0);
+      if (!id && !title) continue;
+      const body = [item.role, item.asA, item.action, item.iWant, item.value, item.soThat, item.goal, item.summary].filter((v) => typeof v === "string" && v.trim().length > 0).join(" ");
+      docs.push({
+        kind: "user-story",
+        id: id || relPath,
+        title: (title ?? id).trim(),
+        body,
+        path: relPath,
+        ...typeof item.status === "string" ? { status: item.status } : {}
+      });
+    }
+  } catch {
+  }
+}
+async function loadMarkdownArtifact(fullPath, relPath, visitedFiles, docs) {
+  const normalized = resolve6(fullPath);
+  if (visitedFiles.has(normalized)) return;
+  visitedFiles.add(normalized);
+  try {
+    const statInfo = await lstat2(normalized);
+    if (!statInfo.isFile() || statInfo.size > 512 * 1024) return;
+    const raw = await readFile3(normalized, "utf-8");
+    const fmMatch = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(raw);
+    const fm = {};
+    let bodyText = raw;
+    if (fmMatch) {
+      bodyText = raw.slice(fmMatch[0].length);
+      for (const line of fmMatch[1].split(/\r?\n/)) {
+        const kv = /^([A-Za-z_][A-Za-z0-9_-]*):\s*(.+?)\s*$/.exec(line);
+        if (kv) fm[kv[1]] = kv[2].replace(/^['"]|['"]$/g, "");
+      }
+    }
+    const headingMatch = /^#\s+(.+?)\s*$/m.exec(bodyText);
+    const id = fm.id || relPath.replace(/\.md$/i, "").split("/").at(-1) || relPath;
+    const title = fm.title || headingMatch?.[1] || id;
+    const excerpt = [fm.goal, fm.summary, bodyText.slice(0, 1200)].filter(Boolean).join(" ").replace(/```[\s\S]*?```/g, " ");
+    docs.push({
+      kind: "artifact",
+      id,
+      title,
+      body: excerpt,
+      path: relPath,
+      ...fm.status ? { status: fm.status } : {}
+    });
+  } catch {
+  }
+}
+function renderInboxAddMarkdown(result) {
+  const lines = [
+    `\u5DF2\u8BB0\u5F55\u60F3\u6CD5 **${result.idea.id}**\uFF08\u72B6\u6001\uFF1A\`${result.idea.status}\`\uFF09`,
+    `- \u6536\u4EF6\u7BB1\u8DEF\u5F84\uFF1A\`${result.inboxPath}\``,
+    `- \u539F\u59CB\u60F3\u6CD5\uFF1A${result.idea.text}`
+  ];
+  if (result.idea.context) lines.push(`- \u80CC\u666F\u8BF4\u660E\uFF1A${result.idea.context}`);
+  lines.push(`- \u8BF4\u660E\uFF1A${result.note}`);
+  if (result.related.length > 0) {
+    lines.push("", `\u53EF\u80FD\u76F8\u5173\u7684\u65E2\u6709\u60F3\u6CD5\u6216\u9700\u6C42\uFF08\u5171 ${result.related.length} \u6761\uFF09\uFF1A`);
+    for (const item of result.related) {
+      lines.push(`- [${item.kind}] **${item.id}** ${item.title}\uFF08\`${item.path}\`\uFF0C\u76F8\u4F3C\u5EA6 ${item.score}\uFF0C\u547D\u4E2D\u8BCD\uFF1A${item.matchedTerms.join("\u3001") || "\u5B57\u9762\u5339\u914D"}\uFF09`);
+    }
+  } else {
+    lines.push("- \u672A\u5728\u5F53\u524D\u5DE5\u4F5C\u533A\u53D1\u73B0\u660E\u663E\u8FD1\u4F3C\u7684\u65E2\u6709\u60F3\u6CD5\u6216\u9700\u6C42\u3002");
+  }
+  return `${lines.join("\n")}
+`;
+}
+function renderInboxListMarkdown(result) {
+  if (result.ideas.length === 0) {
+    return `\u6536\u4EF6\u7BB1\u6682\u65E0\u5339\u914D\u8BB0\u5F55\uFF08\u8DEF\u5F84\uFF1A\`${result.inboxPath}\`\uFF09\u3002
+`;
+  }
+  const lines = [`\u6536\u4EF6\u7BB1\u60F3\u6CD5\u5217\u8868\uFF08\u663E\u793A ${result.ideas.length} / \u5171 ${result.total} \u6761\uFF0C\u8DEF\u5F84\uFF1A\`${result.inboxPath}\`\uFF09\uFF1A`];
+  for (const idea of result.ideas) {
+    const tagPart = idea.tags && idea.tags.length > 0 ? ` [${idea.tags.join(", ")}]` : "";
+    lines.push(`- **${idea.id}** (\`${idea.status}\`, ${idea.createdAt})${tagPart}\uFF1A${idea.text}`);
+  }
+  return `${lines.join("\n")}
+`;
+}
+function renderInboxMatchMarkdown(result) {
+  const lines = [
+    `\u9488\u5BF9\u300C${result.query}\u300D\u626B\u63CF\u4E86 ${result.scannedSources} \u6761\u5DE5\u4F5C\u533A\u6761\u76EE\uFF1A`
+  ];
+  if (result.related.length === 0) {
+    lines.push("- \u672A\u53D1\u73B0\u8FD1\u4F3C\u7684\u65E2\u6709\u60F3\u6CD5\u3001\u7528\u6237\u6545\u4E8B\u6216\u9700\u6C42\u6761\u76EE\u3002");
+  } else {
+    for (const item of result.related) {
+      lines.push(`- [${item.kind}] **${item.id}** ${item.title}\uFF08\`${item.path}\`\uFF0C\u76F8\u4F3C\u5EA6 ${item.score}\uFF0C\u547D\u4E2D\u8BCD\uFF1A${item.matchedTerms.join("\u3001") || "\u5B57\u9762\u5339\u914D"}\uFF09`);
+    }
+  }
+  return `${lines.join("\n")}
+`;
+}
+var DEFAULT_INBOX_RELATIVE_PATH, SKIP_DIRS, ARTIFACT_DIR_HINTS, ASCII_STOPWORDS, CJK_BOILERPLATE;
+var init_inbox = __esm({
+  "src/inbox.ts"() {
+    "use strict";
+    DEFAULT_INBOX_RELATIVE_PATH = ".artifact-inbox/ideas.jsonl";
+    SKIP_DIRS = /* @__PURE__ */ new Set([
+      ".git",
+      "node_modules",
+      "dist",
+      "build",
+      "coverage",
+      ".artifact-graph",
+      ".next",
+      "vendor",
+      ".turbo",
+      ".pnpm-store",
+      "adapters",
+      "site"
+    ]);
+    ARTIFACT_DIR_HINTS = /* @__PURE__ */ new Set([
+      "requirements",
+      "prd",
+      "features",
+      "stories",
+      "user-stories"
+    ]);
+    ASCII_STOPWORDS = /* @__PURE__ */ new Set([
+      "the",
+      "and",
+      "for",
+      "with",
+      "that",
+      "this",
+      "from",
+      "into",
+      "when",
+      "then",
+      "should",
+      "must",
+      "can",
+      "will",
+      "allow",
+      "user",
+      "users",
+      "want",
+      "wants",
+      "need",
+      "needs",
+      "system",
+      "support",
+      "supports",
+      "feature",
+      "story",
+      "item",
+      "have",
+      "has",
+      "are",
+      "not",
+      "only",
+      "also",
+      "without",
+      "before",
+      "after"
+    ]);
+    CJK_BOILERPLATE = /* @__PURE__ */ new Set([
+      "\u7528\u6237",
+      "\u7CFB\u7EDF",
+      "\u529F\u80FD",
+      "\u652F\u6301",
+      "\u63D0\u4F9B",
+      "\u5B9E\u73B0",
+      "\u5E0C\u671B",
+      "\u4EE5\u4FBF",
+      "\u4F5C\u4E3A",
+      "\u53EF\u4EE5",
+      "\u9700\u8981",
+      "\u5E94\u8BE5",
+      "\u80FD\u591F",
+      "\u8FDB\u884C",
+      "\u901A\u8FC7",
+      "\u4E00\u4E2A",
+      "\u5F53\u524D",
+      "\u5904\u7406",
+      "\u4F7F\u7528",
+      "\u7BA1\u7406"
+    ]);
+  }
+});
+
 // src/professional-conclusion.ts
 import { access as access2 } from "fs/promises";
 import { createRequire as createRequire2 } from "module";
-import { basename as basename3, dirname as dirname5, isAbsolute as isAbsolute5, join as join8, resolve as resolve5 } from "path";
+import { basename as basename4, dirname as dirname6, isAbsolute as isAbsolute7, join as join9, resolve as resolve7 } from "path";
 import { pathToFileURL } from "url";
 async function loadContracts() {
   return await import(CONTRACTS_PACKAGE_NAME);
@@ -4480,7 +5347,7 @@ function harnessKind(error) {
   return typeof details?.kind === "string" ? details.kind : void 0;
 }
 async function missingRequiredConfig(root) {
-  const configPath = join8(root, "artifact-graph.config.yaml");
+  const configPath = join9(root, "artifact-graph.config.yaml");
   try {
     await access2(configPath);
     return void 0;
@@ -4600,7 +5467,7 @@ function buildLimitations(checks) {
   return [...new Set(limitations)];
 }
 function buildConclusion(root, checks) {
-  const absoluteRoot = resolve5(root);
+  const absoluteRoot = resolve7(root);
   const mapped = mapDomain(checks);
   const checked = checks.filter((check) => check.status === "completed").map((check) => check.name);
   const limitations = buildLimitations(checks);
@@ -4653,11 +5520,11 @@ async function assertConclusionShape(conclusion) {
   }
 }
 async function publishConclusion(absoluteOutput, conclusion) {
-  if (!isAbsolute5(absoluteOutput)) {
+  if (!isAbsolute7(absoluteOutput)) {
     return "--conclusion-output must be an absolute path";
   }
-  const outputRoot = dirname5(absoluteOutput);
-  const relPath = basename3(absoluteOutput);
+  const outputRoot = dirname6(absoluteOutput);
+  const relPath = basename4(absoluteOutput);
   if (relPath.length === 0 || relPath === "." || relPath === "..") {
     return "--conclusion-output must name a file";
   }
@@ -4675,7 +5542,7 @@ async function publishConclusion(absoluteOutput, conclusion) {
   }
 }
 async function runCheckProfessional(options) {
-  const root = resolve5(options.root);
+  const root = resolve7(options.root);
   const configGap = await missingRequiredConfig(root);
   const checks = configGap === void 0 ? await Promise.all([
     settleCheck(CHECK_VALIDATE, () => runValidate(root)),
@@ -4691,10 +5558,10 @@ async function runCheckProfessional(options) {
   if (options.conclusionOutput === void 0) {
     return { conclusion };
   }
-  if (!isAbsolute5(options.conclusionOutput)) {
+  if (!isAbsolute7(options.conclusionOutput)) {
     return { conclusion, writeError: "--conclusion-output must be an absolute path" };
   }
-  const writeError = await publishConclusion(resolve5(options.conclusionOutput), conclusion);
+  const writeError = await publishConclusion(resolve7(options.conclusionOutput), conclusion);
   return { conclusion, ...writeError ? { writeError } : {} };
 }
 function asRecord(value) {
@@ -4823,7 +5690,7 @@ var init_professional_conclusion = __esm({
 });
 
 // src/review-result-validator.ts
-function validateReviewResult(input) {
+function validateReviewResult(input, options) {
   const errors = [];
   if (!input || typeof input !== "object" || Array.isArray(input)) {
     return [{ path: "$", message: "Root must be a non-null object" }];
@@ -4926,6 +5793,9 @@ function validateReviewResult(input) {
         validateRepairValidation(r.validation_after_repair, "$.repair.validation_after_repair", errors);
       }
     }
+  }
+  if (options?.expectedTargetDigests !== void 0) {
+    validateExpectedTargetDigests(obj, options.expectedTargetDigests, options.strictScopeMatch ?? true, errors);
   }
   return errors;
 }
@@ -5046,6 +5916,7 @@ function validateReviewData(val, path, errors) {
   const r = val;
   if (r.source_files !== void 0) checkStringArray(r.source_files, `${path}.source_files`, errors);
   if (r.files !== void 0) checkStringArray(r.files, `${path}.files`, errors);
+  if (r.target_digests !== void 0) validateTargetDigestsField(r.target_digests, `${path}.target_digests`, errors);
   if (r.findings !== void 0) validateFindingArray(r.findings, `${path}.findings`, errors);
   if (r.resolved_findings !== void 0) validateFindingArray(r.resolved_findings, `${path}.resolved_findings`, errors);
   if (r.batches !== void 0) validateBatches(r.batches, `${path}.batches`, errors);
@@ -5087,7 +5958,129 @@ function validateRepairValidation(val, path, errors) {
   checkOptionalInteger(val.exit_code, `${path}.exit_code`, errors);
   checkOptionalInteger(val.findings_remaining, `${path}.findings_remaining`, errors, 0);
 }
-var VALID_STATUSES, VALID_DECISIONS, VALID_SEVERITIES, VALID_FINDING_STATUSES, VALID_EXECUTORS, TOP_LEVEL_FIELDS, METRIC_FIELDS;
+function normalizeReviewPath(rawPath) {
+  return rawPath.trim().replace(/\\/g, "/").replace(/^\.\//, "");
+}
+function normalizeSha256Digest(raw) {
+  if (typeof raw !== "string") return void 0;
+  const match = SHA256_DIGEST_PATTERN.exec(raw.trim());
+  return match ? `sha256:${match[1].toLowerCase()}` : void 0;
+}
+function validateTargetDigestsField(val, path, errors) {
+  if (!isPlainObject(val)) {
+    errors.push({ path, message: "Must be an object mapping file paths to SHA-256 digests" });
+    return;
+  }
+  for (const [rawKey, rawVal] of Object.entries(val)) {
+    if (!rawKey.trim()) {
+      errors.push({ path, message: "Target digest path key must be non-empty" });
+      continue;
+    }
+    if (!normalizeSha256Digest(rawVal)) {
+      errors.push({
+        path: `${path}[${JSON.stringify(rawKey)}]`,
+        message: "Must be a valid SHA-256 digest (sha256:<64-hex> or <64-hex>)"
+      });
+    }
+  }
+}
+function validateExpectedTargetDigests(obj, expectedMap, strictScopeMatch, errors) {
+  if (!isPlainObject(expectedMap)) {
+    errors.push({ path: "$.options.expectedTargetDigests", message: "expectedTargetDigests must be an object" });
+    return;
+  }
+  const expectedEntries = /* @__PURE__ */ new Map();
+  for (const [rawPath, rawDigest2] of Object.entries(expectedMap)) {
+    const normPath = normalizeReviewPath(rawPath);
+    const normDigest = normalizeSha256Digest(rawDigest2);
+    if (!normPath) {
+      errors.push({ path: "$.options.expectedTargetDigests", message: "Expected target path must be non-empty" });
+      continue;
+    }
+    if (!normDigest) {
+      errors.push({
+        path: `$.options.expectedTargetDigests[${JSON.stringify(rawPath)}]`,
+        message: "Expected digest must be a valid SHA-256 hex string"
+      });
+      continue;
+    }
+    expectedEntries.set(normPath, normDigest);
+  }
+  if (expectedEntries.size === 0) {
+    errors.push({
+      path: "$.options.expectedTargetDigests",
+      message: "expectedTargetDigests must contain at least one valid target digest entry"
+    });
+    return;
+  }
+  const recorded = /* @__PURE__ */ new Map();
+  if (isPlainObject(obj.review) && isPlainObject(obj.review.target_digests)) {
+    for (const [rawPath, rawDigest2] of Object.entries(obj.review.target_digests)) {
+      const normPath = normalizeReviewPath(rawPath);
+      const normDigest = normalizeSha256Digest(rawDigest2);
+      if (normPath && normDigest) {
+        recorded.set(normPath, normDigest);
+      }
+    }
+  }
+  if (Array.isArray(obj.evidence)) {
+    for (let i = 0; i < obj.evidence.length; i += 1) {
+      const item = obj.evidence[i];
+      if (!isPlainObject(item)) continue;
+      if (item.type !== "reviewed-input" && item.type !== "target-digest" && item.type !== "target") continue;
+      if (typeof item.path !== "string" || typeof item.result !== "string") continue;
+      const normDigest = normalizeSha256Digest(item.result);
+      if (!normDigest) continue;
+      const normPath = normalizeReviewPath(item.path);
+      if (!normPath) continue;
+      const prev = recorded.get(normPath);
+      if (prev && prev !== normDigest) {
+        errors.push({
+          path: `$.evidence[${i}].result`,
+          message: `\u76EE\u6807\u6587\u4EF6 "${normPath}" \u5728 review.target_digests \u4E0E evidence \u4E2D\u8BB0\u5F55\u4E86\u4E0D\u4E00\u81F4\u7684\u6458\u8981`
+        });
+      } else {
+        recorded.set(normPath, normDigest);
+      }
+    }
+  }
+  for (const [expectedPath, expectedDigest] of expectedEntries) {
+    const actualDigest = recorded.get(expectedPath);
+    if (!actualDigest) {
+      errors.push({
+        path: "$.review.target_digests",
+        message: `\u5BA1\u9605\u7ED3\u679C\u7F3A\u5C11\u76EE\u6807\u6587\u4EF6 "${expectedPath}" \u7684 SHA-256 \u6458\u8981\u7ED1\u5B9A\uFF0C\u65E0\u6CD5\u8BC1\u660E\u9488\u5BF9\u5F53\u524D\u5FEB\u7167\u5B8C\u6210\u5BA1\u9605\uFF08\u9632\u4E32\u5355\u62E6\u622A\uFF09`
+      });
+    } else if (actualDigest !== expectedDigest) {
+      errors.push({
+        path: `$.review.target_digests[${JSON.stringify(expectedPath)}]`,
+        message: `\u76EE\u6807\u6587\u4EF6 "${expectedPath}" \u6458\u8981\u4E0D\u5339\u914D\uFF1A\u671F\u671B ${expectedDigest}\uFF0C\u5BA1\u9605\u7ED3\u679C\u7ED1\u5B9A\u4E3A ${actualDigest}\uFF08\u76EE\u6807\u6587\u4EF6\u5DF2\u53D8\u66F4\u6216\u4E32\u5165\u65E7\u7248\u5BA1\u9605\u7ED3\u679C\uFF09`
+      });
+    }
+  }
+  if (strictScopeMatch) {
+    for (const [recordedPath] of recorded) {
+      if (!expectedEntries.has(recordedPath)) {
+        errors.push({
+          path: `$.review.target_digests[${JSON.stringify(recordedPath)}]`,
+          message: `\u5BA1\u9605\u7ED3\u679C\u7ED1\u5B9A\u4E86\u975E\u671F\u671B\u76EE\u6807 "${recordedPath}"\uFF0C\u7591\u4F3C\u4E0E\u5176\u4ED6\u6761\u76EE\u7684\u5BA1\u9605\u7ED3\u679C\u4E32\u5355`
+        });
+      }
+    }
+    if (isPlainObject(obj.review) && Array.isArray(obj.review.files) && obj.review.files.length > 0 && obj.review.files.every((item) => typeof item === "string")) {
+      const declaredFiles = new Set(obj.review.files.map(normalizeReviewPath));
+      for (const [expectedPath] of expectedEntries) {
+        if (!declaredFiles.has(expectedPath)) {
+          errors.push({
+            path: "$.review.files",
+            message: `review.files [${obj.review.files.join(", ")}] \u672A\u8986\u76D6\u671F\u671B\u76EE\u6807 "${expectedPath}"\uFF0C\u7591\u4F3C\u5BA1\u9605\u5BF9\u8C61\u4E32\u5355`
+          });
+        }
+      }
+    }
+  }
+}
+var VALID_STATUSES, VALID_DECISIONS, VALID_SEVERITIES, VALID_FINDING_STATUSES, VALID_EXECUTORS, TOP_LEVEL_FIELDS, SHA256_DIGEST_PATTERN, METRIC_FIELDS;
 var init_review_result_validator = __esm({
   "src/review-result-validator.ts"() {
     "use strict";
@@ -5127,6 +6120,7 @@ var init_review_result_validator = __esm({
       "review",
       "repair"
     ]);
+    SHA256_DIGEST_PATTERN = /^(?:sha256:)?([A-Fa-f0-9]{64})$/;
     METRIC_FIELDS = [
       "files_reviewed",
       "files_scanned",
@@ -5145,8 +6139,8 @@ var init_review_result_validator = __esm({
 
 // src/contract-kernel.ts
 import { createHash as createHash2 } from "crypto";
-import { readFile as readFile3, readdir as readdir2 } from "fs/promises";
-import { join as join9 } from "path";
+import { readFile as readFile4, readdir as readdir3 } from "fs/promises";
+import { join as join10 } from "path";
 import _AjvModule2 from "ajv";
 function isOfficialNamespace(namespace) {
   return OFFICIAL_NAMESPACE_PATTERN.test(namespace);
@@ -5427,7 +6421,7 @@ function validatePolicyCompatibility(policy, baseContract) {
   };
 }
 async function loadContract(contractPath, options) {
-  const rawContent = await readFile3(contractPath, "utf-8");
+  const rawContent = await readFile4(contractPath, "utf-8");
   let schema;
   try {
     schema = JSON.parse(rawContent);
@@ -5475,10 +6469,10 @@ async function loadContract(contractPath, options) {
 }
 async function loadContractsFromDirectory(contractsDir, options) {
   const contracts = [];
-  const entries = await readdir2(contractsDir, { withFileTypes: true });
+  const entries = await readdir3(contractsDir, { withFileTypes: true });
   for (const entry of entries) {
     if (entry.isDirectory()) {
-      const schemaPath = join9(contractsDir, entry.name, "schema.json");
+      const schemaPath = join10(contractsDir, entry.name, "schema.json");
       const contract = await loadContract(schemaPath, options);
       contracts.push(contract);
     }
@@ -6022,8 +7016,8 @@ var init_restructure_software = __esm({
 
 // src/restructure-file-set.ts
 import { createHash as createHash3 } from "crypto";
-import { chmod, lstat as lstat2, mkdir as mkdir4, realpath, statfs } from "fs/promises";
-import { join as join10, resolve as resolve6 } from "path";
+import { chmod, lstat as lstat3, mkdir as mkdir5, realpath, statfs } from "fs/promises";
+import { join as join11, resolve as resolve8 } from "path";
 async function loadFoundationModule() {
   return await import(FOUNDATION_PACKAGE_NAME);
 }
@@ -6081,13 +7075,13 @@ function rawDigest(value, path) {
 async function resolveRealRoot(root) {
   let canonical;
   try {
-    canonical = await realpath(resolve6(root));
+    canonical = await realpath(resolve8(root));
   } catch (cause) {
     return failure("ROOT_INVALID", `Project root cannot be resolved: ${cause.message}`);
   }
   let info;
   try {
-    info = await lstat2(canonical);
+    info = await lstat3(canonical);
   } catch (cause) {
     return failure("ROOT_INVALID", `Project root cannot be inspected: ${cause.message}`);
   }
@@ -6120,8 +7114,8 @@ async function qualifyRestructureMechanism(root) {
   return { ok: true, data: { root: canonical.data, filesystem: RESTRUCTURE_QUALIFIED_FILESYSTEM } };
 }
 async function ensureRestructureMechanismRoot(canonicalRoot, options) {
-  const target = join10(canonicalRoot, RESTRUCTURE_RECOVERY_REL_PATH);
-  const current = async () => lstat2(target).catch((cause) => cause.code === "ENOENT" ? null : Promise.reject(cause));
+  const target = join11(canonicalRoot, RESTRUCTURE_RECOVERY_REL_PATH);
+  const current = async () => lstat3(target).catch((cause) => cause.code === "ENOENT" ? null : Promise.reject(cause));
   let info = await current();
   if (info === null) {
     if (!options.create) {
@@ -6132,7 +7126,7 @@ async function ensureRestructureMechanismRoot(canonicalRoot, options) {
     }
     let created = false;
     try {
-      await mkdir4(target, { mode: RESTRUCTURE_RECOVERY_ROOT_MODE });
+      await mkdir5(target, { mode: RESTRUCTURE_RECOVERY_ROOT_MODE });
       created = true;
     } catch (cause) {
       if (cause.code !== "EEXIST") {
@@ -6234,7 +7228,7 @@ async function applyRestructureFileSet(canonicalRoot, plan, options) {
   return await verifyMechanismResult(raw);
 }
 async function observeRestructureJournal(canonicalRoot) {
-  const journalRoot = join10(canonicalRoot, RESTRUCTURE_RECOVERY_REL_PATH, "journal");
+  const journalRoot = join11(canonicalRoot, RESTRUCTURE_RECOVERY_REL_PATH, "journal");
   const module = await loadFoundationModule();
   try {
     return { ok: true, data: await module.inspectStateStoreLock(journalRoot, { recoveryObservation: true }) };
@@ -6443,8 +7437,8 @@ var init_restructure_file_set = __esm({
 
 // src/restructure.ts
 import { createHash as createHash4, randomUUID as randomUUID2 } from "crypto";
-import { lstat as lstat3, readFile as readFile4, readdir as readdir3, realpath as realpath2, stat } from "fs/promises";
-import { dirname as dirname6, isAbsolute as isAbsolute6, join as join11, posix, relative as relative4, resolve as resolve7 } from "path";
+import { lstat as lstat4, readFile as readFile5, readdir as readdir4, realpath as realpath2, stat } from "fs/promises";
+import { dirname as dirname7, isAbsolute as isAbsolute8, join as join12, posix, relative as relative5, resolve as resolve9 } from "path";
 import { fileURLToPath as fileURLToPath2 } from "url";
 function digestBytes(value) {
   return `sha256:${createHash4("sha256").update(value).digest("hex")}`;
@@ -6460,7 +7454,7 @@ function digestRestructureValue(value) {
   return digestBytes(canonicalJson(value));
 }
 function normalizeRelativePath2(value) {
-  if (!value || value.includes("\0") || isAbsolute6(value)) return void 0;
+  if (!value || value.includes("\0") || isAbsolute8(value)) return void 0;
   const normalized = value.replace(/\\/g, "/").replace(/^\.\//, "");
   if (!normalized || normalized === "." || normalized.split("/").some((part) => part === ".." || part === "")) return void 0;
   return normalized;
@@ -6474,13 +7468,13 @@ function isPathAllowed(path, allowed) {
 async function readContainedFileWithMode(root, path) {
   const normalized = normalizeRelativePath2(path);
   if (!normalized) throw new Error(`Path must be a project-relative path without traversal: ${path}`);
-  const absoluteRoot = resolve7(root);
-  const absolutePath = resolve7(absoluteRoot, normalized);
-  if (relative4(absoluteRoot, absolutePath).startsWith("..")) throw new Error(`Path escapes project root: ${path}`);
+  const absoluteRoot = resolve9(root);
+  const absolutePath = resolve9(absoluteRoot, normalized);
+  if (relative5(absoluteRoot, absolutePath).startsWith("..")) throw new Error(`Path escapes project root: ${path}`);
   try {
-    const info = await lstat3(absolutePath);
+    const info = await lstat4(absolutePath);
     if (info.isSymbolicLink() || !info.isFile()) throw new Error(`Path is not a regular file: ${path}`);
-    return { buffer: await readFile4(absolutePath), mode: info.mode & MAX_POSIX_MODE };
+    return { buffer: await readFile5(absolutePath), mode: info.mode & MAX_POSIX_MODE };
   } catch (error) {
     if (error.code === "ENOENT") return void 0;
     throw error;
@@ -6508,7 +7502,7 @@ async function configSnapshot(root) {
   return snapshotFile(root, "artifact-graph.config.yaml");
 }
 async function loadRestructureContract(name) {
-  return loadContract(join11(CONTRACT_ROOT, `restructure-${name}`, "schema.json"), { expectedAuthority: "artifact" });
+  return loadContract(join12(CONTRACT_ROOT, `restructure-${name}`, "schema.json"), { expectedAuthority: "artifact" });
 }
 async function validateDomainContract(name, value) {
   const contract = await loadRestructureContract(name);
@@ -6769,7 +7763,7 @@ function splitMarkdownTarget(target) {
 }
 async function pathExists2(absolutePath) {
   try {
-    await lstat3(absolutePath);
+    await lstat4(absolutePath);
     return true;
   } catch {
     return false;
@@ -6781,16 +7775,16 @@ async function scanUnsupportedReferences(root, sourcePaths, targetPaths) {
   const directories = new Set(migrationPaths.map((path) => posix.dirname(path)));
   const findings = [];
   async function visit(directory) {
-    for (const entry of await readdir3(directory, { withFileTypes: true })) {
+    for (const entry of await readdir4(directory, { withFileTypes: true })) {
       if (entry.isDirectory() && SKIPPED_SCAN_DIRS.has(entry.name)) continue;
-      const absolute = join11(directory, entry.name);
+      const absolute = join12(directory, entry.name);
       if (entry.isDirectory()) {
         await visit(absolute);
         continue;
       }
       if (!entry.isFile() || !TEXT_EXTENSIONS.test(entry.name)) continue;
-      const path = relative4(root, absolute).replace(/\\/g, "/");
-      const raw = await readFile4(absolute, "utf8");
+      const path = relative5(root, absolute).replace(/\\/g, "/");
+      const raw = await readFile5(absolute, "utf8");
       const namesTheMigration = migrationPaths.some((reference) => raw.includes(reference));
       const lines = raw.split(/\r?\n/);
       for (const [index, line] of lines.entries()) {
@@ -6812,7 +7806,7 @@ async function scanUnsupportedReferences(root, sourcePaths, targetPaths) {
                 path,
                 lineNumber
               ));
-            } else if (!await pathExists2(resolve7(root, resolved))) {
+            } else if (!await pathExists2(resolve9(root, resolved))) {
               findings.push(finding(
                 "SIBLING_RELATIVE_REFERENCE_UNRESOLVED",
                 `The relative reference "${literal}" does not resolve inside the project although its file name matches a migration path; its intended destination must be decided explicitly`,
@@ -6837,7 +7831,7 @@ async function scanUnsupportedReferences(root, sourcePaths, targetPaths) {
       }
     }
   }
-  await visit(resolve7(root));
+  await visit(resolve9(root));
   const unique = new Map(findings.map((item) => [`${item.code}	${item.path}	${item.line}	${item.message}`, item]));
   return [...unique.values()].sort((left, right) => (left.path ?? "").localeCompare(right.path ?? "") || (left.line ?? 0) - (right.line ?? 0) || left.code.localeCompare(right.code));
 }
@@ -6853,15 +7847,15 @@ function mergeFindings(target, additions) {
 async function scanConsumerCandidates(root, references, excludedPaths = /* @__PURE__ */ new Set()) {
   const results = [];
   async function visit(directory) {
-    for (const entry of await readdir3(directory, { withFileTypes: true })) {
+    for (const entry of await readdir4(directory, { withFileTypes: true })) {
       if (entry.isDirectory() && SKIPPED_SCAN_DIRS.has(entry.name)) continue;
-      const absolute = join11(directory, entry.name);
+      const absolute = join12(directory, entry.name);
       if (entry.isDirectory()) {
         await visit(absolute);
       } else if (entry.isFile() && TEXT_EXTENSIONS.test(entry.name)) {
-        const path = relative4(root, absolute).replace(/\\/g, "/");
+        const path = relative5(root, absolute).replace(/\\/g, "/");
         if (excludedPaths.has(path)) continue;
-        const raw = await readFile4(absolute, "utf8");
+        const raw = await readFile5(absolute, "utf8");
         raw.split(/\r?\n/).forEach((line, index) => {
           for (const reference of references) {
             if (path !== reference && line.includes(reference)) results.push({ path, line: index + 1, reference });
@@ -6870,7 +7864,7 @@ async function scanConsumerCandidates(root, references, excludedPaths = /* @__PU
       }
     }
   }
-  await visit(resolve7(root));
+  await visit(resolve9(root));
   return results.sort((left, right) => left.path.localeCompare(right.path) || left.line - right.line || left.reference.localeCompare(right.reference));
 }
 function expectedRelationTargets(mapping) {
@@ -6910,7 +7904,7 @@ function restructureBoundaryFindings(operations, limits) {
   const expectedCreateMode = createModeForUmask(limits.umask);
   const applyModeContract = limits.mode_contract === "apply";
   for (const operation of operations) {
-    const parent = dirname6(operation.path) || ".";
+    const parent = dirname7(operation.path) || ".";
     if (!operation.parent_exists) {
       findings.push(finding("PARENT_DIRECTORY_MISSING", `Parent directory does not exist or is not a directory: ${parent}`, operation.path));
     } else if (operation.parent_device !== null && operation.parent_device !== operation.root_device) {
@@ -7101,7 +8095,7 @@ async function planRestructure(root, input) {
     }
     pathMoves.push(move);
     rangesByPath.set(sourcePath, pathMoves);
-    if (dirname6(sourcePath) !== dirname6(targetPath)) {
+    if (dirname7(sourcePath) !== dirname7(targetPath)) {
       for (const link of findRelativeLinks(fragment.toString("utf8"))) {
         const explicitlyEdited = mapping.prose_edits.some((edit) => edit.target_path === targetPath && edit.old_text.includes(link));
         if (!explicitlyEdited) blockers.push(finding("RELATIVE_LINK_REQUIRES_MAPPING", `Relative reference "${link}" changes base directory when moved to ${targetPath}`, sourcePath));
@@ -7218,15 +8212,15 @@ async function planRestructure(root, input) {
       diff: readableDiff(path, original?.toString("utf8"), deleteFile ? void 0 : candidate.toString("utf8"))
     });
   }
-  const rootDirectory = await probeDirectory(resolve7(root));
+  const rootDirectory = await probeDirectory(resolve9(root));
   const parentProbes = /* @__PURE__ */ new Map();
   for (const candidate of candidates) {
-    const parent = dirname6(candidate.path);
-    if (!parentProbes.has(parent)) parentProbes.set(parent, await probeDirectory(resolve7(root, parent)));
+    const parent = dirname7(candidate.path);
+    if (!parentProbes.has(parent)) parentProbes.set(parent, await probeDirectory(resolve9(root, parent)));
   }
   blockers.push(...restructureBoundaryFindings(
     candidates.map((candidate) => {
-      const parent = parentProbes.get(dirname6(candidate.path));
+      const parent = parentProbes.get(dirname7(candidate.path));
       return {
         path: candidate.path,
         action: candidate.action,
@@ -7352,10 +8346,10 @@ function refusal(code, message, findings = []) {
   return { ok: false, error: { code, message, ...findings.length === 0 ? {} : { details: findings } } };
 }
 async function loadRestructurePlanDocument(operation, canonicalRoot, planPath) {
-  const absolute = resolve7(planPath);
+  const absolute = resolve9(planPath);
   let info;
   try {
-    info = await lstat3(absolute);
+    info = await lstat4(absolute);
   } catch (cause) {
     return refusal("PLAN_FILE_UNREADABLE", `Plan document cannot be read: ${absolute} (${cause.message})`);
   }
@@ -7364,7 +8358,7 @@ async function loadRestructurePlanDocument(operation, canonicalRoot, planPath) {
   }
   let bytes;
   try {
-    bytes = await readFile4(absolute);
+    bytes = await readFile5(absolute);
   } catch (cause) {
     return refusal("PLAN_FILE_UNREADABLE", `Plan document cannot be read: ${absolute} (${cause.message})`);
   }
@@ -7395,19 +8389,19 @@ function planRootIdentityFindings(document) {
   if (document.plan.config_snapshot.path !== "artifact-graph.config.yaml") {
     findings.push(finding("ROOT_IDENTITY_MISMATCH", `The plan does not record this project's configuration file: ${document.plan.config_snapshot.path}`));
   }
-  const relativePlan = relative4(document.root, document.realPath);
-  if (!relativePlan || relativePlan.startsWith("..") || isAbsolute6(relativePlan)) {
+  const relativePlan = relative5(document.root, document.realPath);
+  if (!relativePlan || relativePlan.startsWith("..") || isAbsolute8(relativePlan)) {
     findings.push(finding("ROOT_IDENTITY_MISMATCH", `The plan document is outside the project root: ${document.realPath}`, document.realPath));
   }
   return findings;
 }
 async function operationBoundaries(root, plan) {
-  const rootDirectory = await probeDirectory(resolve7(root));
+  const rootDirectory = await probeDirectory(resolve9(root));
   const parents = /* @__PURE__ */ new Map();
   const boundaries = [];
   for (const candidate of plan.candidates) {
-    const parent = dirname6(candidate.path) || ".";
-    if (!parents.has(parent)) parents.set(parent, await probeDirectory(resolve7(root, parent)));
+    const parent = dirname7(candidate.path) || ".";
+    if (!parents.has(parent)) parents.set(parent, await probeDirectory(resolve9(root, parent)));
     const probe = parents.get(parent);
     boundaries.push({
       path: candidate.path,
@@ -7432,7 +8426,7 @@ async function applyPreconditionFindings(root, document) {
     findings.push(finding("CONFIG_CHANGED", "artifact-graph configuration changed after planning", currentConfig.path));
   }
   for (const snapshot of plan.input_snapshots) await verifySnapshot(root, snapshot, findings);
-  const relativePlan = relative4(root, document.realPath).replace(/\\/g, "/");
+  const relativePlan = relative5(root, document.realPath).replace(/\\/g, "/");
   for (const candidate of plan.candidates) {
     if (candidate.path === relativePlan) {
       findings.push(finding("PLAN_IN_WRITE_SET", `The plan document is inside its own candidate write set: ${candidate.path}`, candidate.path));
@@ -7515,7 +8509,7 @@ async function applyRestructure(input) {
   if (drift.length > 0) return refusal("APPLY_PRECONDITION_FAILED", "The project drifted after planning; nothing was written", drift);
   const mechanismRoot = await ensureRestructureMechanismRoot(qualification.data.root, { create: true });
   if (!mechanismRoot.ok) return mechanismRoot;
-  const planRelPath = relative4(qualification.data.root, document.data.realPath).replace(/\\/g, "/");
+  const planRelPath = relative5(qualification.data.root, document.data.realPath).replace(/\\/g, "/");
   const applied = await applyRestructureFileSet(qualification.data.root, plan, {
     validate: createRestructureValidationCallback(plan, [planRelPath])
   });
@@ -7586,14 +8580,2111 @@ var init_restructure = __esm({
     RESTRUCTURE_MAX_TOTAL_BYTES = 256 * 1024 * 1024;
     MAX_POSIX_MODE = 511;
     CREATE_MODE_BASE = 438;
-    MODULE_DIRECTORY = typeof __dirname === "string" ? __dirname : dirname6(fileURLToPath2(import.meta.url));
-    CONTRACT_ROOT = join11(MODULE_DIRECTORY, "..", "contracts");
+    MODULE_DIRECTORY = typeof __dirname === "string" ? __dirname : dirname7(fileURLToPath2(import.meta.url));
+    CONTRACT_ROOT = join12(MODULE_DIRECTORY, "..", "contracts");
     SKIPPED_SCAN_DIRS = /* @__PURE__ */ new Set([".git", "node_modules", "dist", "coverage", ".tmp", ".codex", ".worktrees", ".foundation-file-apply", ".artifact-graph"]);
     TEXT_EXTENSIONS = /\.(?:md|markdown|json|ya?ml|[cm]?[jt]sx?)$/i;
     MARKDOWN_LINK_PATTERN = /!?\[([^\]\n]*)\]\(([^)\n]+)\)/g;
     RUNTIME_PATH_MARKER = /\.join\s*\(|\$\{[^}]*\}|["'`]\s*\+|\+\s*["'`]/;
     MARKDOWN_FILE_SUFFIX = /\.(?:md|markdown)$/i;
     SCRIPT_FILE_SUFFIX = /\.(?:[cm]?[jt]sx?)$/i;
+  }
+});
+
+// src/bidirectional-alignment.ts
+import { createHash as createHash5 } from "crypto";
+import { existsSync as existsSync3 } from "fs";
+import { lstat as lstat5, readdir as readdir5, readFile as readFile6, realpath as realpath3, writeFile as writeFile3 } from "fs/promises";
+import { homedir } from "os";
+import { dirname as dirname8, isAbsolute as isAbsolute9, join as join13, relative as relative6, resolve as resolve10, sep as sep2 } from "path";
+import yaml2 from "js-yaml";
+function normalizeSlashPath(value) {
+  return value.replace(/\\/g, "/").replace(/^\.\//, "");
+}
+function splitCleanSegments(rawPath) {
+  return rawPath.replace(/\\/g, "/").split("/").filter((seg) => seg.length > 0 && seg !== ".");
+}
+function hasForbiddenSegment(segments) {
+  return segments.some((seg) => FORBIDDEN_PATH_SEGMENTS.has(seg));
+}
+async function resolveSafeWithinRoot(rootReal, relPath) {
+  if (typeof relPath !== "string" || relPath.trim().length === 0 || relPath.includes("\0")) {
+    return { ok: false, reason: "\u8DEF\u5F84\u4E0D\u80FD\u4E3A\u7A7A\u6216\u5305\u542B\u7A7A\u5B57\u7B26" };
+  }
+  const normalized = normalizeSlashPath(relPath.trim());
+  if (isAbsolute9(normalized) || normalized.startsWith("/")) {
+    return { ok: false, reason: `\u4ED3\u5185\u8DEF\u5F84\u5FC5\u987B\u662F\u76F8\u5BF9\u8DEF\u5F84\uFF0C\u7981\u6B62\u4F7F\u7528\u7EDD\u5BF9\u8DEF\u5F84\uFF1A${relPath}` };
+  }
+  const segments = splitCleanSegments(normalized);
+  if (segments.length === 0 || segments.includes("..")) {
+    return { ok: false, reason: `\u4ED3\u5185\u8DEF\u5F84\u7981\u6B62\u5305\u542B ".." \u8D8A\u754C\u7247\u6BB5\uFF1A${relPath}` };
+  }
+  if (hasForbiddenSegment(segments)) {
+    return { ok: false, reason: `\u4ED3\u5185\u8DEF\u5F84\u547D\u4E2D\u53D7\u4FDD\u62A4\u7684\u9690\u85CF\u76EE\u5F55\uFF1A${relPath}` };
+  }
+  let cursor = rootReal;
+  for (const segment of segments) {
+    cursor = join13(cursor, segment);
+    try {
+      const st = await lstat5(cursor);
+      if (st.isSymbolicLink()) {
+        return { ok: false, reason: `\u5B89\u5168\u7B56\u7565\u62D2\u7EDD\u8BFB\u53D6\u7B26\u53F7\u94FE\u63A5\u8DEF\u5F84\uFF1A${normalized}` };
+      }
+    } catch (error) {
+      if (error.code === "ENOENT") {
+        return { ok: false, reason: `\u8DEF\u5F84\u4E0D\u5B58\u5728\uFF1A${normalized}` };
+      }
+      return { ok: false, reason: `\u65E0\u6CD5\u8BBF\u95EE\u8DEF\u5F84 ${normalized}\uFF1A${error.message}` };
+    }
+  }
+  const realTarget = await realpath3(cursor);
+  if (realTarget !== rootReal && !realTarget.startsWith(`${rootReal}${sep2}`)) {
+    return { ok: false, reason: `\u771F\u5B9E\u8DEF\u5F84\u5DF2\u9003\u9038\u5F53\u524D\u4ED3\u5E93\u6839\u76EE\u5F55\uFF1A${normalized}` };
+  }
+  const finalStat = await lstat5(realTarget);
+  if (!finalStat.isFile()) {
+    return { ok: false, reason: `\u76EE\u6807\u8DEF\u5F84\u4E0D\u662F\u5E38\u89C4\u6587\u4EF6\uFF1A${normalized}` };
+  }
+  return { ok: true, relNormalized: segments.join("/"), fullRealPath: realTarget };
+}
+async function resolveSafeRelatedRepo(baseRootReal, relRepo) {
+  if (typeof relRepo !== "string" || relRepo.trim().length === 0 || relRepo.includes("\0")) {
+    return { ok: false, reason: "\u5173\u8054\u4ED3\u5E93\u8DEF\u5F84\u4E0D\u80FD\u4E3A\u7A7A\u6216\u5305\u542B\u7A7A\u5B57\u7B26" };
+  }
+  const trimmed = relRepo.trim().replace(/\\/g, "/");
+  if (isAbsolute9(trimmed) || trimmed.startsWith("/")) {
+    return { ok: false, reason: `\u5173\u8054\u4ED3\u5E93\u5FC5\u987B\u4F7F\u7528\u76F8\u5BF9\u8DEF\u5F84\uFF0C\u7981\u6B62\u7EDD\u5BF9\u8DEF\u5F84\uFF1A${relRepo}` };
+  }
+  const rawSegments = trimmed.split("/").filter((seg) => seg.length > 0 && seg !== ".");
+  let leadingDotDots = 0;
+  let seenNonDotDot = false;
+  for (const seg of rawSegments) {
+    if (seg === "..") {
+      if (seenNonDotDot) {
+        return { ok: false, reason: `\u5173\u8054\u4ED3\u5E93\u8DEF\u5F84\u4E2D\u95F4\u4E0D\u5141\u8BB8\u5939\u6742 ".."\uFF1A${relRepo}` };
+      }
+      leadingDotDots += 1;
+    } else {
+      seenNonDotDot = true;
+    }
+  }
+  if (leadingDotDots > MAX_REPO_PARENT_HOPS) {
+    return { ok: false, reason: `\u5173\u8054\u4ED3\u5E93\u8DEF\u5F84\u8D8A\u8FC7\u5141\u8BB8\u7684\u5DE5\u4F5C\u533A\u7236\u7EA7\u6DF1\u5EA6\uFF08\u6700\u591A ${MAX_REPO_PARENT_HOPS} \u7EA7\uFF09\uFF1A${relRepo}` };
+  }
+  const nonDotSegments = rawSegments.filter((seg) => seg !== "..");
+  if (hasForbiddenSegment(nonDotSegments) || nonDotSegments.some((seg) => seg.startsWith("."))) {
+    return { ok: false, reason: `\u5173\u8054\u4ED3\u5E93\u8DEF\u5F84\u7981\u6B62\u6307\u5411\u9690\u85CF\u6216\u654F\u611F\u76EE\u5F55\uFF1A${relRepo}` };
+  }
+  let ancestor = baseRootReal;
+  for (let i = 0; i < leadingDotDots; i += 1) {
+    const nextParent = dirname8(ancestor);
+    if (nextParent === ancestor) {
+      return { ok: false, reason: `\u5173\u8054\u4ED3\u5E93\u8DEF\u5F84\u8D8A\u8FC7\u6587\u4EF6\u7CFB\u7EDF\u6839\u76EE\u5F55\uFF1A${relRepo}` };
+    }
+    ancestor = nextParent;
+  }
+  const userHome = homedir();
+  const ancestorReal = await realpath3(ancestor).catch(() => ancestor);
+  if (ancestorReal === "/" || ancestorReal === userHome) {
+    return { ok: false, reason: `\u5B89\u5168\u7B56\u7565\u7981\u6B62\u4EE5\u7CFB\u7EDF\u6839\u6216\u7528\u6237\u4E3B\u76EE\u5F55\u4F5C\u4E3A\u5DE5\u4F5C\u533A\u8FB9\u754C\uFF1A${relRepo}` };
+  }
+  let cursor = ancestorReal;
+  for (const seg of nonDotSegments) {
+    cursor = join13(cursor, seg);
+    try {
+      const st = await lstat5(cursor);
+      if (st.isSymbolicLink()) {
+        return { ok: false, reason: `\u5173\u8054\u4ED3\u5E93\u8DEF\u5F84\u5305\u542B\u7B26\u53F7\u94FE\u63A5\uFF0C\u62D2\u7EDD\u9003\u9038\u98CE\u9669\uFF1A${relRepo}` };
+      }
+    } catch (error) {
+      if (error.code === "ENOENT") {
+        return { ok: true, repoRealPath: resolve10(baseRootReal, trimmed), exists: false };
+      }
+      return { ok: false, reason: `\u65E0\u6CD5\u68C0\u67E5\u5173\u8054\u4ED3\u5E93\u8DEF\u5F84 ${relRepo}\uFF1A${error.message}` };
+    }
+  }
+  const targetStat = await lstat5(cursor);
+  if (!targetStat.isDirectory()) {
+    return { ok: false, reason: `\u5173\u8054\u4ED3\u5E93\u8DEF\u5F84\u4E0D\u662F\u6709\u6548\u76EE\u5F55\uFF1A${relRepo}` };
+  }
+  const targetReal = await realpath3(cursor);
+  if (targetReal !== ancestorReal && !targetReal.startsWith(`${ancestorReal}${sep2}`)) {
+    return { ok: false, reason: `\u5173\u8054\u4ED3\u5E93\u771F\u5B9E\u8DEF\u5F84\u9003\u9038\u51FA\u5141\u8BB8\u7684\u5171\u540C\u5DE5\u4F5C\u533A\u7956\u5148\uFF1A${relRepo}` };
+  }
+  return { ok: true, repoRealPath: targetReal, exists: true };
+}
+async function computeFileSha256(absFilePath) {
+  const bytes = await readFile6(absFilePath);
+  return `sha256:${createHash5("sha256").update(bytes).digest("hex")}`;
+}
+async function readSafeFileDigest(rootReal, relPath) {
+  const resolved = await resolveSafeWithinRoot(rootReal, relPath);
+  if (!resolved.ok) {
+    return {
+      ok: false,
+      reason: resolved.reason,
+      missing: resolved.reason.startsWith("\u8DEF\u5F84\u4E0D\u5B58\u5728\uFF1A")
+    };
+  }
+  const digest = await computeFileSha256(resolved.fullRealPath);
+  return {
+    ok: true,
+    relNormalized: resolved.relNormalized,
+    digest,
+    fullRealPath: resolved.fullRealPath
+  };
+}
+async function walkImplementationEntries(rootReal, entryGlobs, excludeGlobs) {
+  const matchedFiles = /* @__PURE__ */ new Set();
+  const symlinkViolations = /* @__PURE__ */ new Set();
+  const explicitHiddenDirSegments = collectExplicitHiddenDirSegments(entryGlobs);
+  async function visit(currentDir) {
+    let entries;
+    try {
+      entries = await readdir5(currentDir, { withFileTypes: true });
+    } catch (error) {
+      if (error.code === "ENOENT") return;
+      throw error;
+    }
+    for (const entry of entries) {
+      if (SKIPPED_WALK_DIRS2.has(entry.name)) continue;
+      const fullPath = join13(currentDir, entry.name);
+      const rel = relative6(rootReal, fullPath).split(sep2).join("/");
+      const isExcluded = excludeGlobs.some((pattern) => matchesRunnerGlob(rel, pattern));
+      if (entry.isSymbolicLink()) {
+        if (!isExcluded && entryGlobs.some((pattern) => matchesRunnerGlob(rel, pattern) || matchesRunnerGlob(`${rel}/`, pattern))) {
+          symlinkViolations.add(rel);
+        }
+        continue;
+      }
+      if (entry.isDirectory()) {
+        if (isExcluded) continue;
+        if (entry.name.startsWith(".") && !explicitHiddenDirSegments.some((segPattern) => matchesRunnerGlob(entry.name, segPattern))) {
+          continue;
+        }
+        await visit(fullPath);
+        continue;
+      }
+      if (entry.isFile() && !isExcluded) {
+        if (entryGlobs.some((pattern) => matchesRunnerGlob(rel, pattern))) {
+          matchedFiles.add(rel);
+        }
+      }
+    }
+  }
+  if (entryGlobs.length > 0) {
+    await visit(rootReal);
+  }
+  return {
+    matchedFiles: [...matchedFiles].sort((a, b) => a.localeCompare(b)),
+    symlinkViolations: [...symlinkViolations].sort((a, b) => a.localeCompare(b))
+  };
+}
+async function readVersionLockRaw(rootReal) {
+  const lockFullPath = join13(rootReal, VERSION_LOCK_PATH);
+  if (!existsSync3(lockFullPath)) {
+    return { schemaVersion: "1.0", locks: [], artifactRelations: [] };
+  }
+  const safeCheck = await resolveSafeWithinRoot(rootReal, VERSION_LOCK_PATH);
+  if (!safeCheck.ok) {
+    throw new Error(safeCheck.reason);
+  }
+  const raw = JSON.parse(await readFile6(safeCheck.fullRealPath, "utf-8"));
+  return {
+    schemaVersion: "1.0",
+    locks: Array.isArray(raw.locks) ? raw.locks : [],
+    artifactRelations: Array.isArray(raw.artifactRelations) ? raw.artifactRelations : []
+  };
+}
+function collectTargetLineageUids(graph, targetUid) {
+  const lineage = /* @__PURE__ */ new Set();
+  if (targetUid) {
+    lineage.add(targetUid);
+  }
+  if (!graph || !targetUid) {
+    return lineage;
+  }
+  const nodeByUid = new Map(graph.nodes.map((node) => [node.uid, node]));
+  const artifactNodeUids = new Set(
+    graph.nodes.filter((node) => node.type !== "test" && node.type !== "implementation").map((node) => node.uid)
+  );
+  const queue = [targetUid];
+  const rootNode = nodeByUid.get(targetUid);
+  if (rootNode && (rootNode.type === "requirement" || rootNode.type === "prd")) {
+    for (const edge2 of graph.edges) {
+      if (edge2.to !== targetUid || !artifactNodeUids.has(edge2.from) || lineage.has(edge2.from)) {
+        continue;
+      }
+      if (edge2.kind === "supersedes" || edge2.kind === "partial-supersedes") {
+        continue;
+      }
+      const fromNode = nodeByUid.get(edge2.from);
+      if (!fromNode || fromNode.type === "requirement" || fromNode.type === "prd") {
+        continue;
+      }
+      lineage.add(edge2.from);
+      queue.push(edge2.from);
+    }
+  }
+  while (queue.length > 0) {
+    const current = queue.shift();
+    for (const edge2 of graph.edges) {
+      if (edge2.from !== current || !artifactNodeUids.has(edge2.to) || lineage.has(edge2.to)) {
+        continue;
+      }
+      if (NON_REFINEMENT_EDGE_KINDS.has(edge2.kind)) {
+        continue;
+      }
+      const targetNode = nodeByUid.get(edge2.to);
+      if (targetNode && (targetNode.type === "requirement" || targetNode.type === "prd") && edge2.to !== targetUid) {
+        continue;
+      }
+      lineage.add(edge2.to);
+      queue.push(edge2.to);
+    }
+  }
+  return lineage;
+}
+function evaluateTargetLockFreshness(intra, targetUid) {
+  const lockFile = intra.lockFile;
+  const staleEdgeIds = intra.staleEdgeIds ?? /* @__PURE__ */ new Set();
+  if (!lockFile) {
+    return { hasFreshImplementsLock: false, hasFreshVerifiesLock: false };
+  }
+  const lineage = collectTargetLineageUids(intra.graph, targetUid);
+  const targetLocks = lockFile.locks.filter((entry) => lineage.has(`${entry.artifact.type}:${entry.artifact.id}`));
+  const hasFreshImplementsLock = targetLocks.some(
+    (entry) => entry.kind === "implements" && !staleEdgeIds.has(entry.edgeId)
+  );
+  const hasFreshVerifiesLock = targetLocks.some(
+    (entry) => entry.kind === "verifies" && !staleEdgeIds.has(entry.edgeId)
+  );
+  return { hasFreshImplementsLock, hasFreshVerifiesLock };
+}
+function isHistoricalRequirementNode(node, graph, config) {
+  const view = resolveNodeTimeView(node, graph, config);
+  if (view.bucket === "history") {
+    return true;
+  }
+  if (view.bucket === "current" || view.bucket === "planned") {
+    return false;
+  }
+  const normalizedStatus = typeof node.status === "string" ? node.status.trim().toLowerCase() : "";
+  return HISTORICAL_REQUIREMENT_STATUSES.has(normalizedStatus);
+}
+async function auditIntraRepo(rootReal, strict) {
+  const issues = [];
+  let config;
+  try {
+    config = await loadConfig(rootReal);
+  } catch (error) {
+    issues.push({
+      code: "GRAPH_CONFIG_ERROR",
+      layer: "intra-repo",
+      severity: "error",
+      message: `\u65E0\u6CD5\u52A0\u8F7D\u5355\u4ED3\u5236\u54C1\u56FE\u914D\u7F6E artifact-graph.config.yaml\uFF1A${error.message}`,
+      file: "artifact-graph.config.yaml",
+      remediation: ["\u68C0\u67E5\u5E76\u4FEE\u590D\u5F53\u524D\u4ED3\u5E93\u6839\u76EE\u5F55\u7684 artifact-graph.config.yaml \u8BED\u6CD5\u53CA\u5FC5\u586B\u5B57\u6BB5\uFF08\u5982 allowedEdges\uFF09\u3002"]
+    });
+    return {
+      checked: true,
+      graphErrorCount: 1,
+      totalLocks: 0,
+      freshLocks: 0,
+      implementsLocksCount: 0,
+      verifiesLocksCount: 0,
+      hasFreshImplementsLock: false,
+      hasFreshVerifiesLock: false,
+      implementationSurfaceChecked: false,
+      matchedEntries: [],
+      unclaimedEntries: [],
+      issues
+    };
+  }
+  const graph = await scanArtifacts(rootReal, config);
+  const graphIssues = validateGraph(graph, config);
+  const graphErrors = graphIssues.filter((item) => item.severity === "error");
+  for (const item of graphErrors) {
+    issues.push({
+      code: item.code,
+      layer: "intra-repo",
+      severity: "error",
+      message: `\u56FE\u6821\u9A8C\u5931\u8D25\uFF08${item.code}\uFF09\uFF1A${item.message}`,
+      file: item.path,
+      uid: item.node,
+      remediation: [`\u6253\u5F00 ${item.path}:${item.line} \u4FEE\u590D ${item.code} \u95EE\u9898\u540E\u91CD\u65B0\u8FD0\u884C\u6821\u9A8C\u3002`]
+    });
+  }
+  const lockAudit = await auditVersionLock(rootReal, VERSION_LOCK_PATH, graph, config);
+  const lockFile = await readVersionLockRaw(rootReal);
+  const staleEdgeIds = new Set(
+    lockAudit.issues.filter((issue2) => issue2.status !== "missing_lock" && !(issue2.status === "orphan_lock" && issue2.message.startsWith("Liveness:"))).map((issue2) => issue2.edgeId)
+  );
+  const implementsLocks = lockFile.locks.filter((entry) => entry.kind === "implements");
+  const verifiesLocks = lockFile.locks.filter((entry) => entry.kind === "verifies");
+  const hasFreshImplementsLock = implementsLocks.some((entry) => !staleEdgeIds.has(entry.edgeId));
+  const hasFreshVerifiesLock = verifiesLocks.some((entry) => !staleEdgeIds.has(entry.edgeId));
+  for (const lockIssue of lockAudit.issues) {
+    const blocking = isVersionLockIssueBlocking(lockIssue, strict || Boolean(config.implementationSurface?.requireCodeLocks));
+    issues.push({
+      code: lockIssue.status,
+      layer: "intra-repo",
+      severity: blocking ? "error" : "warning",
+      message: `\u7248\u672C\u9501\u5F02\u5E38\uFF08${lockIssue.status}\uFF09\uFF1A${lockIssue.message}`,
+      edgeId: lockIssue.edgeId,
+      file: lockIssue.source && "path" in lockIssue.source ? lockIssue.source.path : lockIssue.artifact?.path,
+      uid: lockIssue.artifact ? `${lockIssue.artifact.type}:${lockIssue.artifact.id}` : void 0,
+      remediation: lockIssue.remediation ?? ["\u8FD0\u884C `artifact-graph version-lock refresh --all` \u5237\u65B0\u5E76\u6838\u5BF9\u7248\u672C\u9501\u3002"]
+    });
+  }
+  const surface = config.implementationSurface;
+  let matchedEntries = [];
+  const unclaimedEntries = [];
+  const implementationSurfaceChecked = Boolean(surface);
+  if (surface) {
+    if (surface.requireCodeLocks === true && lockFile.locks.length === 0) {
+      issues.push({
+        code: "MISSING_CODE_LOCKS",
+        layer: "intra-repo",
+        severity: "error",
+        file: VERSION_LOCK_PATH,
+        message: "\u5DF2\u5F00\u542F implementationSurface.requireCodeLocks\uFF0C\u4F46 artifacts/traceability-version-lock.json \u4E2D\u7684 locks[] \u4E3A\u7A7A\uFF0C\u7F3A\u5C11\u6E90\u7801/\u6D4B\u8BD5\u5B9E\u73B0\u9501\u3002",
+        remediation: [
+          "\u5728\u6838\u5FC3\u6E90\u7801\u4E0E\u6D4B\u8BD5\u6587\u4EF6\u9876\u90E8\u6DFB\u52A0\u72EC\u7ACB\u8FFD\u6EAF\u6CE8\u91CA\uFF08\u4F8B\u5982 `// @feature <ID>` \u6216 `<!-- @feature <ID> -->`\uFF09\u3002",
+          "\u786E\u4FDD artifact-graph.config.yaml \u7684 types.test.paths \u8986\u76D6\u6E90\u7801\u4E0E\u6D4B\u8BD5\u76EE\u5F55\u540E\uFF0C\u8FD0\u884C `artifact-graph version-lock refresh --all`\u3002"
+        ]
+      });
+    }
+    const entryGlobs = Array.isArray(surface.entryGlobs) ? surface.entryGlobs : [];
+    const excludeGlobs = Array.isArray(surface.excludeGlobs) ? surface.excludeGlobs : [];
+    const walked = await walkImplementationEntries(rootReal, entryGlobs, excludeGlobs);
+    matchedEntries = walked.matchedFiles;
+    for (const symlinkRel of walked.symlinkViolations) {
+      issues.push({
+        code: "UNSAFE_SYMLINK_PATH",
+        layer: "intra-repo",
+        severity: "error",
+        file: symlinkRel,
+        message: `\u68C0\u6D4B\u5230\u5339\u914D implementationSurface.entryGlobs \u7684\u7B26\u53F7\u94FE\u63A5\u5165\u53E3 ${symlinkRel}\uFF0C\u5B89\u5168\u7B56\u7565\u7981\u6B62\u5C06\u7B26\u53F7\u94FE\u63A5\u7EB3\u5165\u5B9E\u73B0\u8BA4\u9886\u3002`,
+        remediation: [`\u5C06 ${symlinkRel} \u66FF\u6362\u4E3A\u4ED3\u5185\u771F\u5B9E\u6587\u4EF6\uFF0C\u6216\u5C06\u5176\u52A0\u5165 implementationSurface.excludeGlobs\u3002`]
+      });
+    }
+    const claimedPaths = new Set(implementsLocks.map((entry) => normalizeSlashPath(entry.source.path)));
+    for (const entryPath of matchedEntries) {
+      if (!claimedPaths.has(entryPath)) {
+        unclaimedEntries.push(entryPath);
+        issues.push({
+          code: "UNCLAIMED_IMPLEMENTATION_ENTRY",
+          layer: "intra-repo",
+          severity: "error",
+          file: entryPath,
+          message: `\u516C\u5F00\u5B9E\u73B0\u5165\u53E3 ${entryPath} \u672A\u88AB\u4EFB\u4F55\u8BE6\u7EC6\u8BBE\u8BA1\u5236\u54C1\u901A\u8FC7 implements \u9501\u8BA4\u9886\uFF0C\u8BF7\u5148\u8865\u9F50\u8BBE\u8BA1\u5236\u54C1\u5E76\u5EFA\u7ACB\u8FFD\u6EAF\u7ED1\u5B9A\u3002`,
+          remediation: [
+            `\u786E\u8BA4\u6216\u8865\u9F50 ${entryPath} \u5BF9\u5E94\u7684 feature/design \u5236\u54C1\u540E\uFF0C\u5728\u8BE5\u6587\u4EF6\u9876\u90E8\u6DFB\u52A0\u72EC\u7ACB\u8FFD\u6EAF\u6CE8\u91CA\uFF08\u5982 \`// @feature <ID>\` \u6216 \`<!-- @feature <ID> -->\`\uFF09\u3002`,
+            `\u786E\u8BA4 artifact-graph.config.yaml \u7684 types.test.paths \u5305\u542B\u8BE5\u6587\u4EF6\uFF0C\u518D\u8FD0\u884C \`artifact-graph version-lock refresh --all\` \u5237\u65B0\u7248\u672C\u9501\u3002`
+          ]
+        });
+      }
+    }
+  }
+  return {
+    checked: true,
+    graphErrorCount: graphErrors.length,
+    totalLocks: lockAudit.totalLocks,
+    freshLocks: lockAudit.fresh,
+    implementsLocksCount: implementsLocks.length,
+    verifiesLocksCount: verifiesLocks.length,
+    hasFreshImplementsLock,
+    hasFreshVerifiesLock,
+    implementationSurfaceChecked,
+    matchedEntries,
+    unclaimedEntries,
+    issues,
+    config,
+    graph,
+    lockFile,
+    staleEdgeIds
+  };
+}
+async function readJsonSafe(rootReal, relPath) {
+  const fullCandidate = join13(rootReal, relPath);
+  if (!existsSync3(fullCandidate)) {
+    return { exists: false };
+  }
+  const safe = await resolveSafeWithinRoot(rootReal, relPath);
+  if (!safe.ok) {
+    return { exists: true, ok: false, error: safe.reason };
+  }
+  try {
+    const raw = await readFile6(safe.fullRealPath, "utf-8");
+    return { exists: true, ok: true, data: JSON.parse(raw), fullRealPath: safe.fullRealPath };
+  } catch (error) {
+    return { exists: true, ok: false, error: `JSON \u89E3\u6790\u5931\u8D25\uFF08${relPath}\uFF09\uFF1A${error.message}` };
+  }
+}
+function isValidPortfolioFileShape(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value;
+  return record.schemaVersion === "1.0" && Array.isArray(record.items);
+}
+function isValidUpstreamBindingsShape(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value;
+  return record.schemaVersion === "1.0" && typeof record.upstreamPortfolio === "string" && record.upstreamPortfolio.trim().length > 0 && Array.isArray(record.bindings);
+}
+function isPlainRecord(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+function hasExplicitReceiptFailure(obj) {
+  if (obj.ok === false || obj.valid === false) return true;
+  if (typeof obj.status === "string" && FAIL_OR_PENDING_RECEIPT_STATUSES.has(obj.status.trim().toLowerCase())) {
+    return true;
+  }
+  if (obj.verdict === "FAIL" || obj.verdict === "BLOCK" || obj.decision === "FAIL" || obj.decision === "BLOCK") {
+    return true;
+  }
+  return false;
+}
+function hasExplicitReceiptPass(obj) {
+  if (obj.ok === true || obj.valid === true) return true;
+  if (typeof obj.status === "string") {
+    const lower = obj.status.trim().toLowerCase();
+    if (lower === "passed" || lower === "pass") return true;
+  }
+  if (obj.verdict === "PASS" || obj.decision === "PASS") return true;
+  return false;
+}
+async function checkReadonlyReceipt(downstreamRootReal, portfolioRootReal, receiptPath) {
+  let check = await resolveSafeWithinRoot(downstreamRootReal, receiptPath);
+  if (!check.ok) {
+    check = await resolveSafeWithinRoot(portfolioRootReal, receiptPath);
+  }
+  if (!check.ok) {
+    return { valid: false, reason: `\u53EA\u8BFB\u76EE\u6807\u58F0\u660E\u7684\u9A8C\u8BC1\u6536\u636E\u4E0D\u53EF\u7528\uFF08${receiptPath}\uFF09\uFF1A${check.reason}` };
+  }
+  try {
+    const raw = (await readFile6(check.fullRealPath, "utf-8")).trim();
+    if (!raw) {
+      return { valid: false, reason: `\u53EA\u8BFB\u76EE\u6807\u9A8C\u8BC1\u6536\u636E\u5185\u5BB9\u4E3A\u7A7A\uFF1A${receiptPath}` };
+    }
+    if (receiptPath.endsWith(".json") || raw.startsWith("{") || raw.startsWith("[") || raw.startsWith('"')) {
+      const parsed = JSON.parse(raw);
+      if (!isPlainRecord(parsed)) {
+        return { valid: false, reason: `\u53EA\u8BFB\u76EE\u6807\u9A8C\u8BC1\u6536\u636E\u5FC5\u987B\u662F\u5305\u542B\u6B63\u5411\u901A\u8FC7\u5B57\u6BB5\u7684 JSON \u5BF9\u8C61\uFF1A${receiptPath}` };
+      }
+      if (hasExplicitReceiptFailure(parsed)) {
+        return { valid: false, reason: `\u53EA\u8BFB\u76EE\u6807\u9A8C\u8BC1\u6536\u636E\u8BB0\u5F55\u4E86\u5931\u8D25\u6216\u672A\u5B8C\u6210\u72B6\u6001\uFF1A${receiptPath}` };
+      }
+      const nestedReview = isPlainRecord(parsed.independent_review) ? parsed.independent_review : void 0;
+      if (nestedReview && hasExplicitReceiptFailure(nestedReview)) {
+        return { valid: false, reason: `\u53EA\u8BFB\u76EE\u6807\u9A8C\u8BC1\u6536\u636E\u4E2D\u7684\u72EC\u7ACB\u5BA1\u9605\u8BB0\u5F55\u4E86\u5931\u8D25\u6216\u672A\u5B8C\u6210\u72B6\u6001\uFF1A${receiptPath}` };
+      }
+      const passed = hasExplicitReceiptPass(parsed) || (nestedReview ? hasExplicitReceiptPass(nestedReview) : false);
+      if (!passed) {
+        return {
+          valid: false,
+          reason: `\u53EA\u8BFB\u76EE\u6807\u9A8C\u8BC1\u6536\u636E\u7F3A\u5C11\u660E\u786E\u6B63\u5411\u901A\u8FC7\u5B57\u6BB5\uFF08ok: true / valid: true / status: "passed" / verdict: "PASS" / decision: "PASS"\uFF09\uFF1A${receiptPath}`
+        };
+      }
+      return { valid: true };
+    }
+    if (/\b(?:FAIL|FAILED|PENDING|BLOCKED|REJECTED|ERROR)\b/i.test(raw)) {
+      return { valid: false, reason: `\u53EA\u8BFB\u76EE\u6807\u9A8C\u8BC1\u6536\u636E\u6587\u672C\u5305\u542B\u5931\u8D25\u6216\u672A\u5B8C\u6210\u72B6\u6001\uFF1A${receiptPath}` };
+    }
+    if (!/(?:\b(?:PASS|PASSED)\b|(?:ok|valid)\s*:\s*true|(?:verdict|decision)\s*:\s*PASS|status\s*:\s*passed)/i.test(raw)) {
+      return { valid: false, reason: `\u53EA\u8BFB\u76EE\u6807\u9A8C\u8BC1\u6536\u636E\u6587\u672C\u7F3A\u5C11\u660E\u786E\u6B63\u5411\u901A\u8FC7\u58F0\u660E\uFF1A${receiptPath}` };
+    }
+    return { valid: true };
+  } catch (error) {
+    return { valid: false, reason: `\u53EA\u8BFB\u76EE\u6807\u9A8C\u8BC1\u6536\u636E\u8BFB\u53D6\u6216\u89E3\u6790\u5931\u8D25\uFF08${receiptPath}\uFF09\uFF1A${error.message}` };
+  }
+}
+async function resolveOptionalSafeFile(rootReal, relPath) {
+  const checked = await resolveSafeWithinRoot(rootReal, relPath);
+  if (checked.ok) {
+    return { status: "ok", fullRealPath: checked.fullRealPath, relNormalized: checked.relNormalized };
+  }
+  if (checked.reason.startsWith("\u8DEF\u5F84\u4E0D\u5B58\u5728\uFF1A")) {
+    return { status: "missing" };
+  }
+  return { status: "unsafe" };
+}
+async function verifyFileDigestRef(rootReal, ref) {
+  if (!isPlainRecord(ref) || typeof ref.path !== "string" || typeof ref.sha256 !== "string") {
+    return false;
+  }
+  if (!/^[a-f0-9]{64}$/.test(ref.sha256)) {
+    return false;
+  }
+  const resolved = await resolveSafeWithinRoot(rootReal, ref.path);
+  if (!resolved.ok) {
+    return false;
+  }
+  try {
+    const bytes = await readFile6(resolved.fullRealPath);
+    const actualSha = createHash5("sha256").update(bytes).digest("hex");
+    return actualSha === ref.sha256;
+  } catch {
+    return false;
+  }
+}
+async function verifyRequirementFileDigestRefs(rootReal, entry) {
+  for (const field of ["source", "criterion"]) {
+    const ref = entry[field];
+    if (ref === void 0) continue;
+    if (!await verifyFileDigestRef(rootReal, ref)) {
+      return false;
+    }
+  }
+  return true;
+}
+async function verifyReceiptItemFileDigestRefs(rootReal, entry, singleFields, arrayFields) {
+  for (const field of singleFields) {
+    const ref = entry[field];
+    if (ref === void 0) continue;
+    if (!await verifyFileDigestRef(rootReal, ref)) {
+      return false;
+    }
+  }
+  for (const field of arrayFields) {
+    const list = entry[field];
+    if (list === void 0) continue;
+    if (!Array.isArray(list)) {
+      return false;
+    }
+    for (const ref of list) {
+      if (!await verifyFileDigestRef(rootReal, ref)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+async function evaluateSingleExecutionReceipt(downstreamRootReal, rawDoc, requirementsInfo) {
+  let doc = rawDoc;
+  if (Array.isArray(doc) && doc.length > 0) {
+    doc = doc[doc.length - 1];
+  } else if (isPlainRecord(doc) && Array.isArray(doc.runs) && doc.runs.length > 0) {
+    doc = doc.runs[doc.runs.length - 1];
+  }
+  if (!isPlainRecord(doc)) {
+    return false;
+  }
+  if (Array.isArray(doc.results)) {
+    if (doc.results.length === 0) return false;
+    if (typeof doc.requirementsSha256 === "string") {
+      if (!requirementsInfo || doc.requirementsSha256.toLowerCase() !== requirementsInfo.rawSha256) {
+        return false;
+      }
+    }
+    const passedReqIds = /* @__PURE__ */ new Set();
+    let passedCount = 0;
+    for (const entry of doc.results) {
+      if (!isPlainRecord(entry)) return false;
+      const reqId = typeof entry.requirementId === "string" ? entry.requirementId : "";
+      const isOptional = entry.optional === true || reqId !== "" && Boolean(requirementsInfo?.optionalIds.has(reqId));
+      const disposition = typeof entry.disposition === "string" ? entry.disposition : "";
+      const isPassed = PASSING_EXECUTION_DISPOSITIONS.has(disposition) && (entry.verdict === "passed" || entry.passed === true);
+      if (!isOptional && !isPassed) {
+        return false;
+      }
+      if (isPassed) {
+        if (!await verifyReceiptItemFileDigestRefs(
+          downstreamRootReal,
+          entry,
+          ["decision", "applicability"],
+          ["evidence", "limitations"]
+        )) {
+          return false;
+        }
+        passedCount += 1;
+        if (reqId) passedReqIds.add(reqId);
+      }
+    }
+    if (passedCount === 0) return false;
+    if (requirementsInfo) {
+      for (const reqId of requirementsInfo.requiredIds) {
+        if (!passedReqIds.has(reqId)) return false;
+      }
+    }
+    return true;
+  }
+  if (Array.isArray(doc.items)) {
+    if (doc.items.length === 0) return false;
+    if (doc.ok === false) return false;
+    if (typeof doc.overallStatus === "string" && !ALLOWED_SFT_OVERALL_STATUSES.has(doc.overallStatus)) {
+      return false;
+    }
+    if (Array.isArray(doc.failedIds) && doc.failedIds.length > 0 || Array.isArray(doc.openIds) && doc.openIds.length > 0 || Array.isArray(doc.notExecutedIds) && doc.notExecutedIds.length > 0) {
+      return false;
+    }
+    const coveredIds = /* @__PURE__ */ new Set();
+    let passedCount = 0;
+    for (const item of doc.items) {
+      if (!isPlainRecord(item)) return false;
+      const reqId = typeof item.requirementId === "string" ? item.requirementId : "";
+      const itemId = typeof item.id === "string" ? item.id : "";
+      const isOptional = item.optional === true || reqId !== "" && Boolean(requirementsInfo?.optionalIds.has(reqId));
+      const disposition = typeof item.disposition === "string" ? item.disposition : "";
+      const isPassed = PASSING_EXECUTION_DISPOSITIONS.has(disposition) && (item.verdict === "passed" || item.passed === true);
+      if (!isOptional && !isPassed) {
+        return false;
+      }
+      if (isPassed) {
+        if (!await verifyReceiptItemFileDigestRefs(
+          downstreamRootReal,
+          item,
+          [],
+          ["evidence"]
+        )) {
+          return false;
+        }
+        passedCount += 1;
+        if (reqId) coveredIds.add(reqId);
+        if (itemId) coveredIds.add(itemId);
+      }
+    }
+    if (passedCount === 0) return false;
+    if (requirementsInfo) {
+      for (const reqId of requirementsInfo.requiredIds) {
+        if (!coveredIds.has(reqId)) return false;
+      }
+    }
+    return true;
+  }
+  return false;
+}
+async function verifyDownstreamExecutionReceipt(downstreamRootReal) {
+  let reqRelPath = ".release-skill/testing/requirements.json";
+  let resultRelPath = ".runs/release-testing/results.json";
+  const releaseCfg = await resolveOptionalSafeFile(downstreamRootReal, ".release-skill/project.yaml");
+  if (releaseCfg.status === "unsafe") {
+    return { valid: false };
+  }
+  if (releaseCfg.status === "ok") {
+    try {
+      const loadedYaml = yaml2.load(await readFile6(releaseCfg.fullRealPath, "utf-8"));
+      if (isPlainRecord(loadedYaml) && isPlainRecord(loadedYaml.testIntake)) {
+        if (typeof loadedYaml.testIntake.requirementsFile === "string" && loadedYaml.testIntake.requirementsFile.trim()) {
+          reqRelPath = loadedYaml.testIntake.requirementsFile.trim();
+        }
+        if (typeof loadedYaml.testIntake.resultFile === "string" && loadedYaml.testIntake.resultFile.trim()) {
+          resultRelPath = loadedYaml.testIntake.resultFile.trim();
+        }
+      }
+    } catch {
+      return { valid: false };
+    }
+  }
+  let requirementsInfo = null;
+  const reqFile = await resolveOptionalSafeFile(downstreamRootReal, reqRelPath);
+  if (reqFile.status === "unsafe") {
+    return { valid: false };
+  }
+  if (reqFile.status === "ok") {
+    try {
+      const reqBytes = await readFile6(reqFile.fullRealPath);
+      const reqParsed = JSON.parse(reqBytes.toString("utf-8"));
+      if (!isPlainRecord(reqParsed) || !Array.isArray(reqParsed.requirements) || reqParsed.requirements.length === 0) {
+        return { valid: false };
+      }
+      const requiredIds = [];
+      const optionalIds = /* @__PURE__ */ new Set();
+      for (const entry of reqParsed.requirements) {
+        if (!isPlainRecord(entry) || typeof entry.id !== "string" || !entry.id.trim()) {
+          return { valid: false };
+        }
+        const id = entry.id.trim();
+        const refsValid = await verifyRequirementFileDigestRefs(downstreamRootReal, entry);
+        if (!refsValid) {
+          return { valid: false };
+        }
+        if (entry.optional === true) {
+          optionalIds.add(id);
+        } else {
+          requiredIds.push(id);
+        }
+      }
+      requirementsInfo = {
+        rawSha256: createHash5("sha256").update(reqBytes).digest("hex"),
+        requiredIds,
+        optionalIds
+      };
+    } catch {
+      return { valid: false };
+    }
+  }
+  const receiptCandidates = Array.from(/* @__PURE__ */ new Set([resultRelPath, "artifacts/tests/sft-runs.json"]));
+  const parsedReceipts = [];
+  for (const rel of receiptCandidates) {
+    const candidate = await resolveOptionalSafeFile(downstreamRootReal, rel);
+    if (candidate.status === "unsafe") {
+      return { valid: false };
+    }
+    if (candidate.status === "ok") {
+      try {
+        parsedReceipts.push(JSON.parse(await readFile6(candidate.fullRealPath, "utf-8")));
+      } catch {
+        return { valid: false };
+      }
+    }
+  }
+  if (parsedReceipts.length === 0) {
+    return { valid: false };
+  }
+  for (const doc of parsedReceipts) {
+    if (!await evaluateSingleExecutionReceipt(downstreamRootReal, doc, requirementsInfo)) {
+      return { valid: false };
+    }
+  }
+  return { valid: true };
+}
+async function auditPortfolioLayer(rootReal, strict, intraCache) {
+  const issues = [];
+  const loaded = await readJsonSafe(rootReal, PORTFOLIO_ALLOCATIONS_PATH);
+  if (!loaded.exists) {
+    throw new Error(`\u5185\u90E8\u9519\u8BEF\uFF1A${PORTFOLIO_ALLOCATIONS_PATH} \u4E0D\u5B58\u5728`);
+  }
+  if (!loaded.ok || !isValidPortfolioFileShape(loaded.data)) {
+    const msg = !loaded.ok ? loaded.error : `${PORTFOLIO_ALLOCATIONS_PATH} \u7ED3\u6784\u65E0\u6548\uFF1A\u5FC5\u987B\u5305\u542B schemaVersion: "1.0" \u4E0E items \u6570\u7EC4\u3002`;
+    issues.push({
+      code: "INVALID_PORTFOLIO_ALLOCATIONS",
+      layer: "portfolio",
+      severity: "error",
+      file: PORTFOLIO_ALLOCATIONS_PATH,
+      message: msg,
+      remediation: [`\u68C0\u67E5 ${PORTFOLIO_ALLOCATIONS_PATH} \u7684 JSON \u683C\u5F0F\uFF0C\u786E\u8BA4\u5305\u542B schemaVersion: "1.0" \u4E0E items \u6570\u7EC4\u3002`]
+    });
+    return {
+      portfolioSummary: {
+        filePath: PORTFOLIO_ALLOCATIONS_PATH,
+        totalItems: 0,
+        satisfactionSummary: {
+          not_applicable: 0,
+          partially_allocated: 0,
+          allocated_in_progress: 0,
+          traceability_locked: 0,
+          verified_satisfied: 0
+        },
+        items: []
+      },
+      issues
+    };
+  }
+  const portfolioFile = loaded.data;
+  const satisfactionSummary = {
+    not_applicable: 0,
+    partially_allocated: 0,
+    allocated_in_progress: 0,
+    traceability_locked: 0,
+    verified_satisfied: 0
+  };
+  const itemEvaluations = [];
+  const registeredSourceUids = /* @__PURE__ */ new Set();
+  const upstreamBindingCache = /* @__PURE__ */ new Map();
+  const executionReceiptCache = /* @__PURE__ */ new Map();
+  for (const item of portfolioFile.items) {
+    if (typeof item.sourceUid === "string" && item.sourceUid.trim().length > 0) {
+      registeredSourceUids.add(item.sourceUid.trim());
+    }
+    const itemIssues = [];
+    const sourceUid = typeof item.sourceUid === "string" ? item.sourceUid : "(unknown)";
+    const sourcePath = typeof item.sourcePath === "string" ? item.sourcePath : "";
+    const disposition = typeof item.disposition === "string" ? item.disposition : "";
+    const remainingScope = Array.isArray(item.remainingScope) ? item.remainingScope.filter((s) => typeof s === "string" && s.trim().length > 0) : [];
+    const allocations = Array.isArray(item.allocations) ? item.allocations : [];
+    let actualSourceDigest;
+    const sourceCheck = await readSafeFileDigest(rootReal, sourcePath);
+    if (!sourceCheck.ok) {
+      itemIssues.push({
+        code: sourceCheck.missing ? "PORTFOLIO_SOURCE_MISSING" : "UNSAFE_TARGET_PATH",
+        layer: "portfolio",
+        severity: "error",
+        uid: sourceUid,
+        file: sourcePath || PORTFOLIO_ALLOCATIONS_PATH,
+        message: `\u9AD8\u9636\u9700\u6C42\u6E90\u6587\u4EF6\u6821\u9A8C\u5931\u8D25\uFF08${sourceUid}\uFF09\uFF1A${sourceCheck.reason}`,
+        remediation: [`\u786E\u8BA4 ${sourcePath || "sourcePath"} \u5B58\u5728\u4E8E\u5F53\u524D\u9AD8\u9636\u4ED3\u5E93\u5185\u4E14\u4E0D\u662F\u7B26\u53F7\u94FE\u63A5\uFF0C\u7136\u540E\u8FD0\u884C \`artifact-graph alignment-lock\`\u3002`]
+      });
+    } else {
+      actualSourceDigest = sourceCheck.digest;
+      if (!SHA256_DIGEST_RE.test(item.sourceDigest ?? "") || item.sourceDigest !== actualSourceDigest) {
+        itemIssues.push({
+          code: "PORTFOLIO_SOURCE_DRIFT",
+          layer: "portfolio",
+          severity: "error",
+          uid: sourceUid,
+          file: sourceCheck.relNormalized,
+          expectedDigest: item.sourceDigest,
+          actualDigest: actualSourceDigest,
+          message: `\u9AD8\u9636\u9700\u6C42\u6587\u4EF6 ${sourceCheck.relNormalized} \u5185\u5BB9\u5DF2\u53D8\u66F4\uFF0C\u4E0E portfolio-allocations.json \u8BB0\u5F55\u7684 sourceDigest \u4E0D\u4E00\u81F4\u3002`,
+          remediation: [
+            `\u5BA1\u9605 ${sourceCheck.relNormalized} \u7684\u9AD8\u9636\u4FEE\u8BA2\uFF0C\u786E\u8BA4\u4E0B\u6E38\u8BE6\u8BBE\u662F\u5426\u9700\u8981\u540C\u6B65\u8C03\u6574\u3002`,
+            "\u5728\u5B8C\u6210\u4E0B\u6E38\u540C\u6B65\u786E\u8BA4\u540E\u8FD0\u884C `artifact-graph alignment-lock` \u540C\u6B65\u66F4\u65B0\u6458\u8981\u3002"
+          ]
+        });
+      }
+    }
+    if (!VALID_DISPOSITIONS.has(disposition)) {
+      itemIssues.push({
+        code: "INVALID_PORTFOLIO_ALLOCATIONS",
+        layer: "portfolio",
+        severity: "error",
+        uid: sourceUid,
+        file: PORTFOLIO_ALLOCATIONS_PATH,
+        message: `\u6761\u76EE ${sourceUid} \u7684 disposition="${disposition}" \u975E\u6CD5\uFF0C\u4EC5\u5141\u8BB8 allocated\u3001deferred\u3001merged \u6216 abandoned\u3002`,
+        remediation: [`\u5C06 ${sourceUid} \u7684 disposition \u4FEE\u6539\u4E3A\u5408\u6CD5\u679A\u4E3E\u503C\u3002`]
+      });
+    } else if (disposition === "allocated") {
+      if (allocations.length === 0) {
+        itemIssues.push({
+          code: "UNALLOCATED_ACTIVE_DEMAND",
+          layer: "portfolio",
+          severity: "error",
+          uid: sourceUid,
+          file: PORTFOLIO_ALLOCATIONS_PATH,
+          message: `\u6D3B\u8DC3\u9AD8\u9636\u9700\u6C42 ${sourceUid} \u5904\u4E8E allocated \u72B6\u6001\uFF0C\u4F46 allocations[] \u4E3A\u7A7A\uFF0C\u5C1A\u672A\u62C6\u5206\u6D3E\u53D1\u7ED9\u4EFB\u4F55\u4E0B\u6E38\u4ED3\u5E93\u3002`,
+          remediation: [
+            `\u5728 ${PORTFOLIO_ALLOCATIONS_PATH} \u4E2D\u4E3A ${sourceUid} \u6DFB\u52A0\u81F3\u5C11\u4E00\u6761\u4E0B\u6E38\u5206\u914D\u8BB0\u5F55\uFF08targetRepo\u3001targetUid\u3001targetPath\u3001targetDigest\uFF09\uFF0C\u6216\u5728\u7ECF\u6388\u6743\u540E\u8C03\u6574 disposition\u3002`
+          ]
+        });
+      }
+    } else {
+      const noteOk = typeof item.dispositionNote === "string" && item.dispositionNote.trim().length > 0;
+      const mergedOk = disposition !== "merged" || typeof item.mergedInto === "string" && item.mergedInto.trim().length > 0 && item.mergedInto !== sourceUid;
+      if (!noteOk || !mergedOk) {
+        itemIssues.push({
+          code: "MISSING_DISPOSITION_REASON",
+          layer: "portfolio",
+          severity: "error",
+          uid: sourceUid,
+          file: PORTFOLIO_ALLOCATIONS_PATH,
+          message: disposition === "merged" && !mergedOk ? `\u5DF2\u5408\u5E76\u6761\u76EE ${sourceUid} \u7F3A\u5C11\u6709\u6548\u7684 mergedInto \u76EE\u6807 ID \u6216 dispositionNote \u7406\u7531\u8BF4\u660E\u3002` : `\u975E\u5B9E\u65BD\u6761\u76EE ${sourceUid}\uFF08disposition=${disposition}\uFF09\u7F3A\u5C11\u5FC5\u586B\u7684 dispositionNote \u5904\u7F6E\u7406\u7531\u3002`,
+          remediation: [
+            disposition === "merged" ? `\u4E3A ${sourceUid} \u8865\u5145\u6709\u6548\u7684 mergedInto \u76EE\u6807\u4E0E dispositionNote \u8BF4\u660E\u3002` : `\u4E3A ${sourceUid} \u8865\u5145\u6E05\u6670\u7684 dispositionNote \u8BF4\u660E\u539F\u56E0\u6216\u91CD\u8BC4\u6761\u4EF6\u3002`
+          ]
+        });
+      }
+    }
+    const allocationDetails = new Array(allocations.length);
+    const activeCarriers = [];
+    const absorbedPending = [];
+    for (let idx = 0; idx < allocations.length; idx += 1) {
+      const alloc = allocations[idx];
+      const targetRepo = typeof alloc.targetRepo === "string" ? alloc.targetRepo : "";
+      const targetUid = typeof alloc.targetUid === "string" ? alloc.targetUid : "";
+      const targetPath = typeof alloc.targetPath === "string" ? alloc.targetPath : "";
+      const readonlyTarget = alloc.readonlyTarget === true;
+      const allocStatus = alloc.allocationStatus === void 0 ? "active" : alloc.allocationStatus;
+      if (allocStatus !== "active" && allocStatus !== "absorbed") {
+        itemIssues.push({
+          code: "INVALID_PORTFOLIO_ALLOCATIONS",
+          layer: "portfolio",
+          severity: "error",
+          uid: sourceUid,
+          targetRepo,
+          targetUid,
+          file: PORTFOLIO_ALLOCATIONS_PATH,
+          message: `\u5206\u914D\u6761\u76EE ${sourceUid} -> ${targetUid} \u7684 allocationStatus="${String(alloc.allocationStatus)}" \u975E\u6CD5\uFF0C\u4EC5\u5141\u8BB8 "active" \u6216 "absorbed"\u3002`,
+          remediation: ['\u5C06 allocationStatus \u4FEE\u6B63\u4E3A "active" \u6216 "absorbed"\uFF08\u6216\u79FB\u9664\u8BE5\u53EF\u9009\u5B57\u6BB5\u9ED8\u8BA4\u6309 active \u5904\u7406\uFF09\u3002']
+        });
+        allocationDetails[idx] = {
+          targetRepo,
+          targetUid,
+          targetPath,
+          readonlyTarget,
+          allocationStatus: String(alloc.allocationStatus),
+          targetRepoReachable: false,
+          satisfied: false,
+          hasFreshImplementsLock: false,
+          hasFreshVerifiesLock: false
+        };
+        continue;
+      }
+      if (allocStatus === "absorbed") {
+        absorbedPending.push({ index: idx, alloc });
+        continue;
+      }
+      let repoReachable = false;
+      let resolvedDownstreamRoot;
+      let hasFreshImplementsLock = false;
+      let hasFreshVerifiesLock = false;
+      let verifiedReceiptValid;
+      let allocOk = true;
+      const repoCheck = await resolveSafeRelatedRepo(rootReal, targetRepo);
+      if (!repoCheck.ok) {
+        allocOk = false;
+        itemIssues.push({
+          code: "UNSAFE_TARGET_PATH",
+          layer: "portfolio",
+          severity: "error",
+          uid: sourceUid,
+          targetRepo,
+          targetUid,
+          file: PORTFOLIO_ALLOCATIONS_PATH,
+          message: `\u5206\u914D\u6761\u76EE targetRepo \u5B89\u5168\u6821\u9A8C\u5931\u8D25\uFF08${sourceUid} -> ${targetRepo}\uFF09\uFF1A${repoCheck.reason}`,
+          remediation: ["\u5C06 targetRepo \u4FEE\u6B63\u4E3A\u6307\u5411\u540C\u7236\u7EA7\u6216\u5DE5\u4F5C\u533A\u5144\u5F1F\u4ED3\u5E93\u7684\u5408\u6CD5\u76F8\u5BF9\u8DEF\u5F84\uFF0C\u907F\u514D\u8D8A\u754C\u6216\u7B26\u53F7\u94FE\u63A5\u3002"]
+        });
+      } else if (!repoCheck.exists) {
+        allocOk = false;
+        itemIssues.push({
+          code: "TARGET_REPO_UNREACHABLE",
+          layer: "portfolio",
+          severity: "error",
+          uid: sourceUid,
+          targetRepo,
+          targetUid,
+          file: PORTFOLIO_ALLOCATIONS_PATH,
+          message: `\u4E0B\u6E38\u76EE\u6807\u4ED3\u5E93\u5728\u672C\u673A\u4E0D\u5B58\u5728\u6216\u4E0D\u53EF\u8FBE\uFF1A${targetRepo}\uFF08\u7528\u4E8E\u627F\u63A5 ${sourceUid} -> ${targetUid}\uFF09\u3002`,
+          remediation: [`\u786E\u8BA4\u4E0B\u6E38\u4ED3\u5E93 ${targetRepo} \u5DF2\u68C0\u51FA\u5230\u5DE5\u4F5C\u533A\u6B63\u786E\u4F4D\u7F6E\uFF0C\u6216\u4FEE\u6B63 targetRepo \u76F8\u5BF9\u8DEF\u5F84\u3002`]
+        });
+      } else {
+        repoReachable = true;
+        resolvedDownstreamRoot = repoCheck.repoRealPath;
+        const downstreamRoot = repoCheck.repoRealPath;
+        const targetFileCheck = await readSafeFileDigest(downstreamRoot, targetPath);
+        if (!targetFileCheck.ok) {
+          allocOk = false;
+          itemIssues.push({
+            code: targetFileCheck.missing ? "DOWNSTREAM_TARGET_MISSING" : "UNSAFE_TARGET_PATH",
+            layer: "portfolio",
+            severity: "error",
+            uid: sourceUid,
+            targetRepo,
+            targetUid,
+            file: targetPath || PORTFOLIO_ALLOCATIONS_PATH,
+            message: `\u4E0B\u6E38\u76EE\u6807\u5236\u54C1\u6821\u9A8C\u5931\u8D25\uFF08${targetRepo}/${targetPath}\uFF09\uFF1A${targetFileCheck.reason}`,
+            remediation: [`\u5728\u4E0B\u6E38\u4ED3\u5E93 ${targetRepo} \u4E2D\u521B\u5EFA\u6216\u6062\u590D ${targetPath}\uFF0C\u5E76\u5728\u53CC\u65B9\u540C\u6B65\u540E\u8FD0\u884C \`artifact-graph alignment-lock\`\u3002`]
+          });
+        } else {
+          if (!SHA256_DIGEST_RE.test(alloc.targetDigest ?? "") || alloc.targetDigest !== targetFileCheck.digest) {
+            allocOk = false;
+            itemIssues.push({
+              code: "DOWNSTREAM_DESIGN_EVOLVED",
+              layer: "portfolio",
+              severity: "error",
+              uid: sourceUid,
+              targetRepo,
+              targetUid,
+              file: `${targetRepo}/${targetFileCheck.relNormalized}`,
+              expectedDigest: alloc.targetDigest,
+              actualDigest: targetFileCheck.digest,
+              message: `\u4E0B\u6E38\u8BE6\u8BBE\u5236\u54C1 ${targetRepo}/${targetFileCheck.relNormalized}\uFF08${targetUid}\uFF09\u5DF2\u6F14\u8FDB\uFF0C\u9AD8\u9636\u5206\u914D\u8868\u4E2D\u7684 targetDigest \u5C1A\u672A\u540C\u6B65\u6821\u51C6\u3002`,
+              remediation: [
+                `\u5BF9\u6BD4\u4E0B\u6E38 ${targetRepo}/${targetFileCheck.relNormalized} \u4E0E\u9AD8\u9636 ${sourcePath} \u7684\u5DEE\u5F02\u5E76\u8BC4\u4F30\u662F\u5426\u9700\u8981\u56DE\u5199\u9AD8\u9636\u62C6\u5206\u89C4\u5212\u3002`,
+                "\u786E\u8BA4\u4E24\u4FA7\u5185\u5BB9\u4E00\u81F4\u540E\uFF0C\u8FD0\u884C `artifact-graph alignment-lock` \u540C\u6B65\u5237\u65B0\u53CC\u5411\u6458\u8981\u3002"
+              ]
+            });
+          }
+          if (readonlyTarget) {
+            if (typeof alloc.verifiedReceiptPath === "string" && alloc.verifiedReceiptPath.trim().length > 0) {
+              const receipt = await checkReadonlyReceipt(downstreamRoot, rootReal, alloc.verifiedReceiptPath.trim());
+              verifiedReceiptValid = receipt.valid;
+              if (!receipt.valid) {
+                allocOk = false;
+                itemIssues.push({
+                  code: "READONLY_RECEIPT_INVALID",
+                  layer: "portfolio",
+                  severity: "error",
+                  uid: sourceUid,
+                  targetRepo,
+                  targetUid,
+                  file: alloc.verifiedReceiptPath,
+                  message: receipt.reason ?? `\u53EA\u8BFB\u76EE\u6807\u9A8C\u8BC1\u6536\u636E\u65E0\u6548\uFF1A${alloc.verifiedReceiptPath}`,
+                  remediation: [`\u6838\u5BF9 ${alloc.verifiedReceiptPath} \u662F\u5426\u6307\u5411\u5B8C\u6574\u4E14\u6709\u6548\u7684\u53EA\u8BFB\u9A8C\u8BC1\u6536\u636E\u6587\u4EF6\u3002`]
+                });
+              }
+            } else if (existsSync3(join13(downstreamRoot, "artifact-graph.config.yaml")) && existsSync3(join13(downstreamRoot, VERSION_LOCK_PATH))) {
+              let roIntra = intraCache.get(downstreamRoot);
+              if (!roIntra) {
+                roIntra = await auditIntraRepo(downstreamRoot, strict);
+                intraCache.set(downstreamRoot, roIntra);
+              }
+              const targetFreshness = evaluateTargetLockFreshness(roIntra, targetUid);
+              hasFreshImplementsLock = targetFreshness.hasFreshImplementsLock;
+              hasFreshVerifiesLock = targetFreshness.hasFreshVerifiesLock;
+              if (roIntra.issues.some((iss) => iss.severity === "error")) {
+                allocOk = false;
+              }
+            }
+          } else {
+            let cachedBindings = upstreamBindingCache.get(downstreamRoot);
+            if (!cachedBindings) {
+              const loadedBindings = await readJsonSafe(downstreamRoot, UPSTREAM_BINDINGS_PATH);
+              if (!loadedBindings.exists) {
+                cachedBindings = { ok: false, error: `\u4E0B\u6E38\u4ED3\u5E93 ${targetRepo} \u7F3A\u5C11 ${UPSTREAM_BINDINGS_PATH}` };
+              } else if (!loadedBindings.ok) {
+                cachedBindings = { ok: false, error: loadedBindings.error };
+              } else if (!isValidUpstreamBindingsShape(loadedBindings.data)) {
+                cachedBindings = { ok: false, error: `${targetRepo}/${UPSTREAM_BINDINGS_PATH} \u7ED3\u6784\u65E0\u6548` };
+              } else {
+                cachedBindings = { ok: true, data: loadedBindings.data };
+              }
+              upstreamBindingCache.set(downstreamRoot, cachedBindings);
+            }
+            const matchedBinding = cachedBindings.ok && cachedBindings.data ? cachedBindings.data.bindings.find((b) => b.localUid === targetUid && normalizeSlashPath(b.localPath ?? "") === targetFileCheck.relNormalized && b.upstreamUid === sourceUid && normalizeSlashPath(b.upstreamPath ?? "") === normalizeSlashPath(sourcePath)) : void 0;
+            let pointsToThisPortfolio = false;
+            if (cachedBindings.ok && cachedBindings.data) {
+              const backRef = await resolveSafeRelatedRepo(downstreamRoot, cachedBindings.data.upstreamPortfolio);
+              pointsToThisPortfolio = backRef.ok && backRef.exists && backRef.repoRealPath === rootReal;
+            }
+            if (!matchedBinding || !pointsToThisPortfolio) {
+              allocOk = false;
+              itemIssues.push({
+                code: "UNRECIPROCATED_ALLOCATION",
+                layer: "portfolio",
+                severity: "error",
+                uid: sourceUid,
+                targetRepo,
+                targetUid,
+                file: `${targetRepo}/${UPSTREAM_BINDINGS_PATH}`,
+                message: cachedBindings.error ? `\u672A\u5EFA\u7ACB\u53CC\u5411\u4E92\u8BA4\uFF08${sourceUid} -> ${targetRepo}#${targetUid}\uFF09\uFF1A${cachedBindings.error}\u3002` : `\u5355\u8FB9\u5206\u914D\u672A\u4E92\u8BA4\uFF1A\u9AD8\u9636\u4ED3\u5DF2\u5C06 ${sourceUid} \u5206\u914D\u7ED9 ${targetRepo}\uFF08${targetUid}\uFF09\uFF0C\u4F46\u4E0B\u6E38 ${UPSTREAM_BINDINGS_PATH} \u7F3A\u5C11\u5BF9\u5E94\u7684\u56DE\u6307\u7ED1\u5B9A\u3002`,
+                remediation: [
+                  `\u5728\u4E0B\u6E38\u4ED3\u5E93 ${targetRepo}/${UPSTREAM_BINDINGS_PATH} \u4E2D\u8865\u5145\u56DE\u6307\u7ED1\u5B9A\uFF08localUid: "${targetUid}", upstreamUid: "${sourceUid}"\uFF09\u3002`,
+                  "\u7136\u540E\u8FD0\u884C `artifact-graph alignment-lock` \u540C\u6B65\u9501\u5B9A\u53CC\u5411\u6458\u8981\u3002"
+                ]
+              });
+            } else {
+              if (matchedBinding.upstreamDigest !== item.sourceDigest || actualSourceDigest && matchedBinding.upstreamDigest !== actualSourceDigest) {
+                allocOk = false;
+                itemIssues.push({
+                  code: "UPSTREAM_DESIGN_CHANGED",
+                  layer: "portfolio",
+                  severity: "error",
+                  uid: sourceUid,
+                  targetRepo,
+                  targetUid,
+                  file: `${targetRepo}/${UPSTREAM_BINDINGS_PATH}`,
+                  expectedDigest: matchedBinding.upstreamDigest,
+                  actualDigest: actualSourceDigest ?? item.sourceDigest,
+                  message: `\u9AD8\u9636\u9700\u6C42 ${sourceUid} \u5DF2\u53D8\u66F4\uFF0C\u4F46\u4E0B\u6E38 ${targetRepo}/${UPSTREAM_BINDINGS_PATH} \u4E2D\u7684 upstreamDigest \u4ECD\u505C\u7559\u5728\u65E7\u7248\u672C\u3002`,
+                  remediation: [
+                    `\u540C\u6B65\u66F4\u65B0\u4E0B\u6E38 ${targetRepo} \u7684\u8BE6\u7EC6\u8BBE\u8BA1\u5236\u54C1\u4EE5\u54CD\u5E94 ${sourceUid} \u7684\u53D8\u66F4\u3002`,
+                    "\u5B8C\u6210\u540C\u6B65\u540E\u8FD0\u884C `artifact-graph alignment-lock` \u5237\u65B0\u4E0A\u4E0B\u6E38\u53CC\u5411\u6458\u8981\u3002"
+                  ]
+                });
+              }
+              if (matchedBinding.localDigest !== targetFileCheck.digest || matchedBinding.localDigest !== alloc.targetDigest) {
+                allocOk = false;
+                itemIssues.push({
+                  code: "DOWNSTREAM_DESIGN_EVOLVED",
+                  layer: "portfolio",
+                  severity: "error",
+                  uid: sourceUid,
+                  targetRepo,
+                  targetUid,
+                  file: `${targetRepo}/${UPSTREAM_BINDINGS_PATH}`,
+                  expectedDigest: matchedBinding.localDigest,
+                  actualDigest: targetFileCheck.digest,
+                  message: `\u4E0B\u6E38 ${targetRepo}/${targetFileCheck.relNormalized}\uFF08${targetUid}\uFF09\u76F8\u5BF9\u5176\u81EA\u8EAB ${UPSTREAM_BINDINGS_PATH} \u8BB0\u5F55\u7684 localDigest \u5DF2\u53D1\u751F\u53D8\u5316\u3002`,
+                  remediation: [
+                    `\u6838\u5BF9\u4E0B\u6E38 ${targetRepo} \u7684\u6700\u65B0\u4FEE\u6539\u662F\u5426\u9700\u8981\u540C\u6B65\u56DE\u5199\u9AD8\u9636\u89C4\u5212\uFF0C\u518D\u8FD0\u884C \`artifact-graph alignment-lock\` \u6821\u51C6\u6458\u8981\u3002`
+                  ]
+                });
+              }
+            }
+            let downstreamIntra = intraCache.get(downstreamRoot);
+            if (!downstreamIntra) {
+              downstreamIntra = await auditIntraRepo(downstreamRoot, strict);
+              intraCache.set(downstreamRoot, downstreamIntra);
+            }
+            const targetFreshness = evaluateTargetLockFreshness(downstreamIntra, targetUid);
+            hasFreshImplementsLock = targetFreshness.hasFreshImplementsLock;
+            hasFreshVerifiesLock = targetFreshness.hasFreshVerifiesLock;
+            const downstreamLockOrGraphBroken = downstreamIntra.graphErrorCount > 0 || downstreamIntra.issues.some((iss) => iss.severity === "error" && (iss.code === "artifact_changed" || iss.code === "source_changed" || iss.code === "verified_by_changed" || iss.code === "orphan_lock" || iss.code === "invalid_test_shell"));
+            if (downstreamLockOrGraphBroken && strict) {
+              allocOk = false;
+              itemIssues.push({
+                code: "DOWNSTREAM_INTRA_DRIFT",
+                layer: "portfolio",
+                severity: "error",
+                uid: sourceUid,
+                targetRepo,
+                targetUid,
+                file: targetRepo,
+                message: `\u4E0B\u6E38\u4ED3\u5E93 ${targetRepo} \u5B58\u5728\u672A\u5904\u7406\u7684\u56FE\u6821\u9A8C\u9519\u8BEF\u6216\u7248\u672C\u9501\u6F02\u79FB\uFF0C\u4E25\u683C\u6A21\u5F0F\u4E0B\u4E0D\u5141\u8BB8\u5224\u5B9A\u4E3A\u5BF9\u9F50\u901A\u8FC7\u3002`,
+                remediation: [`\u8FDB\u5165 ${targetRepo} \u8FD0\u884C \`artifact-graph alignment-audit\` \u4FEE\u590D\u56FE\u6821\u9A8C\u4E0E\u7248\u672C\u9501\u6F02\u79FB\u95EE\u9898\u3002`]
+              });
+            }
+            if (downstreamIntra.issues.some((iss) => iss.severity === "error")) {
+              allocOk = false;
+            }
+          }
+        }
+      }
+      const baseAligned = Boolean(
+        allocOk && repoReachable && actualSourceDigest && item.sourceDigest === actualSourceDigest
+      );
+      let executionReceiptValid;
+      let traceabilityLocked = false;
+      let satisfied = false;
+      if (baseAligned && readonlyTarget && typeof alloc.verifiedReceiptPath === "string" && alloc.verifiedReceiptPath.trim().length > 0) {
+        satisfied = verifiedReceiptValid === true;
+      } else if (baseAligned && hasFreshImplementsLock && hasFreshVerifiesLock && resolvedDownstreamRoot) {
+        let execReceipt = executionReceiptCache.get(resolvedDownstreamRoot);
+        if (!execReceipt) {
+          execReceipt = await verifyDownstreamExecutionReceipt(resolvedDownstreamRoot);
+          executionReceiptCache.set(resolvedDownstreamRoot, execReceipt);
+        }
+        executionReceiptValid = execReceipt.valid;
+        if (execReceipt.valid) {
+          satisfied = true;
+        } else {
+          traceabilityLocked = true;
+        }
+      }
+      const detail = {
+        targetRepo,
+        targetUid,
+        targetPath,
+        readonlyTarget,
+        allocationStatus: "active",
+        targetRepoReachable: repoReachable,
+        satisfied,
+        ...traceabilityLocked ? { traceabilityLocked: true } : {},
+        hasFreshImplementsLock,
+        hasFreshVerifiesLock,
+        ...verifiedReceiptValid !== void 0 ? { verifiedReceiptValid } : {},
+        ...executionReceiptValid !== void 0 ? { executionReceiptValid } : {}
+      };
+      allocationDetails[idx] = detail;
+      if (resolvedDownstreamRoot) {
+        activeCarriers.push({
+          targetRepo,
+          repoRealPath: resolvedDownstreamRoot,
+          allocOk,
+          detail
+        });
+      }
+    }
+    for (const { index: idx, alloc } of absorbedPending) {
+      const targetRepo = typeof alloc.targetRepo === "string" ? alloc.targetRepo : "";
+      const targetUid = typeof alloc.targetUid === "string" ? alloc.targetUid : "";
+      const targetPath = typeof alloc.targetPath === "string" ? alloc.targetPath : "";
+      const readonlyTarget = alloc.readonlyTarget === true;
+      const absorbedBy = typeof alloc.absorbedBy === "string" ? alloc.absorbedBy.trim() : "";
+      let absorbedOk = false;
+      let carrierDetail;
+      if (!absorbedBy) {
+        itemIssues.push({
+          code: "INVALID_ABSORBED_ALLOCATION",
+          layer: "portfolio",
+          severity: "error",
+          uid: sourceUid,
+          targetRepo,
+          targetUid,
+          file: PORTFOLIO_ALLOCATIONS_PATH,
+          message: `\u5DF2\u5438\u7EB3\u5206\u914D\u9879 ${sourceUid} -> ${targetRepo}#${targetUid} \u58F0\u660E\u4E86 allocationStatus: "absorbed"\uFF0C\u4F46\u7F3A\u5C11\u975E\u7A7A absorbedBy \u627F\u63A5\u4ED3\u8DEF\u5F84\u3002`,
+          remediation: ["\u8865\u5145\u6709\u6548\u7684 absorbedBy \u76F8\u5BF9\u4ED3\u5E93\u8DEF\u5F84\uFF0C\u5E76\u786E\u4FDD\u540C\u9700\u6C42\u4E0B\u5B58\u5728\u6307\u5411\u8BE5\u627F\u63A5\u4ED3\u7684\u6D3B\u8DC3\u6216\u53EA\u8BFB\u627F\u63A5\u9879\u3002"]
+        });
+      } else {
+        const absorbedRepoCheck = await resolveSafeRelatedRepo(rootReal, absorbedBy);
+        if (!absorbedRepoCheck.ok) {
+          itemIssues.push({
+            code: "UNSAFE_TARGET_PATH",
+            layer: "portfolio",
+            severity: "error",
+            uid: sourceUid,
+            targetRepo,
+            targetUid,
+            file: PORTFOLIO_ALLOCATIONS_PATH,
+            message: `\u5DF2\u5438\u7EB3\u5206\u914D\u9879\u7684 absorbedBy \u5B89\u5168\u6821\u9A8C\u5931\u8D25\uFF08${sourceUid} -> ${absorbedBy}\uFF09\uFF1A${absorbedRepoCheck.reason}`,
+            remediation: ["\u5C06 absorbedBy \u4FEE\u6B63\u4E3A\u6307\u5411\u540C\u5DE5\u4F5C\u533A\u6709\u6548\u627F\u63A5\u4ED3\u7684\u5408\u6CD5\u76F8\u5BF9\u8DEF\u5F84\u3002"]
+          });
+        } else if (normalizeSlashPath(absorbedBy) === normalizeSlashPath(targetRepo)) {
+          itemIssues.push({
+            code: "INVALID_ABSORBED_ALLOCATION",
+            layer: "portfolio",
+            severity: "error",
+            uid: sourceUid,
+            targetRepo,
+            targetUid,
+            file: PORTFOLIO_ALLOCATIONS_PATH,
+            message: `\u5DF2\u5438\u7EB3\u5206\u914D\u9879 ${sourceUid} -> ${targetRepo} \u7684 absorbedBy \u4E0D\u80FD\u6307\u5411\u5DF2\u9000\u5F79\u65E7\u4ED3\u81EA\u8EAB\u3002`,
+            remediation: ["\u5C06 absorbedBy \u6307\u5411\u5B9E\u9645\u627F\u63A5\u8BE5\u804C\u8D23\u7684\u65B0\u4ED3\u5E93\u8DEF\u5F84\uFF0C\u5E76\u786E\u4FDD\u540C\u9700\u6C42\u4E0B\u5B58\u5728\u5BF9\u5E94\u6D3B\u8DC3\u6216\u53EA\u8BFB\u627F\u63A5\u9879\u3002"]
+          });
+        } else {
+          const matchedCarrier = activeCarriers.find((carrier) => carrier.allocOk && (normalizeSlashPath(carrier.targetRepo) === normalizeSlashPath(absorbedBy) || absorbedRepoCheck.exists && carrier.repoRealPath === absorbedRepoCheck.repoRealPath));
+          if (!matchedCarrier) {
+            itemIssues.push({
+              code: "INVALID_ABSORBED_ALLOCATION",
+              layer: "portfolio",
+              severity: "error",
+              uid: sourceUid,
+              targetRepo,
+              targetUid,
+              file: PORTFOLIO_ALLOCATIONS_PATH,
+              message: `\u5DF2\u5438\u7EB3\u5206\u914D\u9879 ${sourceUid} -> ${targetRepo} \u58F0\u660E\u7531 "${absorbedBy}" \u627F\u63A5\uFF0C\u4F46\u540C\u9700\u6C42\u4E0B\u7F3A\u5C11\u6307\u5411\u8BE5\u627F\u63A5\u4ED3\u7684\u6709\u6548\u6D3B\u8DC3\u6216\u53EA\u8BFB\u627F\u63A5\u9879\u3002`,
+              remediation: [`\u5728 ${sourceUid} \u7684 allocations[] \u4E2D\u786E\u8BA4\u5B58\u5728\u6307\u5411 "${absorbedBy}" \u7684\u6709\u6548\u6D3B\u8DC3/\u53EA\u8BFB\u627F\u63A5\u9879\u5E76\u5B8C\u6210\u5BF9\u79F0\u7ED1\u5B9A\u3002`]
+            });
+          } else {
+            absorbedOk = true;
+            carrierDetail = matchedCarrier.detail;
+          }
+        }
+      }
+      allocationDetails[idx] = {
+        targetRepo,
+        targetUid,
+        targetPath,
+        readonlyTarget,
+        allocationStatus: "absorbed",
+        ...absorbedBy ? { absorbedBy } : {},
+        targetRepoReachable: false,
+        satisfied: Boolean(absorbedOk && carrierDetail?.satisfied),
+        ...absorbedOk && carrierDetail?.traceabilityLocked ? { traceabilityLocked: true } : {},
+        hasFreshImplementsLock: carrierDetail?.hasFreshImplementsLock ?? false,
+        hasFreshVerifiesLock: carrierDetail?.hasFreshVerifiesLock ?? false,
+        ...carrierDetail?.executionReceiptValid !== void 0 ? { executionReceiptValid: carrierDetail.executionReceiptValid } : {}
+      };
+    }
+    let computedSatisfaction;
+    if (disposition !== "allocated") {
+      computedSatisfaction = "not_applicable";
+    } else if (allocations.length === 0 || remainingScope.length > 0) {
+      computedSatisfaction = "partially_allocated";
+    } else if (allocationDetails.length > 0 && allocationDetails.every((detail) => detail.satisfied) && !itemIssues.some((issue2) => issue2.severity === "error")) {
+      computedSatisfaction = "verified_satisfied";
+    } else if (allocationDetails.length > 0 && allocationDetails.every((detail) => detail.satisfied || detail.traceabilityLocked) && allocationDetails.some((detail) => detail.traceabilityLocked) && !itemIssues.some((issue2) => issue2.severity === "error")) {
+      computedSatisfaction = "traceability_locked";
+    } else {
+      computedSatisfaction = "allocated_in_progress";
+    }
+    satisfactionSummary[computedSatisfaction] += 1;
+    issues.push(...itemIssues);
+    itemEvaluations.push({
+      sourceUid,
+      sourcePath,
+      ...typeof item.title === "string" ? { title: item.title } : {},
+      disposition,
+      computedSatisfaction,
+      remainingScope,
+      allocationsCount: allocations.length,
+      verifiedAllocationsCount: allocationDetails.filter((d) => d.satisfied).length,
+      traceabilityLockedAllocationsCount: allocationDetails.filter((d) => d.traceabilityLocked === true).length,
+      issues: itemIssues,
+      allocations: allocationDetails
+    });
+  }
+  let selfConfig = intraCache.get(rootReal)?.config;
+  let selfGraph = intraCache.get(rootReal)?.graph;
+  if ((!selfConfig || !selfGraph) && existsSync3(join13(rootReal, "artifact-graph.config.yaml"))) {
+    try {
+      selfConfig = await loadConfig(rootReal);
+      selfGraph = await scanArtifacts(rootReal, selfConfig);
+    } catch {
+    }
+  }
+  if (selfConfig && selfGraph) {
+    const activeRequirementNodes = selfGraph.nodes.filter((node) => node.type === "requirement" && !isHistoricalRequirementNode(node, selfGraph, selfConfig)).sort((a, b) => a.uid.localeCompare(b.uid));
+    for (const reqNode of activeRequirementNodes) {
+      if (registeredSourceUids.has(reqNode.uid) || registeredSourceUids.has(reqNode.code)) {
+        continue;
+      }
+      issues.push({
+        code: "UNALLOCATED_ACTIVE_DEMAND",
+        layer: "portfolio",
+        severity: "error",
+        uid: reqNode.uid,
+        file: reqNode.path,
+        message: `\u6D3B\u8DC3\u9700\u6C42\u5236\u54C1 ${reqNode.uid}\uFF08${reqNode.path}\uFF09\u5C1A\u672A\u767B\u8BB0\u81F3 ${PORTFOLIO_ALLOCATIONS_PATH} \u7684 items[] \u4E2D\uFF0C\u5B58\u5728\u9AD8\u9636\u9700\u6C42\u6F0F\u62C6\u98CE\u9669\u3002`,
+        remediation: [
+          `\u5C06\u8BE5\u9700\u6C42\u767B\u8BB0\u81F3 ${PORTFOLIO_ALLOCATIONS_PATH} \u5E76\u660E\u786E\u62C6\u5206\u76EE\u6807\u6216\u5904\u7F6E\u65B9\u5F0F\uFF08\u4F8B\u5982\u8BBE disposition \u4E3A "allocated" \u5E76\u586B\u5199 allocations[]\uFF0C\u6216\u6309\u51B3\u7B56\u8BBE\u4E3A deferred / merged / abandoned \u5E76\u8865\u5145 dispositionNote\uFF09\u3002`
+        ]
+      });
+    }
+  }
+  return {
+    portfolioSummary: {
+      filePath: PORTFOLIO_ALLOCATIONS_PATH,
+      ...typeof portfolioFile.portfolioId === "string" ? { portfolioId: portfolioFile.portfolioId } : {},
+      ...typeof portfolioFile.title === "string" ? { title: portfolioFile.title } : {},
+      totalItems: itemEvaluations.length,
+      satisfactionSummary,
+      items: itemEvaluations
+    },
+    issues
+  };
+}
+async function resolveExplicitPortfolioOverride(portfolioRootOption) {
+  if (!portfolioRootOption || portfolioRootOption.includes("\0")) {
+    return { ok: false, reason: "portfolioRoot \u53C2\u6570\u4E0D\u80FD\u4E3A\u7A7A\u6216\u5305\u542B\u7A7A\u5B57\u7B26" };
+  }
+  const abs = resolve10(portfolioRootOption);
+  const segs = abs.split(sep2).filter(Boolean);
+  if (hasForbiddenSegment(segs)) {
+    return { ok: false, reason: `portfolioRoot \u7981\u6B62\u5305\u542B\u53D7\u4FDD\u62A4\u9690\u85CF\u76EE\u5F55\uFF1A${portfolioRootOption}` };
+  }
+  try {
+    const st = await lstat5(abs);
+    if (st.isSymbolicLink()) {
+      return { ok: false, reason: `\u5B89\u5168\u7B56\u7565\u62D2\u7EDD\u76F4\u63A5\u5C06\u7B26\u53F7\u94FE\u63A5\u4F5C\u4E3A portfolioRoot\uFF1A${portfolioRootOption}` };
+    }
+    if (!st.isDirectory()) {
+      return { ok: false, reason: `portfolioRoot \u4E0D\u662F\u6709\u6548\u76EE\u5F55\uFF1A${portfolioRootOption}` };
+    }
+    const real = await realpath3(abs);
+    if (real === "/" || real === homedir()) {
+      return { ok: false, reason: `portfolioRoot \u4E0D\u80FD\u6307\u5411\u7CFB\u7EDF\u6839\u76EE\u5F55\u6216\u7528\u6237\u4E3B\u76EE\u5F55\uFF1A${portfolioRootOption}` };
+    }
+    return { ok: true, repoRealPath: real, exists: true };
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return { ok: true, repoRealPath: abs, exists: false };
+    }
+    return { ok: false, reason: `\u65E0\u6CD5\u8BBF\u95EE portfolioRoot ${portfolioRootOption}\uFF1A${error.message}` };
+  }
+}
+async function auditChildProjectLayer(rootReal, opts) {
+  const issues = [];
+  const loaded = await readJsonSafe(rootReal, UPSTREAM_BINDINGS_PATH);
+  if (!loaded.exists) {
+    throw new Error(`\u5185\u90E8\u9519\u8BEF\uFF1A${UPSTREAM_BINDINGS_PATH} \u4E0D\u5B58\u5728`);
+  }
+  if (!loaded.ok || !isValidUpstreamBindingsShape(loaded.data)) {
+    const msg = !loaded.ok ? loaded.error : `${UPSTREAM_BINDINGS_PATH} \u7ED3\u6784\u65E0\u6548\uFF1A\u5FC5\u987B\u5305\u542B schemaVersion: "1.0"\u3001\u975E\u7A7A upstreamPortfolio \u4E0E bindings \u6570\u7EC4\u3002`;
+    issues.push({
+      code: "INVALID_UPSTREAM_BINDINGS",
+      layer: "child-upstream",
+      severity: "error",
+      file: UPSTREAM_BINDINGS_PATH,
+      message: msg,
+      remediation: [`\u68C0\u67E5 ${UPSTREAM_BINDINGS_PATH} \u7684 JSON \u7ED3\u6784\u5E76\u4FEE\u6B63\u5FC5\u586B\u5B57\u6BB5\u3002`]
+    });
+    return {
+      childSummary: {
+        filePath: UPSTREAM_BINDINGS_PATH,
+        upstreamPortfolio: "",
+        upstreamReachable: false,
+        totalBindings: 0,
+        matchedBindings: 0
+      },
+      issues
+    };
+  }
+  const bindingFile = loaded.data;
+  const upstreamCheck = opts.portfolioRoot ? await resolveExplicitPortfolioOverride(opts.portfolioRoot) : await resolveSafeRelatedRepo(rootReal, bindingFile.upstreamPortfolio);
+  let upstreamPortfolioFile;
+  let upstreamRootReal;
+  let upstreamReachable = false;
+  if (!upstreamCheck.ok) {
+    issues.push({
+      code: "UNSAFE_TARGET_PATH",
+      layer: "child-upstream",
+      severity: "error",
+      file: UPSTREAM_BINDINGS_PATH,
+      message: `upstreamPortfolio \u5B89\u5168\u6821\u9A8C\u5931\u8D25\uFF1A${upstreamCheck.reason}`,
+      remediation: ["\u5C06 upstreamPortfolio \u4FEE\u6B63\u4E3A\u6307\u5411\u540C\u7236\u7EA7\u6216\u5DE5\u4F5C\u533A\u5144\u5F1F\u4ED3\u5E93\u7684\u5408\u6CD5\u76F8\u5BF9\u8DEF\u5F84\u3002"]
+    });
+  } else if (!upstreamCheck.exists || !existsSync3(join13(upstreamCheck.repoRealPath, PORTFOLIO_ALLOCATIONS_PATH))) {
+    issues.push({
+      code: "UPSTREAM_PORTFOLIO_UNREACHABLE",
+      layer: "child-upstream",
+      severity: opts.strict ? "error" : "warning",
+      file: UPSTREAM_BINDINGS_PATH,
+      message: `\u672C\u673A\u672A\u627E\u5230\u4E0A\u6E38\u9AD8\u9636\u89C4\u5212\u4ED3 ${bindingFile.upstreamPortfolio}\uFF08\u6216\u7F3A\u5C11 ${PORTFOLIO_ALLOCATIONS_PATH}\uFF09\uFF0C${opts.strict ? "\u4E25\u683C\u6A21\u5F0F\u4E0B\u963B\u65AD\u901A\u8FC7" : "\u5F53\u524D\u5DF2\u964D\u7EA7\u4E3A\u672C\u5730\u7ED3\u6784\u4E0E\u6458\u8981\u6821\u9A8C"}\u3002`,
+      remediation: [
+        `\u5982\u9700\u5B8C\u6574\u53CC\u5411\u6838\u5BF9\uFF0C\u8BF7\u5C06\u4E0A\u6E38\u89C4\u5212\u4ED3\u68C0\u51FA\u5230 ${bindingFile.upstreamPortfolio}\uFF0C\u6216\u901A\u8FC7 --portfolio-root \u6307\u5B9A\u53EF\u8FBE\u7684\u4E0A\u6E38\u4ED3\u5E93\u8DEF\u5F84\u3002`
+      ]
+    });
+  } else {
+    upstreamRootReal = upstreamCheck.repoRealPath;
+    const loadedPortfolio = await readJsonSafe(upstreamRootReal, PORTFOLIO_ALLOCATIONS_PATH);
+    if (!loadedPortfolio.exists || !loadedPortfolio.ok || !isValidPortfolioFileShape(loadedPortfolio.data)) {
+      issues.push({
+        code: "INVALID_PORTFOLIO_ALLOCATIONS",
+        layer: "child-upstream",
+        severity: "error",
+        file: `${bindingFile.upstreamPortfolio}/${PORTFOLIO_ALLOCATIONS_PATH}`,
+        message: `\u4E0A\u6E38\u9AD8\u9636\u62C6\u5206\u6E05\u5355 ${PORTFOLIO_ALLOCATIONS_PATH} \u65E0\u6CD5\u8BFB\u53D6\u6216\u683C\u5F0F\u65E0\u6548\u3002`,
+        remediation: [`\u68C0\u67E5\u4E0A\u6E38\u4ED3\u5E93 ${bindingFile.upstreamPortfolio} \u7684 ${PORTFOLIO_ALLOCATIONS_PATH} \u6587\u4EF6\u683C\u5F0F\u3002`]
+      });
+    } else {
+      upstreamReachable = true;
+      upstreamPortfolioFile = loadedPortfolio.data;
+    }
+  }
+  let matchedBindings = 0;
+  for (const binding of bindingFile.bindings) {
+    const localUid = typeof binding.localUid === "string" ? binding.localUid : "(unknown)";
+    const localPath = typeof binding.localPath === "string" ? binding.localPath : "";
+    const upstreamUid = typeof binding.upstreamUid === "string" ? binding.upstreamUid : "(unknown)";
+    const upstreamPath = typeof binding.upstreamPath === "string" ? binding.upstreamPath : "";
+    let actualLocalDigest;
+    const localCheck = await readSafeFileDigest(rootReal, localPath);
+    if (!localCheck.ok) {
+      issues.push({
+        code: localCheck.missing ? "LOCAL_DESIGN_MISSING" : "UNSAFE_TARGET_PATH",
+        layer: "child-upstream",
+        severity: "error",
+        uid: localUid,
+        file: localPath || UPSTREAM_BINDINGS_PATH,
+        message: `\u5B50\u9879\u76EE\u672C\u5730\u8BBE\u8BA1\u6587\u4EF6\u6821\u9A8C\u5931\u8D25\uFF08${localUid}\uFF09\uFF1A${localCheck.reason}`,
+        remediation: [`\u786E\u8BA4\u672C\u5730\u6587\u4EF6 ${localPath} \u5B58\u5728\u4E14\u975E\u7B26\u53F7\u94FE\u63A5\uFF0C\u968F\u540E\u8FD0\u884C \`artifact-graph alignment-lock\`\u3002`]
+      });
+    } else {
+      actualLocalDigest = localCheck.digest;
+      if (!SHA256_DIGEST_RE.test(binding.localDigest ?? "") || binding.localDigest !== actualLocalDigest) {
+        issues.push({
+          code: "LOCAL_DESIGN_UNSYNCED",
+          layer: "child-upstream",
+          severity: "error",
+          uid: localUid,
+          file: localCheck.relNormalized,
+          expectedDigest: binding.localDigest,
+          actualDigest: actualLocalDigest,
+          message: `\u672C\u5730\u8BBE\u8BA1\u5236\u54C1 ${localCheck.relNormalized}\uFF08${localUid}\uFF09\u5185\u5BB9\u5DF2\u6539\u52A8\uFF0C\u4E0E upstream-bindings.json \u4E2D\u7684 localDigest \u4E0D\u4E00\u81F4\u3002`,
+          remediation: [
+            `\u786E\u8BA4\u672C\u5730\u6539\u52A8\u662F\u5426\u5F71\u54CD\u4E0A\u6E38\u89C4\u5212 ${upstreamUid}\uFF1B\u5FC5\u8981\u65F6\u5148\u4E0E\u9AD8\u9636\u8BBE\u8BA1\u5BF9\u9F50\u3002`,
+            "\u786E\u8BA4\u540E\u8FD0\u884C `artifact-graph alignment-lock` \u66F4\u65B0\u672C\u5730\u4E0E\u4E0A\u6E38\u53CC\u65B9\u6458\u8981\u3002"
+          ]
+        });
+      }
+    }
+    if (upstreamReachable && upstreamRootReal && upstreamPortfolioFile) {
+      const upstreamFileCheck = await readSafeFileDigest(upstreamRootReal, upstreamPath);
+      let actualUpstreamDigest;
+      if (!upstreamFileCheck.ok) {
+        issues.push({
+          code: upstreamFileCheck.missing ? "UPSTREAM_DESIGN_MISSING" : "UNSAFE_TARGET_PATH",
+          layer: "child-upstream",
+          severity: "error",
+          uid: localUid,
+          targetUid: upstreamUid,
+          file: upstreamPath || UPSTREAM_BINDINGS_PATH,
+          message: `\u4E0A\u6E38\u9AD8\u9636\u8BBE\u8BA1\u6587\u4EF6\u6821\u9A8C\u5931\u8D25\uFF08${upstreamUid}\uFF09\uFF1A${upstreamFileCheck.reason}`,
+          remediation: [`\u68C0\u67E5\u4E0A\u6E38\u4ED3\u5E93 ${bindingFile.upstreamPortfolio}/${upstreamPath} \u662F\u5426\u88AB\u5220\u9664\u6216\u91CD\u547D\u540D\u3002`]
+        });
+      } else {
+        actualUpstreamDigest = upstreamFileCheck.digest;
+        if (!SHA256_DIGEST_RE.test(binding.upstreamDigest ?? "") || binding.upstreamDigest !== actualUpstreamDigest) {
+          issues.push({
+            code: "UPSTREAM_DESIGN_CHANGED",
+            layer: "child-upstream",
+            severity: "error",
+            uid: localUid,
+            targetUid: upstreamUid,
+            file: localPath,
+            expectedDigest: binding.upstreamDigest,
+            actualDigest: actualUpstreamDigest,
+            message: `\u4E0A\u6E38\u9AD8\u9636\u9700\u6C42 ${upstreamUid}\uFF08${upstreamFileCheck.relNormalized}\uFF09\u5DF2\u4FEE\u8BA2\uFF0C\u5F53\u524D\u5B50\u9879\u76EE\u8BE6\u8BBE ${localUid} \u5C1A\u672A\u540C\u6B65\u66F4\u65B0\u6458\u8981\u3002`,
+            remediation: [
+              `\u8BFB\u53D6\u4E0A\u6E38 ${bindingFile.upstreamPortfolio}/${upstreamFileCheck.relNormalized} \u7684\u6700\u65B0\u6539\u52A8\u5E76\u540C\u6B65\u8C03\u6574\u672C\u5730 ${localPath}\u3002`,
+              "\u5B8C\u6210\u540E\u8FD0\u884C `artifact-graph alignment-lock` \u540C\u6B65\u9501\u5B9A\u53CC\u5411\u6458\u8981\u3002"
+            ]
+          });
+        }
+      }
+      const matchingItem = upstreamPortfolioFile.items.find((item) => item.sourceUid === upstreamUid && normalizeSlashPath(item.sourcePath ?? "") === normalizeSlashPath(upstreamPath));
+      let matchedAlloc;
+      if (matchingItem && matchingItem.disposition === "allocated" && Array.isArray(matchingItem.allocations)) {
+        for (const alloc of matchingItem.allocations) {
+          if (alloc.allocationStatus === "absorbed") {
+            continue;
+          }
+          if (alloc.targetUid === localUid && normalizeSlashPath(alloc.targetPath ?? "") === normalizeSlashPath(localPath)) {
+            const resolvedTarget = await resolveSafeRelatedRepo(upstreamRootReal, alloc.targetRepo);
+            if (resolvedTarget.ok && resolvedTarget.exists && resolvedTarget.repoRealPath === rootReal) {
+              matchedAlloc = alloc;
+              break;
+            }
+          }
+        }
+      }
+      if (!matchingItem || !matchedAlloc) {
+        issues.push({
+          code: "UNRECIPROCATED_ALLOCATION",
+          layer: "child-upstream",
+          severity: "error",
+          uid: localUid,
+          targetUid: upstreamUid,
+          file: UPSTREAM_BINDINGS_PATH,
+          message: `\u672A\u5EFA\u7ACB\u5BF9\u79F0\u4E92\u8BA4\uFF1A\u5B50\u9879\u76EE ${localUid} \u58F0\u660E\u56DE\u6307\u4E0A\u6E38 ${upstreamUid}\uFF0C\u4F46\u4E0A\u6E38 ${PORTFOLIO_ALLOCATIONS_PATH} \u672A\u627E\u5230\u5BF9\u5E94\u5206\u914D\u7ED9\u672C\u4ED3\u7684 active \u6761\u76EE\u3002`,
+          remediation: [
+            `\u5728\u4E0A\u6E38\u4ED3\u5E93 ${bindingFile.upstreamPortfolio}/${PORTFOLIO_ALLOCATIONS_PATH} \u4E3A ${upstreamUid} \u8865\u5145\u6307\u5411\u672C\u4ED3 ${localUid} \u7684 allocation \u8BB0\u5F55\u3002`,
+            "\u6216\u8005\u6E05\u7406\u672C\u4ED3\u591A\u4F59\u7684\u7ED1\u5B9A\u540E\u8FD0\u884C `artifact-graph alignment-lock`\u3002"
+          ]
+        });
+      } else {
+        matchedBindings += 1;
+        if (matchingItem.sourceDigest !== binding.upstreamDigest || actualUpstreamDigest && matchingItem.sourceDigest !== actualUpstreamDigest) {
+          issues.push({
+            code: "UPSTREAM_DESIGN_CHANGED",
+            layer: "child-upstream",
+            severity: "error",
+            uid: localUid,
+            targetUid: upstreamUid,
+            file: UPSTREAM_BINDINGS_PATH,
+            expectedDigest: binding.upstreamDigest,
+            actualDigest: actualUpstreamDigest ?? matchingItem.sourceDigest,
+            message: `\u4E0A\u6E38 ${upstreamUid} \u7684 sourceDigest \u4E0E\u672C\u4ED3\u8BB0\u5F55\u7684 upstreamDigest \u6216\u5F53\u524D\u6587\u4EF6\u5185\u5BB9\u4E0D\u4E00\u81F4\u3002`,
+            remediation: ["\u5BA1\u9605\u4E0A\u6E38\u9AD8\u9636\u8BBE\u8BA1\u53D8\u66F4\uFF0C\u540C\u6B65\u5B50\u9879\u76EE\u8BE6\u8BBE\u540E\u8FD0\u884C `artifact-graph alignment-lock`\u3002"]
+          });
+        }
+        if (matchedAlloc.targetDigest !== binding.localDigest || actualLocalDigest && matchedAlloc.targetDigest !== actualLocalDigest) {
+          issues.push({
+            code: "DOWNSTREAM_DESIGN_EVOLVED",
+            layer: "child-upstream",
+            severity: "error",
+            uid: localUid,
+            targetUid: upstreamUid,
+            file: localPath,
+            expectedDigest: matchedAlloc.targetDigest,
+            actualDigest: actualLocalDigest ?? binding.localDigest,
+            message: `\u5F53\u524D\u5B50\u9879\u76EE\u8BE6\u8BBE ${localUid}\uFF08${localPath}\uFF09\u5DF2\u6F14\u8FDB\uFF0C\u4E0A\u6E38\u5206\u914D\u6E05\u5355\u8BB0\u5F55\u7684 targetDigest \u5C1A\u672A\u540C\u6B65\u6821\u51C6\u3002`,
+            remediation: [
+              `\u901A\u77E5\u4E0A\u6E38\u89C4\u5212\u4ED3\u5BA1\u9605\u672C\u4ED3 ${localPath} \u7684\u6F14\u8FDB\uFF0C\u786E\u8BA4\u65E0\u8303\u56F4\u504F\u5DEE\u540E\u8FD0\u884C \`artifact-graph alignment-lock\` \u5237\u65B0\u53CC\u8FB9\u6458\u8981\u3002`
+            ]
+          });
+        }
+      }
+    }
+  }
+  return {
+    childSummary: {
+      filePath: UPSTREAM_BINDINGS_PATH,
+      upstreamPortfolio: bindingFile.upstreamPortfolio,
+      ...upstreamRootReal ? { resolvedPortfolioRoot: upstreamRootReal } : {},
+      upstreamReachable,
+      totalBindings: bindingFile.bindings.length,
+      matchedBindings
+    },
+    issues
+  };
+}
+async function auditBidirectionalAlignment(root, opts = {}) {
+  const rootReal = await realpath3(resolve10(root));
+  const strict = opts.strict === true;
+  const hasConfig = existsSync3(join13(rootReal, "artifact-graph.config.yaml"));
+  const hasPortfolio = existsSync3(join13(rootReal, PORTFOLIO_ALLOCATIONS_PATH));
+  const hasChildBindings = existsSync3(join13(rootReal, UPSTREAM_BINDINGS_PATH));
+  if (!hasConfig && !hasPortfolio && !hasChildBindings) {
+    throw new Error(`\u672A\u5728 ${rootReal} \u627E\u5230 artifact-graph.config.yaml\u3001${PORTFOLIO_ALLOCATIONS_PATH} \u6216 ${UPSTREAM_BINDINGS_PATH}\uFF0C\u65E0\u6CD5\u6267\u884C\u53CC\u5411\u5BF9\u9F50\u68C0\u67E5\u3002`);
+  }
+  const intraCache = /* @__PURE__ */ new Map();
+  const intraState = hasConfig ? await auditIntraRepo(rootReal, strict) : {
+    checked: false,
+    graphErrorCount: 0,
+    totalLocks: 0,
+    freshLocks: 0,
+    implementsLocksCount: 0,
+    verifiesLocksCount: 0,
+    hasFreshImplementsLock: false,
+    hasFreshVerifiesLock: false,
+    implementationSurfaceChecked: false,
+    matchedEntries: [],
+    unclaimedEntries: [],
+    issues: []
+  };
+  if (hasConfig) {
+    intraCache.set(rootReal, intraState);
+  }
+  const allIssues = [...intraState.issues];
+  let portfolioResult;
+  let childResult;
+  if (hasPortfolio) {
+    const res = await auditPortfolioLayer(rootReal, strict, intraCache);
+    portfolioResult = res.portfolioSummary;
+    allIssues.push(...res.issues);
+  }
+  if (hasChildBindings) {
+    const res = await auditChildProjectLayer(rootReal, opts);
+    childResult = res.childSummary;
+    allIssues.push(...res.issues);
+  }
+  const errorCount = allIssues.filter((item) => item.severity === "error").length;
+  const warningCount = allIssues.filter((item) => item.severity === "warning").length;
+  return {
+    schemaVersion: "1.0",
+    root: rootReal,
+    ok: errorCount === 0,
+    strict,
+    modes: {
+      intraRepo: intraState.checked,
+      portfolio: hasPortfolio,
+      childProject: hasChildBindings
+    },
+    intraRepo: {
+      graphErrorCount: intraState.graphErrorCount,
+      totalLocks: intraState.totalLocks,
+      freshLocks: intraState.freshLocks,
+      implementsLocksCount: intraState.implementsLocksCount,
+      verifiesLocksCount: intraState.verifiesLocksCount,
+      implementationSurfaceChecked: intraState.implementationSurfaceChecked,
+      matchedEntries: intraState.matchedEntries,
+      unclaimedEntries: intraState.unclaimedEntries
+    },
+    ...portfolioResult ? { portfolio: portfolioResult } : {},
+    ...childResult ? { childProject: childResult } : {},
+    issues: allIssues,
+    summary: {
+      totalIssues: allIssues.length,
+      errorCount,
+      warningCount
+    }
+  };
+}
+async function writeJsonIfChanged(fullPath, data) {
+  const nextRaw = `${JSON.stringify(data, null, 2)}
+`;
+  let prevRaw = "";
+  try {
+    prevRaw = await readFile6(fullPath, "utf-8");
+  } catch {
+    prevRaw = "";
+  }
+  if (prevRaw === nextRaw) {
+    return false;
+  }
+  await writeFile3(fullPath, nextRaw, "utf-8");
+  return true;
+}
+async function refreshBidirectionalAlignmentLocks(root, opts = {}) {
+  const rootReal = await realpath3(resolve10(root));
+  const hasPortfolio = existsSync3(join13(rootReal, PORTFOLIO_ALLOCATIONS_PATH));
+  const hasChildBindings = existsSync3(join13(rootReal, UPSTREAM_BINDINGS_PATH));
+  if (!hasPortfolio && !hasChildBindings) {
+    throw new Error(`\u672A\u5728 ${rootReal} \u627E\u5230 ${PORTFOLIO_ALLOCATIONS_PATH} \u6216 ${UPSTREAM_BINDINGS_PATH}\uFF0C\u65E0\u9700\u6216\u65E0\u6CD5\u6267\u884C\u53CC\u5411\u7ED1\u5B9A\u5237\u65B0\u3002`);
+  }
+  const updatedFiles = /* @__PURE__ */ new Set();
+  const issues = [];
+  const skipped = [];
+  let refreshedAllocations = 0;
+  let refreshedBindings = 0;
+  if (hasPortfolio) {
+    const loadedPortfolio = await readJsonSafe(rootReal, PORTFOLIO_ALLOCATIONS_PATH);
+    if (!loadedPortfolio.exists || !loadedPortfolio.ok || !isValidPortfolioFileShape(loadedPortfolio.data)) {
+      issues.push({
+        code: "INVALID_PORTFOLIO_ALLOCATIONS",
+        layer: "portfolio",
+        severity: "error",
+        file: PORTFOLIO_ALLOCATIONS_PATH,
+        message: `${PORTFOLIO_ALLOCATIONS_PATH} \u65E0\u6CD5\u89E3\u6790\u6216\u7ED3\u6784\u65E0\u6548\uFF0C\u65E0\u6CD5\u5237\u65B0\u9501\u3002`,
+        remediation: [`\u5148\u4FEE\u590D ${PORTFOLIO_ALLOCATIONS_PATH} \u7684 JSON \u8BED\u6CD5\u4E0E\u5FC5\u586B\u7ED3\u6784\u3002`]
+      });
+    } else {
+      const portfolioDoc = loadedPortfolio.data;
+      const dirtyDownstreamBindings = /* @__PURE__ */ new Map();
+      for (const item of portfolioDoc.items) {
+        const sourceCheck = await readSafeFileDigest(rootReal, item.sourcePath);
+        if (!sourceCheck.ok) {
+          skipped.push({ scope: "portfolio", uid: item.sourceUid, reason: sourceCheck.reason });
+          issues.push({
+            code: sourceCheck.missing ? "PORTFOLIO_SOURCE_MISSING" : "UNSAFE_TARGET_PATH",
+            layer: "portfolio",
+            severity: "error",
+            uid: item.sourceUid,
+            file: item.sourcePath,
+            message: `\u65E0\u6CD5\u5237\u65B0\u9AD8\u9636\u6761\u76EE ${item.sourceUid}\uFF1A${sourceCheck.reason}`,
+            remediation: [`\u6838\u67E5 ${item.sourcePath} \u662F\u5426\u5B58\u5728\u4E14\u5408\u6CD5\u540E\u91CD\u8BD5\u3002`]
+          });
+          continue;
+        }
+        const nextSourceDigest = sourceCheck.digest;
+        const allocations = Array.isArray(item.allocations) ? item.allocations : [];
+        if (allocations.length === 0) {
+          item.sourceDigest = nextSourceDigest;
+          continue;
+        }
+        let anySymmetricVerified = false;
+        for (const alloc of allocations) {
+          if (alloc.allocationStatus === "absorbed") {
+            continue;
+          }
+          const repoCheck = await resolveSafeRelatedRepo(rootReal, alloc.targetRepo);
+          if (!repoCheck.ok || !repoCheck.exists) {
+            const reason = !repoCheck.ok ? repoCheck.reason : `\u4E0B\u6E38\u4ED3\u5E93\u4E0D\u5B58\u5728\uFF1A${alloc.targetRepo}`;
+            skipped.push({ scope: "portfolio", uid: `${item.sourceUid}->${alloc.targetUid}`, reason });
+            issues.push({
+              code: !repoCheck.ok ? "UNSAFE_TARGET_PATH" : "TARGET_REPO_UNREACHABLE",
+              layer: "portfolio",
+              severity: "error",
+              uid: item.sourceUid,
+              targetRepo: alloc.targetRepo,
+              targetUid: alloc.targetUid,
+              message: `\u8DF3\u8FC7\u5237\u65B0 ${item.sourceUid} -> ${alloc.targetRepo}#${alloc.targetUid}\uFF1A${reason}`,
+              remediation: [`\u786E\u8BA4\u4E0B\u6E38\u4ED3\u5E93 ${alloc.targetRepo} \u8DEF\u5F84\u5B89\u5168\u53EF\u8FBE\u3002`]
+            });
+            continue;
+          }
+          const downstreamRoot = repoCheck.repoRealPath;
+          const targetCheck = await readSafeFileDigest(downstreamRoot, alloc.targetPath);
+          if (!targetCheck.ok) {
+            skipped.push({ scope: "portfolio", uid: `${item.sourceUid}->${alloc.targetUid}`, reason: targetCheck.reason });
+            issues.push({
+              code: targetCheck.missing ? "DOWNSTREAM_TARGET_MISSING" : "UNSAFE_TARGET_PATH",
+              layer: "portfolio",
+              severity: "error",
+              uid: item.sourceUid,
+              targetRepo: alloc.targetRepo,
+              targetUid: alloc.targetUid,
+              file: alloc.targetPath,
+              message: `\u4E0B\u6E38\u76EE\u6807\u6587\u4EF6\u4E0D\u53EF\u7528\uFF0C\u65E0\u6CD5\u5237\u65B0\uFF08${alloc.targetRepo}/${alloc.targetPath}\uFF09\uFF1A${targetCheck.reason}`,
+              remediation: [`\u5728\u4E0B\u6E38\u4ED3\u5E93\u786E\u8BA4 ${alloc.targetPath} \u5B58\u5728\u4E14\u5408\u6CD5\u3002`]
+            });
+            continue;
+          }
+          if (alloc.readonlyTarget === true) {
+            alloc.targetDigest = targetCheck.digest;
+            anySymmetricVerified = true;
+            refreshedAllocations += 1;
+            continue;
+          }
+          let downstreamBundle = dirtyDownstreamBindings.get(downstreamRoot);
+          if (!downstreamBundle) {
+            const loadedBindings = await readJsonSafe(downstreamRoot, UPSTREAM_BINDINGS_PATH);
+            if (!loadedBindings.exists || !loadedBindings.ok || !isValidUpstreamBindingsShape(loadedBindings.data)) {
+              const reason = !loadedBindings.exists ? `\u4E0B\u6E38\u7F3A\u5C11 ${UPSTREAM_BINDINGS_PATH}` : !loadedBindings.ok ? loadedBindings.error : `${UPSTREAM_BINDINGS_PATH} \u7ED3\u6784\u65E0\u6548`;
+              skipped.push({ scope: "portfolio", uid: `${item.sourceUid}->${alloc.targetUid}`, reason });
+              issues.push({
+                code: "UNRECIPROCATED_ALLOCATION",
+                layer: "portfolio",
+                severity: "error",
+                uid: item.sourceUid,
+                targetRepo: alloc.targetRepo,
+                targetUid: alloc.targetUid,
+                file: `${alloc.targetRepo}/${UPSTREAM_BINDINGS_PATH}`,
+                message: `\u4EC5\u5355\u8FB9\u5B58\u5728\u5206\u914D\u58F0\u660E\uFF0C\u7981\u6B62\u4F2A\u9020\u56DE\u6307\uFF1A${reason}\u3002`,
+                remediation: [`\u5148\u5728 ${alloc.targetRepo}/${UPSTREAM_BINDINGS_PATH} \u4E2D\u58F0\u660E\u5BF9\u79F0\u56DE\u6307\u6761\u76EE\uFF0C\u518D\u8FD0\u884C \`artifact-graph alignment-lock\`\u3002`]
+              });
+              continue;
+            }
+            downstreamBundle = { fullRealPath: loadedBindings.fullRealPath, doc: loadedBindings.data };
+            dirtyDownstreamBindings.set(downstreamRoot, downstreamBundle);
+          }
+          const backRef = await resolveSafeRelatedRepo(downstreamRoot, downstreamBundle.doc.upstreamPortfolio);
+          const matchedBinding = backRef.ok && backRef.exists && backRef.repoRealPath === rootReal ? downstreamBundle.doc.bindings.find((b) => b.localUid === alloc.targetUid && normalizeSlashPath(b.localPath ?? "") === targetCheck.relNormalized && b.upstreamUid === item.sourceUid && normalizeSlashPath(b.upstreamPath ?? "") === sourceCheck.relNormalized) : void 0;
+          if (!matchedBinding) {
+            skipped.push({
+              scope: "portfolio",
+              uid: `${item.sourceUid}->${alloc.targetUid}`,
+              reason: "\u4E0B\u6E38 upstream-bindings.json \u4E2D\u5C1A\u672A\u58F0\u660E\u5BF9\u79F0\u56DE\u6307\u7ED1\u5B9A"
+            });
+            issues.push({
+              code: "UNRECIPROCATED_ALLOCATION",
+              layer: "portfolio",
+              severity: "error",
+              uid: item.sourceUid,
+              targetRepo: alloc.targetRepo,
+              targetUid: alloc.targetUid,
+              file: `${alloc.targetRepo}/${UPSTREAM_BINDINGS_PATH}`,
+              message: `\u62D2\u7EDD\u5355\u8FB9\u5237\u9501\uFF1A\u4E0B\u6E38 ${alloc.targetRepo}/${UPSTREAM_BINDINGS_PATH} \u7F3A\u5C11\u4E0E ${item.sourceUid} <-> ${alloc.targetUid} \u5BF9\u79F0\u7684\u7ED1\u5B9A\u58F0\u660E\u3002`,
+              remediation: [`\u5148\u5728 ${alloc.targetRepo}/${UPSTREAM_BINDINGS_PATH} \u8865\u9F50\u5BF9\u79F0\u7ED1\u5B9A\u540E\u518D\u6267\u884C\u9501\u5237\u65B0\u3002`]
+            });
+            continue;
+          }
+          alloc.targetDigest = targetCheck.digest;
+          matchedBinding.localDigest = targetCheck.digest;
+          matchedBinding.upstreamDigest = nextSourceDigest;
+          anySymmetricVerified = true;
+          refreshedAllocations += 1;
+          refreshedBindings += 1;
+        }
+        if (anySymmetricVerified) {
+          item.sourceDigest = nextSourceDigest;
+        }
+      }
+      if (await writeJsonIfChanged(loadedPortfolio.fullRealPath, portfolioDoc)) {
+        updatedFiles.add(PORTFOLIO_ALLOCATIONS_PATH);
+      }
+      for (const [downstreamRoot, bundle] of dirtyDownstreamBindings.entries()) {
+        if (await writeJsonIfChanged(bundle.fullRealPath, bundle.doc)) {
+          updatedFiles.add(join13(relative6(rootReal, downstreamRoot) || ".", UPSTREAM_BINDINGS_PATH).split(sep2).join("/"));
+        }
+      }
+    }
+  }
+  if (hasChildBindings) {
+    const loadedBindings = await readJsonSafe(rootReal, UPSTREAM_BINDINGS_PATH);
+    if (!loadedBindings.exists || !loadedBindings.ok || !isValidUpstreamBindingsShape(loadedBindings.data)) {
+      issues.push({
+        code: "INVALID_UPSTREAM_BINDINGS",
+        layer: "child-upstream",
+        severity: "error",
+        file: UPSTREAM_BINDINGS_PATH,
+        message: `${UPSTREAM_BINDINGS_PATH} \u65E0\u6CD5\u89E3\u6790\u6216\u7ED3\u6784\u65E0\u6548\uFF0C\u65E0\u6CD5\u5237\u65B0\u9501\u3002`,
+        remediation: [`\u4FEE\u590D ${UPSTREAM_BINDINGS_PATH} \u7684 JSON \u683C\u5F0F\u540E\u91CD\u8BD5\u3002`]
+      });
+    } else {
+      const bindingsDoc = loadedBindings.data;
+      const upstreamCheck = opts.portfolioRoot ? await resolveExplicitPortfolioOverride(opts.portfolioRoot) : await resolveSafeRelatedRepo(rootReal, bindingsDoc.upstreamPortfolio);
+      if (!upstreamCheck.ok || !upstreamCheck.exists || !existsSync3(join13(upstreamCheck.repoRealPath, PORTFOLIO_ALLOCATIONS_PATH))) {
+        const reason = !upstreamCheck.ok ? upstreamCheck.reason : `\u4E0A\u6E38\u9AD8\u9636\u89C4\u5212\u4ED3\u4E0D\u53EF\u8FBE\uFF1A${bindingsDoc.upstreamPortfolio}`;
+        skipped.push({ scope: "child-upstream", uid: "*", reason });
+        issues.push({
+          code: !upstreamCheck.ok ? "UNSAFE_TARGET_PATH" : "UPSTREAM_PORTFOLIO_UNREACHABLE",
+          layer: "child-upstream",
+          severity: "error",
+          file: UPSTREAM_BINDINGS_PATH,
+          message: `\u65E0\u6CD5\u5237\u65B0\u8DE8\u4ED3\u53CC\u5411\u7ED1\u5B9A\uFF1A${reason}\u3002`,
+          remediation: ["\u786E\u4FDD\u672C\u673A\u5DE5\u4F5C\u533A\u5305\u542B\u4E0A\u6E38\u9AD8\u9636\u89C4\u5212\u4ED3\uFF0C\u6216\u901A\u8FC7 --portfolio-root \u4F20\u5165\u6B63\u786E\u7684\u4E0A\u6E38\u4ED3\u5E93\u8DEF\u5F84\u3002"]
+        });
+      } else {
+        const upstreamRoot = upstreamCheck.repoRealPath;
+        const loadedPortfolio = await readJsonSafe(upstreamRoot, PORTFOLIO_ALLOCATIONS_PATH);
+        if (!loadedPortfolio.exists || !loadedPortfolio.ok || !isValidPortfolioFileShape(loadedPortfolio.data)) {
+          issues.push({
+            code: "INVALID_PORTFOLIO_ALLOCATIONS",
+            layer: "child-upstream",
+            severity: "error",
+            file: `${bindingsDoc.upstreamPortfolio}/${PORTFOLIO_ALLOCATIONS_PATH}`,
+            message: `\u4E0A\u6E38 ${PORTFOLIO_ALLOCATIONS_PATH} \u7ED3\u6784\u65E0\u6548\uFF0C\u65E0\u6CD5\u540C\u6B65\u5237\u65B0\u3002`,
+            remediation: ["\u5148\u4FEE\u590D\u4E0A\u6E38\u9AD8\u9636\u4ED3\u5E93\u4E2D\u7684 portfolio-allocations.json\u3002"]
+          });
+        } else {
+          const portfolioDoc = loadedPortfolio.data;
+          for (const binding of bindingsDoc.bindings) {
+            const localCheck = await readSafeFileDigest(rootReal, binding.localPath);
+            if (!localCheck.ok) {
+              skipped.push({ scope: "child-upstream", uid: binding.localUid, reason: localCheck.reason });
+              issues.push({
+                code: localCheck.missing ? "LOCAL_DESIGN_MISSING" : "UNSAFE_TARGET_PATH",
+                layer: "child-upstream",
+                severity: "error",
+                uid: binding.localUid,
+                file: binding.localPath,
+                message: `\u672C\u5730\u6587\u4EF6\u6821\u9A8C\u5931\u8D25\uFF08${binding.localUid}\uFF09\uFF1A${localCheck.reason}`,
+                remediation: [`\u786E\u8BA4\u672C\u5730\u6587\u4EF6 ${binding.localPath} \u5B58\u5728\u4E14\u5408\u6CD5\u3002`]
+              });
+              continue;
+            }
+            const upstreamFileCheck = await readSafeFileDigest(upstreamRoot, binding.upstreamPath);
+            if (!upstreamFileCheck.ok) {
+              skipped.push({ scope: "child-upstream", uid: binding.localUid, reason: upstreamFileCheck.reason });
+              issues.push({
+                code: upstreamFileCheck.missing ? "UPSTREAM_DESIGN_MISSING" : "UNSAFE_TARGET_PATH",
+                layer: "child-upstream",
+                severity: "error",
+                uid: binding.localUid,
+                targetUid: binding.upstreamUid,
+                file: binding.upstreamPath,
+                message: `\u4E0A\u6E38\u6587\u4EF6\u6821\u9A8C\u5931\u8D25\uFF08${binding.upstreamUid}\uFF09\uFF1A${upstreamFileCheck.reason}`,
+                remediation: [`\u786E\u8BA4\u4E0A\u6E38 ${binding.upstreamPath} \u5B58\u5728\u4E14\u5408\u6CD5\u3002`]
+              });
+              continue;
+            }
+            const matchingItem = portfolioDoc.items.find((item) => item.sourceUid === binding.upstreamUid && normalizeSlashPath(item.sourcePath ?? "") === upstreamFileCheck.relNormalized && item.disposition === "allocated");
+            let matchedAlloc;
+            if (matchingItem && Array.isArray(matchingItem.allocations)) {
+              for (const alloc of matchingItem.allocations) {
+                if (alloc.targetUid === binding.localUid && normalizeSlashPath(alloc.targetPath ?? "") === localCheck.relNormalized) {
+                  const targetCheck = await resolveSafeRelatedRepo(upstreamRoot, alloc.targetRepo);
+                  if (targetCheck.ok && targetCheck.exists && targetCheck.repoRealPath === rootReal) {
+                    matchedAlloc = alloc;
+                    break;
+                  }
+                }
+              }
+            }
+            if (!matchingItem || !matchedAlloc) {
+              skipped.push({ scope: "child-upstream", uid: binding.localUid, reason: "\u4E0A\u6E38\u672A\u5BF9\u79F0\u58F0\u660E\u5BF9\u5E94 allocation" });
+              issues.push({
+                code: "UNRECIPROCATED_ALLOCATION",
+                layer: "child-upstream",
+                severity: "error",
+                uid: binding.localUid,
+                targetUid: binding.upstreamUid,
+                file: UPSTREAM_BINDINGS_PATH,
+                message: `\u62D2\u7EDD\u5355\u8FB9\u5237\u9501\uFF1A\u4E0A\u6E38 ${PORTFOLIO_ALLOCATIONS_PATH} \u7F3A\u5C11\u4E0E ${binding.localUid} <-> ${binding.upstreamUid} \u5BF9\u79F0\u7684\u5206\u914D\u6761\u76EE\u3002`,
+                remediation: [`\u5148\u5728\u4E0A\u6E38 ${PORTFOLIO_ALLOCATIONS_PATH} \u4E2D\u5EFA\u7ACB\u5BF9\u5E94 allocation \u6761\u76EE\u540E\u518D\u6267\u884C\u5237\u9501\u3002`]
+              });
+              continue;
+            }
+            binding.localDigest = localCheck.digest;
+            binding.upstreamDigest = upstreamFileCheck.digest;
+            matchingItem.sourceDigest = upstreamFileCheck.digest;
+            matchedAlloc.targetDigest = localCheck.digest;
+            refreshedBindings += 1;
+            refreshedAllocations += 1;
+          }
+          if (await writeJsonIfChanged(loadedBindings.fullRealPath, bindingsDoc)) {
+            updatedFiles.add(UPSTREAM_BINDINGS_PATH);
+          }
+          if (await writeJsonIfChanged(loadedPortfolio.fullRealPath, portfolioDoc)) {
+            updatedFiles.add(join13(relative6(rootReal, upstreamRoot) || ".", PORTFOLIO_ALLOCATIONS_PATH).split(sep2).join("/"));
+          }
+        }
+      }
+    }
+  }
+  return {
+    schemaVersion: "1.0",
+    root: rootReal,
+    ok: issues.filter((item) => item.severity === "error").length === 0,
+    updatedFiles: [...updatedFiles].sort((a, b) => a.localeCompare(b)),
+    refreshedAllocations,
+    refreshedBindings,
+    skipped,
+    issues
+  };
+}
+function renderBidirectionalAlignmentAuditMarkdown(result) {
+  const lines = [
+    "# \u53CC\u5411\u4E00\u81F4\u6027\u5BF9\u9F50\u68C0\u67E5\u62A5\u544A\uFF08alignment-audit\uFF09",
+    "",
+    `- \u4ED3\u5E93\u6839\u76EE\u5F55\uFF1A\`${result.root}\``,
+    `- \u68C0\u67E5\u6A21\u5F0F\uFF1A${[
+      result.modes.intraRepo ? "\u5355\u4ED3\u8BE6\u8BBE\u2194\u4EE3\u7801\u6D4B\u8BD5" : null,
+      result.modes.portfolio ? "\u9AD8\u9636\u89C4\u5212\u2194\u62C6\u5206\u6D3E\u53D1" : null,
+      result.modes.childProject ? "\u5B50\u9879\u76EE\u8BE6\u8BBE\u2194\u4E0A\u6E38\u9AD8\u9636" : null
+    ].filter(Boolean).join("\u3001") || "\u65E0"}`,
+    `- \u4E25\u683C\u6A21\u5F0F\uFF1A${result.strict ? "\u5F00\u542F\uFF08--strict\uFF09" : "\u9ED8\u8BA4"}`,
+    `- \u603B\u4F53\u7ED3\u679C\uFF1A${result.ok ? "\u901A\u8FC7\uFF08\u65E0\u963B\u65AD\u6F02\u79FB\uFF09" : `\u672A\u901A\u8FC7\uFF08\u53D1\u73B0 ${result.summary.errorCount} \u4E2A\u963B\u65AD\u95EE\u9898\uFF0C${result.summary.warningCount} \u4E2A\u63D0\u793A\uFF09`}`,
+    ""
+  ];
+  if (result.modes.intraRepo) {
+    lines.push("## \u4E00\u3001\u5355\u4ED3\u8BE6\u8BBE\u4E0E\u4EE3\u7801/\u6D4B\u8BD5\u5BF9\u9F50");
+    lines.push("");
+    lines.push(`- \u56FE\u6821\u9A8C\u9519\u8BEF\uFF1A${result.intraRepo.graphErrorCount}`);
+    lines.push(`- \u8FFD\u6EAF\u7248\u672C\u9501\uFF1A\u5171 ${result.intraRepo.totalLocks} \u6761\uFF08\u65B0\u9C9C ${result.intraRepo.freshLocks} \u6761\uFF1Bimplements ${result.intraRepo.implementsLocksCount} \u6761\uFF0Cverifies ${result.intraRepo.verifiesLocksCount} \u6761\uFF09`);
+    if (result.intraRepo.implementationSurfaceChecked) {
+      lines.push(`- \u516C\u5F00\u5165\u53E3\u8BA4\u9886\uFF1A\u5171\u5339\u914D ${result.intraRepo.matchedEntries.length} \u4E2A\u5165\u53E3\u6587\u4EF6\uFF0C\u672A\u8BA4\u9886 ${result.intraRepo.unclaimedEntries.length} \u4E2A`);
+    }
+    lines.push("");
+  }
+  if (result.portfolio) {
+    const s = result.portfolio.satisfactionSummary;
+    const statusLabelMap = {
+      verified_satisfied: "\u5DF2\u9A8C\u8BC1\u6EE1\u8DB3",
+      traceability_locked: "\u8FFD\u6EAF\u53CC\u9501\u9F50\u5907",
+      allocated_in_progress: "\u5B9E\u65BD\u63A8\u8FDB\u4E2D",
+      partially_allocated: "\u90E8\u5206\u62C6\u5206",
+      not_applicable: "\u6309\u5904\u7F6E\u4E0D\u8BA1\u6EE1\u8DB3"
+    };
+    lines.push("## \u4E8C\u3001\u9AD8\u9636\u89C4\u5212\u4E0E\u4E0B\u6E38\u62C6\u5206\u6D3E\u53D1\u5BF9\u9F50");
+    lines.push("");
+    lines.push(`- \u9AD8\u9636\u6E05\u5355\uFF1A\`${result.portfolio.filePath}\`\uFF08\u5171 ${result.portfolio.totalItems} \u9879\uFF09`);
+    lines.push(
+      `- \u673A\u5668\u6D3E\u751F\u6EE1\u8DB3\u6982\u51B5\uFF1A\u5DF2\u9A8C\u8BC1\u6EE1\u8DB3 ${s.verified_satisfied} | \u8FFD\u6EAF\u53CC\u9501\u9F50\u5907 ${s.traceability_locked} | \u5B9E\u65BD\u63A8\u8FDB\u4E2D ${s.allocated_in_progress} | \u90E8\u5206\u62C6\u5206 ${s.partially_allocated} | \u6309\u5904\u7F6E\u4E0D\u8BA1\u6EE1\u8DB3 ${s.not_applicable}`
+    );
+    lines.push(
+      "- \u53E3\u5F84\u8BF4\u660E\uFF1A`\u8FFD\u6EAF\u53CC\u9501\u9F50\u5907` = \u4E0A\u4E0B\u6E38\u6458\u8981\u4E0E\u4EE3\u7801/\u6D4B\u8BD5\u9759\u6001\u53CC\u9501\u5DF2\u5BF9\u9F50\uFF0C\u5F85\u4E0B\u6E38\u751F\u6210\u901A\u8FC7\u7684 `sft-runs.json` \u6216 `testIntake` \u5B9E\u6D4B\u6536\u636E\u540E\u5347\u683C\u4E3A `\u5DF2\u9A8C\u8BC1\u6EE1\u8DB3`\u3002"
+    );
+    const nonVerifiedItems = result.portfolio.items.filter(
+      (item) => item.computedSatisfaction !== "verified_satisfied"
+    );
+    if (nonVerifiedItems.length > 0) {
+      lines.push("- \u672A\u8FBE `\u5DF2\u9A8C\u8BC1\u6EE1\u8DB3` \u6761\u76EE\u660E\u7EC6\uFF1A");
+      for (const item of nonVerifiedItems) {
+        const pendingReceiptRepos = Array.from(
+          new Set(
+            item.allocations.filter((alloc) => alloc.traceabilityLocked === true && alloc.allocationStatus !== "absorbed").map((alloc) => `${alloc.targetRepo}#${alloc.targetUid}`)
+          )
+        );
+        const pendingAlignRepos = Array.from(
+          new Set(
+            item.allocations.filter((alloc) => !alloc.satisfied && !alloc.traceabilityLocked && alloc.allocationStatus !== "absorbed").map((alloc) => `${alloc.targetRepo}#${alloc.targetUid}`)
+          )
+        );
+        const label = item.computedSatisfaction === "not_applicable" ? `${statusLabelMap[item.computedSatisfaction]}\uFF08disposition=${item.disposition}\uFF09` : statusLabelMap[item.computedSatisfaction];
+        const parts = [`\u72B6\u6001\uFF1A${label}\uFF08\`${item.computedSatisfaction}\`\uFF09`];
+        if (pendingReceiptRepos.length > 0) {
+          parts.push(`\u5F85\u8865\u5B9E\u6D4B\u6536\u636E\u4E0B\u6E38\uFF1A${pendingReceiptRepos.map((r) => `\`${r}\``).join("\u3001")}`);
+        }
+        if (pendingAlignRepos.length > 0) {
+          parts.push(`\u5F85\u5BF9\u9F50\u6216\u8865\u9759\u6001\u53CC\u9501\u4E0B\u6E38\uFF1A${pendingAlignRepos.map((r) => `\`${r}\``).join("\u3001")}`);
+        }
+        if (item.remainingScope.length > 0) {
+          parts.push(`\u5F85\u62C6\u5206\u8303\u56F4\uFF1A${item.remainingScope.length} \u9879`);
+        }
+        lines.push(`  - \`${item.sourceUid}\`\uFF1A${parts.join("\uFF1B")}`);
+      }
+    }
+    lines.push("");
+  }
+  if (result.childProject) {
+    lines.push("## \u4E09\u3001\u5B50\u9879\u76EE\u8BE6\u8BBE\u4E0E\u4E0A\u6E38\u9AD8\u9636\u4E92\u9501");
+    lines.push("");
+    lines.push(`- \u7ED1\u5B9A\u6E05\u5355\uFF1A\`${result.childProject.filePath}\`\uFF08\u4E0A\u6E38 \`${result.childProject.upstreamPortfolio}\`\uFF09`);
+    lines.push(`- \u4E0A\u6E38\u53EF\u8FBE\u6027\uFF1A${result.childProject.upstreamReachable ? "\u672C\u673A\u53EF\u8FBE\u5E76\u5DF2\u5B8C\u6574\u4E92\u6838" : "\u4E0D\u53EF\u8FBE\uFF08\u5DF2\u964D\u7EA7\u4E3A\u672C\u5730\u7ED3\u6784\u4E0E\u6458\u8981\u68C0\u67E5\uFF09"}`);
+    lines.push(`- \u7ED1\u5B9A\u6761\u76EE\uFF1A\u5171 ${result.childProject.totalBindings} \u6761\uFF08\u5DF2\u4E92\u8BA4 ${result.childProject.matchedBindings} \u6761\uFF09`);
+    lines.push("");
+  }
+  if (result.issues.length > 0) {
+    lines.push("## \u95EE\u9898\u660E\u7EC6\u4E0E\u4FEE\u590D\u5EFA\u8BAE");
+    lines.push("");
+    result.issues.forEach((issue2, index) => {
+      const badge = issue2.severity === "error" ? "\u963B\u65AD" : issue2.severity === "warning" ? "\u63D0\u793A" : "\u4FE1\u606F";
+      lines.push(`### ${index + 1}. [${badge}] \`${issue2.code}\``);
+      lines.push("");
+      lines.push(`- \u5C42\u7EA7\uFF1A${issue2.layer}`);
+      if (issue2.uid) lines.push(`- \u5BF9\u8C61\uFF1A\`${issue2.uid}\``);
+      if (issue2.file) lines.push(`- \u4F4D\u7F6E\uFF1A\`${issue2.file}\``);
+      lines.push(`- \u8BF4\u660E\uFF1A${issue2.message}`);
+      if (issue2.remediation.length > 0) {
+        lines.push("- \u5904\u7406\u6B65\u9AA4\uFF1A");
+        issue2.remediation.forEach((step, idx) => {
+          lines.push(`  ${idx + 1}. ${step}`);
+        });
+      }
+      lines.push("");
+    });
+  } else {
+    lines.push("\u672A\u53D1\u73B0\u53CC\u5411\u6F02\u79FB\u3001\u672A\u8BA4\u9886\u5B9E\u73B0\u5165\u53E3\u6216\u6F0F\u62C6\u8BC9\u6C42\u3002");
+    lines.push("");
+  }
+  return `${lines.join("\n")}
+`;
+}
+function renderBidirectionalAlignmentLockMarkdown(result) {
+  const lines = [
+    "# \u53CC\u5411\u7ED1\u5B9A\u6458\u8981\u5237\u65B0\u7ED3\u679C\uFF08alignment-lock\uFF09",
+    "",
+    `- \u4ED3\u5E93\u6839\u76EE\u5F55\uFF1A\`${result.root}\``,
+    `- \u6267\u884C\u7ED3\u679C\uFF1A${result.ok ? "\u5B8C\u6210\uFF08\u53CC\u5411\u7ED1\u5B9A\u6458\u8981\u5DF2\u5BF9\u9F50\uFF09" : `\u5B58\u5728 ${result.issues.filter((i) => i.severity === "error").length} \u9879\u672A\u5B8C\u6210\u6761\u4EF6`}`,
+    `- \u5DF2\u5237\u65B0\u6761\u76EE\uFF1A\u4E0A\u6E38\u5206\u914D ${result.refreshedAllocations} \u6761\uFF0C\u4E0B\u6E38\u7ED1\u5B9A ${result.refreshedBindings} \u6761`,
+    `- \u53D1\u751F\u5199\u5165\u7684\u6587\u4EF6\uFF1A${result.updatedFiles.length > 0 ? result.updatedFiles.map((f) => `\`${f}\``).join("\u3001") : "\u65E0\u53D8\u66F4"}`,
+    ""
+  ];
+  if (result.issues.length > 0) {
+    lines.push("## \u672A\u5237\u65B0\u6216\u963B\u65AD\u8BF4\u660E");
+    lines.push("");
+    for (const issue2 of result.issues) {
+      lines.push(`- [\`${issue2.code}\`] ${issue2.message}`);
+      for (const step of issue2.remediation) {
+        lines.push(`  - \u5EFA\u8BAE\uFF1A${step}`);
+      }
+    }
+    lines.push("");
+  }
+  return `${lines.join("\n")}
+`;
+}
+var PORTFOLIO_ALLOCATIONS_PATH, UPSTREAM_BINDINGS_PATH, SHA256_DIGEST_RE, VALID_DISPOSITIONS, HISTORICAL_REQUIREMENT_STATUSES, SKIPPED_WALK_DIRS2, FORBIDDEN_PATH_SEGMENTS, MAX_REPO_PARENT_HOPS, NON_REFINEMENT_EDGE_KINDS, FAIL_OR_PENDING_RECEIPT_STATUSES, PASSING_EXECUTION_DISPOSITIONS, ALLOWED_SFT_OVERALL_STATUSES;
+var init_bidirectional_alignment = __esm({
+  "src/bidirectional-alignment.ts"() {
+    "use strict";
+    init_index();
+    init_file_walker();
+    init_glob_matcher();
+    init_versioned_traceability();
+    PORTFOLIO_ALLOCATIONS_PATH = "artifacts/portfolio-allocations.json";
+    UPSTREAM_BINDINGS_PATH = "artifacts/upstream-bindings.json";
+    SHA256_DIGEST_RE = /^sha256:[a-f0-9]{64}$/;
+    VALID_DISPOSITIONS = /* @__PURE__ */ new Set(["allocated", "deferred", "merged", "abandoned"]);
+    HISTORICAL_REQUIREMENT_STATUSES = /* @__PURE__ */ new Set([
+      "deprecated",
+      "done",
+      "superseded",
+      "archived",
+      "abandoned",
+      "rejected"
+    ]);
+    SKIPPED_WALK_DIRS2 = SKIPPED_WALK_DIRS;
+    FORBIDDEN_PATH_SEGMENTS = /* @__PURE__ */ new Set([".git", ".ssh", ".gnupg", ".aws", ".env", ".npmrc"]);
+    MAX_REPO_PARENT_HOPS = 3;
+    NON_REFINEMENT_EDGE_KINDS = /* @__PURE__ */ new Set(["derives-from", "supersedes", "partial-supersedes"]);
+    FAIL_OR_PENDING_RECEIPT_STATUSES = /* @__PURE__ */ new Set([
+      "failed",
+      "fail",
+      "error",
+      "pending",
+      "rejected",
+      "blocked",
+      "incomplete",
+      "cancelled"
+    ]);
+    PASSING_EXECUTION_DISPOSITIONS = /* @__PURE__ */ new Set(["executed", "reused", "not-applicable"]);
+    ALLOWED_SFT_OVERALL_STATUSES = /* @__PURE__ */ new Set(["all_required_passed", "passed_with_explicit_skips"]);
   }
 });
 
@@ -7609,6 +10700,7 @@ __export(index_exports, {
   ContractCatalog: () => ContractCatalog,
   ContractError: () => ContractError,
   ContractRegistry: () => ContractRegistry,
+  DEFAULT_INBOX_RELATIVE_PATH: () => DEFAULT_INBOX_RELATIVE_PATH,
   DEFAULT_MAX_CHARS: () => DEFAULT_MAX_CHARS,
   DEFAULT_SCHEMA: () => DEFAULT_SCHEMA,
   E2E_NORMALIZER_CONFIG: () => E2E_NORMALIZER_CONFIG,
@@ -7618,6 +10710,7 @@ __export(index_exports, {
   GRAPH_PROVIDER_ENTRY: () => GRAPH_PROVIDER_ENTRY,
   GRAPH_PROVIDER_ID: () => GRAPH_PROVIDER_ID,
   MIN_PROMPT_CHARS: () => MIN_PROMPT_CHARS,
+  PORTFOLIO_ALLOCATIONS_PATH: () => PORTFOLIO_ALLOCATIONS_PATH,
   PROFESSIONAL_CONCLUSION_OBJECT: () => PROFESSIONAL_CONCLUSION_OBJECT,
   RESTRUCTURE_MAX_OPERATIONS: () => RESTRUCTURE_MAX_OPERATIONS,
   RESTRUCTURE_MAX_TOTAL_BYTES: () => RESTRUCTURE_MAX_TOTAL_BYTES,
@@ -7629,15 +10722,19 @@ __export(index_exports, {
   RESTRUCTURE_RECOVERY_REL_PATH: () => RESTRUCTURE_RECOVERY_REL_PATH,
   RESTRUCTURE_RECOVERY_ROOT_MODE: () => RESTRUCTURE_RECOVERY_ROOT_MODE,
   RESTRUCTURE_VALIDATION_TIMEOUT_MS: () => RESTRUCTURE_VALIDATION_TIMEOUT_MS,
+  SPECIALIZED_PARSER_TYPES: () => SPECIALIZED_PARSER_TYPES,
   TARGET_ARTIFACT_TYPES: () => TARGET_ARTIFACT_TYPES,
+  UPSTREAM_BINDINGS_PATH: () => UPSTREAM_BINDINGS_PATH,
   VALID_PACKET_TARGET_TYPES: () => VALID_PACKET_TARGET_TYPES,
   VERSION_INDEX_SCHEMA_VERSION: () => VERSION_INDEX_SCHEMA_VERSION,
   VERSION_LOCK_PATH: () => VERSION_LOCK_PATH,
   VERSION_LOCK_SCHEMA_VERSION: () => VERSION_LOCK_SCHEMA_VERSION,
+  addInboxIdea: () => addInboxIdea,
   applyPreparedManagedHookBlocks: () => applyPreparedManagedHookBlocks,
   applyRestructure: () => applyRestructure,
   applyRestructureFileSet: () => applyRestructureFileSet,
   assemblePacket: () => assemblePacket,
+  auditBidirectionalAlignment: () => auditBidirectionalAlignment,
   auditPackets: () => auditPackets,
   auditVersionLock: () => auditVersionLock,
   bootstrapVersionLock: () => bootstrapVersionLock,
@@ -7656,12 +10753,13 @@ __export(index_exports, {
   diagnoseConfigDocument: () => diagnoseConfigDocument,
   diagnoseProjectConfig: () => diagnoseProjectConfig,
   digestRestructureValue: () => digestRestructureValue,
-  dirname: () => dirname7,
+  dirname: () => dirname9,
   discoverAndAuditPackets: () => discoverAndAuditPackets,
   discoverTargets: () => discoverTargets,
   doctorArtifactChain: () => doctorArtifactChain,
   ensureRestructureMechanismRoot: () => ensureRestructureMechanismRoot,
   extname: () => extname,
+  extractInformativeTerms: () => extractInformativeTerms,
   filterGraphByView: () => filterGraphByView,
   formatContextMarkdown: () => formatContextMarkdown,
   gateRestructureOperationPlan: () => gateRestructureOperationPlan,
@@ -7677,6 +10775,7 @@ __export(index_exports, {
   isPacketTargetTypeDynamic: () => isPacketTargetTypeDynamic,
   isTargetArtifactType: () => isTargetArtifactType,
   isVersionLockIssueBlocking: () => isVersionLockIssueBlocking,
+  listInboxIdeas: () => listInboxIdeas,
   loadConfig: () => loadConfig,
   loadContract: () => loadContract,
   loadContractCatalog: () => loadContractCatalog,
@@ -7684,11 +10783,14 @@ __export(index_exports, {
   loadFoundationModule: () => loadFoundationModule,
   locateSoftwareRecord: () => locateSoftwareRecord,
   markdownRecordHeadings: () => markdownRecordHeadings,
+  matchInboxIdea: () => matchInboxIdea,
   matchesConfiguredArtifactPath: () => matchesConfiguredArtifactPath,
   nextId: () => nextId,
   normalizeE2eLegacyArtifact: () => normalizeE2eLegacyArtifact,
+  normalizeSha256Digest: () => normalizeSha256Digest,
   normalizeToCanonical: () => normalizeToCanonical,
   observeRestructureJournal: () => observeRestructureJournal,
+  parseSafeFrontmatter: () => parseSafeFrontmatter,
   parseTargetSelector: () => parseTargetSelector,
   parseTargetsFile: () => parseTargetsFile,
   planRestructure: () => planRestructure,
@@ -7699,12 +10801,19 @@ __export(index_exports, {
   pruneRestructureRecovery: () => pruneRestructureRecovery,
   qualifyRestructureMechanism: () => qualifyRestructureMechanism,
   queryGraph: () => queryGraph,
+  readInboxIdeasFile: () => readInboxIdeasFile,
   recoverRestructure: () => recoverRestructure,
   recoverRestructureFileSet: () => recoverRestructureFileSet,
+  refreshBidirectionalAlignmentLocks: () => refreshBidirectionalAlignmentLocks,
   refreshVersionLock: () => refreshVersionLock,
+  renderBidirectionalAlignmentAuditMarkdown: () => renderBidirectionalAlignmentAuditMarkdown,
+  renderBidirectionalAlignmentLockMarkdown: () => renderBidirectionalAlignmentLockMarkdown,
   renderCoverageBoundaryMarkdown: () => renderCoverageBoundaryMarkdown,
   renderDoctorMarkdown: () => renderDoctorMarkdown,
   renderImpactMarkdown: () => renderImpactMarkdown,
+  renderInboxAddMarkdown: () => renderInboxAddMarkdown,
+  renderInboxListMarkdown: () => renderInboxListMarkdown,
+  renderInboxMatchMarkdown: () => renderInboxMatchMarkdown,
   renderMermaid: () => renderMermaid,
   renderPacketMarkdown: () => renderPacketMarkdown,
   renderPacketPrompt: () => renderPacketPrompt,
@@ -7717,6 +10826,7 @@ __export(index_exports, {
   resolveArtifactTypeName: () => resolveArtifactTypeName,
   resolveCliTarget: () => resolveCliTarget,
   resolveGitHookPath: () => resolveGitHookPath,
+  resolveInboxFilePath: () => resolveInboxFilePath,
   resolveMatrixEdges: () => resolveMatrixEdges,
   resolveNodeTimeView: () => resolveNodeTimeView,
   resolveRealRoot: () => resolveRealRoot,
@@ -7725,6 +10835,7 @@ __export(index_exports, {
   runReadProof: () => runReadProof,
   scanArtifacts: () => scanArtifacts,
   traceVersion: () => traceVersion,
+  uninstallManagedHookBlock: () => uninstallManagedHookBlock,
   updateVersionLock: () => updateVersionLock,
   validateContractAgainstSchema: () => validateContractAgainstSchema,
   validateExecutableTraceability: () => validateExecutableTraceability,
@@ -7743,12 +10854,22 @@ __export(index_exports, {
   writeGraphCache: () => writeGraphCache
 });
 import matter from "gray-matter";
-import yaml2 from "js-yaml";
-import { accessSync, constants as fsConstants, existsSync as existsSync3, statSync } from "fs";
-import { mkdir as mkdir5, readFile as readFile5, writeFile as writeFile3 } from "fs/promises";
-import { basename as basename5, dirname as dirname7, extname, isAbsolute as isAbsolute7, join as join12, resolve as resolve8 } from "path";
+import yaml3 from "js-yaml";
+import { accessSync, constants as fsConstants, existsSync as existsSync4, statSync } from "fs";
+import { mkdir as mkdir6, readFile as readFile7, writeFile as writeFile4 } from "fs/promises";
+import { basename as basename6, dirname as dirname9, extname, isAbsolute as isAbsolute10, join as join14, resolve as resolve11 } from "path";
 function getConfigDiagnostics(schema) {
   return configDiagnosticsBySchema.get(schema);
+}
+function parseSafeFrontmatter(raw) {
+  const headerMatch = /^\uFEFF?---(?!-)([^\r\n]*)/.exec(raw);
+  if (headerMatch) {
+    const lang = headerMatch[1].trim().toLowerCase();
+    if (!SAFE_FRONTMATTER_LANGS.has(lang)) {
+      throw new Error(`Unsafe or unsupported frontmatter language "${headerMatch[1].trim()}" is disabled`);
+    }
+  }
+  return matter(raw, SAFE_FRONTMATTER_OPTIONS);
 }
 function edgeRule(from, to, kind) {
   return { from, to, kind };
@@ -7809,17 +10930,17 @@ function resolveArtifactTypeName(schema, token) {
   return void 0;
 }
 async function loadConfig(root) {
-  const configPath = join12(root, "artifact-graph.config.yaml");
+  const configPath = join14(root, "artifact-graph.config.yaml");
   let raw;
   try {
-    raw = await readFile5(configPath, "utf-8");
+    raw = await readFile7(configPath, "utf-8");
   } catch (error) {
     if (error.code === "ENOENT") {
       throw new Error(`required configuration is missing: ${configPath}`);
     }
     throw error;
   }
-  const document = yaml2.load(raw) ?? {};
+  const document = yaml3.load(raw) ?? {};
   const shapeDiagnosis = diagnoseConfigDocument(document);
   if (shapeDiagnosis.errors.length > 0) {
     throw new Error(shapeDiagnosis.errors[0].message);
@@ -7899,8 +11020,11 @@ async function scanArtifacts(root, schema, options = {}) {
   const scanDiagnostics = [];
   const scannedFiles = /* @__PURE__ */ new Map();
   const contentOverrides = options.contents instanceof Map ? options.contents : new Map(Object.entries(options.contents ?? {}));
-  for (const [type, definition] of artifactTypeEntriesBySpecificity(config)) {
-    const diskFiles = await findFiles(root, definition.paths);
+  const typeEntries = artifactTypeEntriesBySpecificity(config);
+  const allConfiguredPatterns = typeEntries.flatMap(([, def]) => def.paths);
+  const allDiskFiles = allConfiguredPatterns.length > 0 ? await walkFiles(root, root, void 0, collectExplicitHiddenDirSegments(allConfiguredPatterns)) : [];
+  for (const [type, definition] of typeEntries) {
+    const diskFiles = matchFilesFromList(allDiskFiles, definition.paths);
     const files = [.../* @__PURE__ */ new Set([
       ...diskFiles.filter((file) => contentOverrides.get(file) !== null),
       ...[...contentOverrides.keys()].filter((file) => contentOverrides.get(file) !== null && definition.paths.some((pattern) => matchesPattern(file, pattern)))
@@ -7918,7 +11042,7 @@ async function scanArtifacts(root, schema, options = {}) {
         continue;
       }
       scannedFiles.set(file, type);
-      const raw = contentOverrides.has(file) ? contentOverrides.get(file) : await readFile5(join12(root, file), "utf-8");
+      const raw = contentOverrides.has(file) ? contentOverrides.get(file) : await readFile7(join14(root, file), "utf-8");
       const parsed = parseFile(type, file, raw, config);
       const semantic = isJsonOriginalType(type, config) ? { edges: [], diagnostics: [] } : parseConfiguredRelations(type, file, raw, parsed.nodes, config);
       nodes.push(...parsed.nodes);
@@ -7926,7 +11050,7 @@ async function scanArtifacts(root, schema, options = {}) {
       scanDiagnostics.push(...parsed.diagnostics, ...semantic.diagnostics);
     }
   }
-  const absoluteRoot = isAbsolute7(root) ? root : resolve8(root);
+  const absoluteRoot = isAbsolute10(root) ? root : resolve11(root);
   const graph = buildGraph(nodes, edges, scanDiagnostics, absoluteRoot);
   return resolveMatrixEdges(graph);
 }
@@ -8273,7 +11397,7 @@ async function validateScenarioPrdLinkIndex(root, graph) {
   const indexPath = "artifacts/prd/feature-index.md";
   let raw = "";
   try {
-    raw = await readFile5(join12(root, indexPath), "utf-8");
+    raw = await readFile7(join14(root, indexPath), "utf-8");
   } catch (error) {
     if (error.code === "ENOENT") {
       return [];
@@ -8521,12 +11645,12 @@ function nextId(graph, schema, type, rangeName) {
   throw new Error(`ID range ${type}.${rangeName} is exhausted`);
 }
 async function writeGraphCache(root, graph) {
-  const cacheDir = join12(root, ".artifact-graph");
-  await mkdir5(cacheDir, { recursive: true });
-  await writeFile3(join12(cacheDir, "index.json"), `${JSON.stringify(graph, null, 2)}
+  const cacheDir = join14(root, ".artifact-graph");
+  await mkdir6(cacheDir, { recursive: true });
+  await writeFile4(join14(cacheDir, "index.json"), `${JSON.stringify(graph, null, 2)}
 `);
   const { default: Database } = await import("better-sqlite3");
-  const db = new Database(join12(cacheDir, "graph.sqlite"));
+  const db = new Database(join14(cacheDir, "graph.sqlite"));
   try {
     db.exec(`
       DROP TABLE IF EXISTS nodes;
@@ -8833,7 +11957,7 @@ function parseGenericMarkdown(type, path, raw, schema) {
     ));
     return { nodes: [], edges: [], diagnostics };
   }
-  const parsed = matter(raw);
+  const parsed = parseSafeFrontmatter(raw);
   const data = parsed.data;
   const code = String(data.id ?? "").trim();
   if (!code) {
@@ -8929,7 +12053,7 @@ function parseGenericMarkdown(type, path, raw, schema) {
   return { nodes: [node], edges, diagnostics };
 }
 function parseConfiguredRelations(type, path, raw, nodes, schema) {
-  const data = matter(raw).data;
+  const data = parseSafeFrontmatter(raw).data;
   const frontmatterCode = typeof data.id === "string" ? data.id.trim() : "";
   const sourceNode = nodes.find((node) => node.code === frontmatterCode) ?? (nodes.length === 1 ? nodes[0] : void 0);
   if (!sourceNode) return { edges: [], diagnostics: [] };
@@ -9054,7 +12178,7 @@ function relationTargetTypeMatches(code, targetTypes, schema) {
   });
 }
 function parseFeature(path, raw) {
-  const parsed = matter(raw);
+  const parsed = parseSafeFrontmatter(raw);
   const data = parsed.data;
   const code = String(data.id ?? "").trim();
   if (!code) {
@@ -9157,7 +12281,7 @@ function parseEntityRegistry(path, raw) {
   return { nodes, edges };
 }
 function parseDecisions(path, raw) {
-  const parsed = matter(raw);
+  const parsed = parseSafeFrontmatter(raw);
   const data = parsed.data;
   const code = String(data.id ?? "").trim();
   if (code) {
@@ -9192,7 +12316,7 @@ function parseDecisions(path, raw) {
 }
 function isTestFile(filePath) {
   const normalized = filePath.replace(/\\/g, "/");
-  const name = basename5(normalized);
+  const name = basename6(normalized);
   if (/\.(test|spec)\.[^.]+$/.test(name)) return true;
   if (/(^|\/)(tests|test|__tests__)\//.test(normalized)) return true;
   if (/\w+Tests?\.java$/.test(name)) return true;
@@ -9451,7 +12575,7 @@ function containsTraceabilityTag(value, schema = DEFAULT_SCHEMA) {
   return new RegExp(`(?:^|\\s)@(?:${alternatives})(?=\\s|$)`).test(value);
 }
 function parseDesign(path, raw, schema = DEFAULT_SCHEMA) {
-  const parsed = matter(raw);
+  const parsed = parseSafeFrontmatter(raw);
   const data = parsed.data;
   const code = normalizeDesignCode(path);
   const title = String(data.title ?? raw.match(/^#\s+(.+)$/m)?.[1] ?? code);
@@ -9501,13 +12625,13 @@ function parseDesign(path, raw, schema = DEFAULT_SCHEMA) {
   return { nodes, edges, diagnostics };
 }
 function parseE2eTest(path, raw) {
-  const parsed = matter(raw);
+  const parsed = parseSafeFrontmatter(raw);
   const data = parsed.data;
   const lines = raw.split(/\r?\n/);
   const starts = extractE2eTestCaseStarts(lines);
   const nodes = [];
   const edges = [];
-  const batch = String(data.test_batch ?? basename5(path, extname(path))).trim();
+  const batch = String(data.test_batch ?? basename6(path, extname(path))).trim();
   const frontmatterScenarios = toArray(data.related_scenarios).map((value) => String(value).trim()).filter(Boolean);
   const scopeFeatures = extractCodes(String(data.scope ?? ""), "feature");
   const frontmatterFeatures = [.../* @__PURE__ */ new Set([...Object.keys(asRecord2(data.ac_coverage)), ...scopeFeatures])];
@@ -9570,7 +12694,7 @@ function parseE2eRegistry(path, raw) {
     data = { parseError: error.message };
   }
   return {
-    nodes: [{ type: "e2e_registry", code: basename5(path, extname(path)), title: "E2E Test Registry", path, line: 1, attrs: data }],
+    nodes: [{ type: "e2e_registry", code: basename6(path, extname(path)), title: "E2E Test Registry", path, line: 1, attrs: data }],
     edges: []
   };
 }
@@ -10608,10 +13732,10 @@ async function validateExecutableTraceability(root, config) {
   const tcKeyToFields = /* @__PURE__ */ new Map();
   const mdBatches = /* @__PURE__ */ new Set();
   for (const relPath of e2eFiles) {
-    const raw = await readFile5(join12(root, relPath), "utf-8");
-    const parsed = matter(raw);
+    const raw = await readFile7(join14(root, relPath), "utf-8");
+    const parsed = parseSafeFrontmatter(raw);
     const data = parsed.data;
-    const batch = String(data.test_batch ?? basename5(relPath, extname(relPath))).trim();
+    const batch = String(data.test_batch ?? basename6(relPath, extname(relPath))).trim();
     const lines = raw.split(/\r?\n/);
     const tcStarts = extractE2eTestCaseStarts(lines);
     for (let i = 0; i < tcStarts.length; i += 1) {
@@ -10650,10 +13774,10 @@ async function validateExecutableTraceability(root, config) {
   const tcAnnotationRegex = /\/\/!?\s*@(?:e2e_test|tc)\s+(\S+?)\s+\[(\w+)\]/;
   const tcAnnotationNoLevelRegex = /\/\/!?\s*@(?:e2e_test|tc)\s+(\S+)/;
   for (const specFile of specFiles) {
-    const fullSpecPath = join12(root, specFile);
+    const fullSpecPath = join14(root, specFile);
     let content;
     try {
-      content = await readFile5(fullSpecPath, "utf-8");
+      content = await readFile7(fullSpecPath, "utf-8");
     } catch {
       continue;
     }
@@ -10732,7 +13856,7 @@ async function validateExecutableTraceability(root, config) {
       if (entry.testId) {
         let content;
         try {
-          content = await readFile5(join12(root, normalizedRefFile), "utf-8");
+          content = await readFile7(join14(root, normalizedRefFile), "utf-8");
         } catch {
           continue;
         }
@@ -10967,7 +14091,7 @@ async function computeE2eCoverageStats(graph, root, thresholds = {}) {
     let hasActiveE2eRef = false;
     for (const entry of parseExecutableRefLines(execRef)) {
       const normalized = resolveExecutableRefFile(entry.file, allProjectFiles);
-      if (!normalized || !existsSync3(join12(root, normalized))) continue;
+      if (!normalized || !existsSync4(join14(root, normalized))) continue;
       const accepting = await getAcceptingRunners(root, normalized, runners);
       if (accepting.some((runner) => runner.kind === "e2e")) {
         hasActiveE2eRef = true;
@@ -11026,7 +14150,7 @@ async function computeE2eCoverageStats(graph, root, thresholds = {}) {
   const acCoverageRateByFeature = {};
   const featureAcMap = /* @__PURE__ */ new Map();
   for (const node of featureNodes) {
-    const acs = parseAcceptanceCriteria(await readFile5(join12(root, node.path), "utf-8"));
+    const acs = parseAcceptanceCriteria(await readFile7(join14(root, node.path), "utf-8"));
     featureAcMap.set(node.code, new Set(acs));
   }
   const coveredAcByFeature = /* @__PURE__ */ new Map();
@@ -11074,11 +14198,11 @@ async function generateE2eRegistry(root, opts) {
   const batchIds = /* @__PURE__ */ new Set();
   let totalTestCases = 0;
   for (const file of files) {
-    const filePath = join12(root, file);
-    const raw = await readFile5(filePath, "utf-8");
-    const parsed = matter(raw);
+    const filePath = join14(root, file);
+    const raw = await readFile7(filePath, "utf-8");
+    const parsed = parseSafeFrontmatter(raw);
     const data = parsed.data;
-    const batch = String(data.test_batch ?? basename5(file, extname(file))).trim();
+    const batch = String(data.test_batch ?? basename6(file, extname(file))).trim();
     const relPath = file;
     const scope = String(data.scope ?? "").trim();
     const acCoverage = normalizeAcCoverageForRegistry(data.ac_coverage);
@@ -11200,10 +14324,10 @@ async function validatePartialRustEvidence(tcFields, tcKey, root, allFiles) {
     if (!normalizedPath) {
       return { hasValidPartialRust: false, detail: `partial_rust file not found: ${ref.file}` };
     }
-    const fullPath = join12(root, normalizedPath);
+    const fullPath = join14(root, normalizedPath);
     let content;
     try {
-      content = await readFile5(fullPath, "utf-8");
+      content = await readFile7(fullPath, "utf-8");
     } catch {
       return { hasValidPartialRust: false, detail: `partial_rust file not found: ${ref.file}` };
     }
@@ -11237,7 +14361,7 @@ function detectTestLevel(specFile, content) {
 }
 function resolveExecutableRefFile(refFile, allFiles) {
   const normalized = refFile.replace(/\\/g, "/").replace(/^\.\//, "");
-  if (!normalized || isAbsolute7(refFile) || normalized.split("/").includes("..")) {
+  if (!normalized || isAbsolute10(refFile) || normalized.split("/").includes("..")) {
     return void 0;
   }
   if (allFiles.includes(normalized)) {
@@ -11310,8 +14434,8 @@ function splitMarkdownCells(line) {
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
-async function findFiles(root, patterns) {
-  const all = await walkFiles(root);
+function matchFilesFromList(all, patterns) {
+  if (patterns.length === 0 || all.length === 0) return [];
   const matched = /* @__PURE__ */ new Set();
   for (const pattern of patterns) {
     for (const file of all) {
@@ -11321,6 +14445,11 @@ async function findFiles(root, patterns) {
     }
   }
   return [...matched].sort();
+}
+async function findFiles(root, patterns) {
+  if (patterns.length === 0) return [];
+  const all = await walkFiles(root, root, void 0, collectExplicitHiddenDirSegments(patterns));
+  return matchFilesFromList(all, patterns);
 }
 async function findConfiguredE2eFiles(root, schema) {
   const patterns = schema.types.e2e_test?.paths ?? [];
@@ -11543,7 +14672,7 @@ function normalizeDesignCode(value) {
   if (!raw) {
     return "";
   }
-  return basename5(raw, extname(raw));
+  return basename6(raw, extname(raw));
 }
 function toUid(type, code) {
   return `${type}:${code}`;
@@ -11819,7 +14948,7 @@ function resolveArtifactContext(graph, opts) {
     }
     if (root) {
       for (const ap of ALWAYS_PRESENT_ITEMS) {
-        const fullPath = join12(root, ap.path);
+        const fullPath = join14(root, ap.path);
         let stat2;
         try {
           stat2 = statSync(fullPath);
@@ -12061,7 +15190,7 @@ function formatContextMarkdown(manifest) {
   }
   return lines.join("\n");
 }
-var configDiagnosticsBySchema, DEFAULT_ALLOWED_EDGES, TARGET_ARTIFACT_TYPES, NON_TARGET_ROLES, DEFAULT_SCHEMA, SPECIALIZED_PARSER_TYPES, EMPTY_RELATION_FIELD_VALUES, VALID_TC_STATUSES, VALID_CHAIN_TYPES, DEPRECATED_CHAIN_TYPE_ALIASES, CONTEXT_CATEGORIES, TIER_ORDER;
+var configDiagnosticsBySchema, SAFE_FRONTMATTER_LANGS, DISABLED_FRONTMATTER_ENGINE, SAFE_FRONTMATTER_OPTIONS, DEFAULT_ALLOWED_EDGES, TARGET_ARTIFACT_TYPES, NON_TARGET_ROLES, DEFAULT_SCHEMA, SPECIALIZED_PARSER_TYPES, EMPTY_RELATION_FIELD_VALUES, VALID_TC_STATUSES, VALID_CHAIN_TYPES, DEPRECATED_CHAIN_TYPE_ALIASES, CONTEXT_CATEGORIES, TIER_ORDER;
 var init_index = __esm({
   "src/index.ts"() {
     init_packet_constants();
@@ -12084,13 +15213,41 @@ var init_index = __esm({
     init_git_changes();
     init_git_hook_path();
     init_hook_installer();
+    init_inbox();
     init_professional_conclusion();
     init_review_result_validator();
     init_contract_kernel();
     init_restructure();
     init_restructure_file_set();
     init_restructure_software();
+    init_bidirectional_alignment();
     configDiagnosticsBySchema = /* @__PURE__ */ new WeakMap();
+    SAFE_FRONTMATTER_LANGS = /* @__PURE__ */ new Set(["", "yaml", "yml", "json"]);
+    DISABLED_FRONTMATTER_ENGINE = {
+      parse() {
+        throw new Error("Executable frontmatter engines (js/javascript/coffee) are disabled");
+      },
+      stringify() {
+        throw new Error("Executable frontmatter engines (js/javascript/coffee) are disabled");
+      }
+    };
+    SAFE_FRONTMATTER_OPTIONS = {
+      engines: {
+        yaml: {
+          parse: (str) => yaml3.load(str) ?? {},
+          stringify: (data) => yaml3.dump(data)
+        },
+        json: {
+          parse: (str) => JSON.parse(str) ?? {},
+          stringify: (data) => JSON.stringify(data, null, 2)
+        },
+        js: DISABLED_FRONTMATTER_ENGINE,
+        javascript: DISABLED_FRONTMATTER_ENGINE,
+        coffee: DISABLED_FRONTMATTER_ENGINE,
+        coffeescript: DISABLED_FRONTMATTER_ENGINE,
+        cson: DISABLED_FRONTMATTER_ENGINE
+      }
+    };
     DEFAULT_ALLOWED_EDGES = [
       edgeRule("feature", "scenario", "covers"),
       edgeRule("feature", "decision", "references"),
@@ -12254,6 +15411,7 @@ export {
   ContractCatalog,
   ContractError,
   ContractRegistry,
+  DEFAULT_INBOX_RELATIVE_PATH,
   DEFAULT_MAX_CHARS,
   DEFAULT_SCHEMA,
   E2E_NORMALIZER_CONFIG,
@@ -12263,6 +15421,7 @@ export {
   GRAPH_PROVIDER_ENTRY,
   GRAPH_PROVIDER_ID,
   MIN_PROMPT_CHARS,
+  PORTFOLIO_ALLOCATIONS_PATH,
   PROFESSIONAL_CONCLUSION_OBJECT,
   RESTRUCTURE_MAX_OPERATIONS,
   RESTRUCTURE_MAX_TOTAL_BYTES,
@@ -12274,15 +15433,19 @@ export {
   RESTRUCTURE_RECOVERY_REL_PATH,
   RESTRUCTURE_RECOVERY_ROOT_MODE,
   RESTRUCTURE_VALIDATION_TIMEOUT_MS,
+  SPECIALIZED_PARSER_TYPES,
   TARGET_ARTIFACT_TYPES,
+  UPSTREAM_BINDINGS_PATH,
   VALID_PACKET_TARGET_TYPES,
   VERSION_INDEX_SCHEMA_VERSION,
   VERSION_LOCK_PATH,
   VERSION_LOCK_SCHEMA_VERSION,
+  addInboxIdea,
   applyPreparedManagedHookBlocks,
   applyRestructure,
   applyRestructureFileSet,
   assemblePacket,
+  auditBidirectionalAlignment,
   auditPackets,
   auditVersionLock,
   bootstrapVersionLock,
@@ -12301,12 +15464,13 @@ export {
   diagnoseConfigDocument,
   diagnoseProjectConfig,
   digestRestructureValue,
-  dirname7 as dirname,
+  dirname9 as dirname,
   discoverAndAuditPackets,
   discoverTargets,
   doctorArtifactChain,
   ensureRestructureMechanismRoot,
   extname,
+  extractInformativeTerms,
   filterGraphByView,
   formatContextMarkdown,
   gateRestructureOperationPlan,
@@ -12322,6 +15486,7 @@ export {
   isPacketTargetTypeDynamic,
   isTargetArtifactType,
   isVersionLockIssueBlocking,
+  listInboxIdeas,
   loadConfig,
   loadContract,
   loadContractCatalog,
@@ -12329,11 +15494,14 @@ export {
   loadFoundationModule,
   locateSoftwareRecord,
   markdownRecordHeadings,
+  matchInboxIdea,
   matchesConfiguredArtifactPath,
   nextId,
   normalizeE2eLegacyArtifact,
+  normalizeSha256Digest,
   normalizeToCanonical,
   observeRestructureJournal,
+  parseSafeFrontmatter,
   parseTargetSelector,
   parseTargetsFile,
   planRestructure,
@@ -12344,12 +15512,19 @@ export {
   pruneRestructureRecovery,
   qualifyRestructureMechanism,
   queryGraph,
+  readInboxIdeasFile,
   recoverRestructure,
   recoverRestructureFileSet,
+  refreshBidirectionalAlignmentLocks,
   refreshVersionLock,
+  renderBidirectionalAlignmentAuditMarkdown,
+  renderBidirectionalAlignmentLockMarkdown,
   renderCoverageBoundaryMarkdown,
   renderDoctorMarkdown,
   renderImpactMarkdown,
+  renderInboxAddMarkdown,
+  renderInboxListMarkdown,
+  renderInboxMatchMarkdown,
   renderMermaid,
   renderPacketMarkdown,
   renderPacketPrompt,
@@ -12362,6 +15537,7 @@ export {
   resolveArtifactTypeName,
   resolveCliTarget,
   resolveGitHookPath,
+  resolveInboxFilePath,
   resolveMatrixEdges,
   resolveNodeTimeView,
   resolveRealRoot,
@@ -12370,6 +15546,7 @@ export {
   runReadProof,
   scanArtifacts,
   traceVersion,
+  uninstallManagedHookBlock,
   updateVersionLock,
   validateContractAgainstSchema,
   validateExecutableTraceability,

@@ -1,3 +1,4 @@
+import matter from 'gray-matter';
 export { dirname, extname } from 'node:path';
 import * as skill_family_harness_node from 'skill-family-harness-node';
 import { FoundationFileSetResult, FoundationFileSetOutcome, FoundationFileSetValidation, FoundationFileSetPathResult, FoundationFileSetErrorKind, FoundationFileSetApplyRequest, FoundationFilesystemRootBinding, FoundationStateStoreRecoveryObservation } from 'skill-family-harness-node';
@@ -562,7 +563,7 @@ declare const VERSION_INDEX_SCHEMA_VERSION = "1.0";
 declare const VERSION_LOCK_SCHEMA_VERSION = "1.0";
 type VersionSourceKind = 'artifact' | 'code' | 'test';
 type VersionEdgeKind = 'references' | 'covers' | 'depends_on' | 'implements' | 'verifies';
-type VersionLockStatus = 'fresh' | 'target_not_found' | 'artifact_changed' | 'source_changed' | 'verified_by_changed' | 'missing_lock' | 'orphan_lock';
+type VersionLockStatus = 'fresh' | 'target_not_found' | 'artifact_changed' | 'source_changed' | 'verified_by_changed' | 'missing_lock' | 'orphan_lock' | 'invalid_test_shell';
 interface VersionedNode {
     uid: string;
     type: string;
@@ -876,7 +877,92 @@ interface PreparedManagedHookBlock {
 }
 declare function prepareManagedHookBlock(options: ManagedHookBlockOptions): Promise<PreparedManagedHookBlock>;
 declare function applyPreparedManagedHookBlocks(prepared: readonly PreparedManagedHookBlock[]): Promise<HookInstallResult[]>;
+interface UninstallManagedHookBlockOptions {
+    hookPath: string;
+    markerId?: string;
+}
 declare function installManagedHookBlock(options: ManagedHookBlockOptions): Promise<HookInstallResult>;
+declare function uninstallManagedHookBlock(options: UninstallManagedHookBlockOptions): Promise<HookInstallResult>;
+
+declare const DEFAULT_INBOX_RELATIVE_PATH = ".artifact-inbox/ideas.jsonl";
+type InboxIdeaStatus = 'captured';
+type InboxMatchKind = 'inbox-idea' | 'user-story' | 'artifact';
+interface InboxIdea {
+    id: string;
+    text: string;
+    context?: string;
+    tags?: string[];
+    source: string;
+    createdAt: string;
+    status: InboxIdeaStatus;
+}
+interface InboxMatchCandidate {
+    kind: InboxMatchKind;
+    id: string;
+    title: string;
+    path: string;
+    status?: string;
+    score: number;
+    matchedTerms: string[];
+}
+interface AddInboxIdeaOptions {
+    root?: string;
+    inboxPath?: string;
+    text: string;
+    context?: string;
+    tags?: string[];
+    source?: string;
+    createdAt?: string;
+    limit?: number;
+    minScore?: number;
+}
+interface AddInboxIdeaResult {
+    ok: true;
+    idea: InboxIdea;
+    inboxPath: string;
+    related: InboxMatchCandidate[];
+    scaffoldTriggered: false;
+    note: string;
+}
+interface ListInboxIdeasOptions {
+    root?: string;
+    inboxPath?: string;
+    status?: string;
+    tag?: string;
+    limit?: number;
+}
+interface ListInboxIdeasResult {
+    ok: true;
+    inboxPath: string;
+    total: number;
+    ideas: InboxIdea[];
+}
+interface MatchInboxIdeaOptions {
+    root?: string;
+    inboxPath?: string;
+    query: string;
+    context?: string;
+    limit?: number;
+    minScore?: number;
+    excludeIdeaId?: string;
+}
+interface MatchInboxIdeaResult {
+    ok: true;
+    query: string;
+    scannedSources: number;
+    related: InboxMatchCandidate[];
+    scaffoldTriggered: false;
+    note: string;
+}
+declare function resolveInboxFilePath(root?: string, inboxPath?: string): string;
+declare function readInboxIdeasFile(inboxFilePath: string): Promise<InboxIdea[]>;
+declare function addInboxIdea(options: AddInboxIdeaOptions): Promise<AddInboxIdeaResult>;
+declare function listInboxIdeas(options?: ListInboxIdeasOptions): Promise<ListInboxIdeasResult>;
+declare function matchInboxIdea(options: MatchInboxIdeaOptions): Promise<MatchInboxIdeaResult>;
+declare function extractInformativeTerms(text: string): Set<string>;
+declare function renderInboxAddMarkdown(result: AddInboxIdeaResult): string;
+declare function renderInboxListMarkdown(result: ListInboxIdeasResult): string;
+declare function renderInboxMatchMarkdown(result: MatchInboxIdeaResult): string;
 
 declare const GRAPH_PROVIDER_ID = "artifact-graph";
 declare const GRAPH_PROVIDER_ENTRY = "check-professional";
@@ -951,13 +1037,29 @@ interface ValidationError {
     path: string;
     message: string;
 }
+interface ValidateReviewResultOptions {
+    /**
+     * 被审目标路径到期望内容 SHA-256 摘要（sha256:<64位十六进制> 或 64 位十六进制）的映射。
+     * 传入时强制核对审阅结果中记录的目标摘要与审阅文件范围，拦截旧快照混入与条目串单；
+     * 省略时保持纯协议结构与身份独立性校验。
+     */
+    expectedTargetDigests?: Record<string, string>;
+    /**
+     * 为 true（默认）时，若审阅结果绑定了 expectedTargetDigests 之外的其他目标路径，
+     * 或 review.files 未覆盖期望目标，均判定为串单阻断。
+     */
+    strictScopeMatch?: boolean;
+}
 /**
- * Validate a review result object against the v1.0 protocol.
+ * 校验审阅结果对象是否符合 Review Result Protocol v1.0 契约；
+ * 当提供 options.expectedTargetDigests 时，同步核对目标文件摘要防止串单。
  *
- * @param input - Parsed JSON to validate (not a string).
- * @returns Array of validation errors. Empty = valid.
+ * @param input - 待校验的已解析 JSON 对象（非原始字符串）。
+ * @param options - 可选的目标摘要防串单核对配置。
+ * @returns 校验错误数组；空数组表示通过。
  */
-declare function validateReviewResult(input: unknown): ValidationError[];
+declare function validateReviewResult(input: unknown, options?: ValidateReviewResultOptions): ValidationError[];
+declare function normalizeSha256Digest(raw: unknown): string | undefined;
 
 /**
  * Review Result Protocol v1.0 — TypeScript types.
@@ -1032,6 +1134,7 @@ interface ReviewMetrics {
 interface ReviewData {
     source_files?: string[];
     files?: string[];
+    target_digests?: Record<string, string>;
     batches?: BatchDefinition[];
     metrics?: ReviewMetrics;
     findings?: Finding[];
@@ -1865,8 +1968,166 @@ declare function markdownRecordHeadings(raw: string, type: string): Array<{
 declare function locateSoftwareRecord(raw: string, node: ArtifactNode, nodesInFile: ArtifactNode[]): RecordBoundaryResult;
 declare function replaceSoftwareHeader(raw: string, header: string): string;
 
+declare const PORTFOLIO_ALLOCATIONS_PATH = "artifacts/portfolio-allocations.json";
+declare const UPSTREAM_BINDINGS_PATH = "artifacts/upstream-bindings.json";
+type BidirectionalAlignmentSeverity = 'error' | 'warning' | 'info';
+type PortfolioDisposition = 'allocated' | 'deferred' | 'merged' | 'abandoned';
+type PortfolioSatisfactionStatus = 'not_applicable' | 'partially_allocated' | 'allocated_in_progress' | 'traceability_locked' | 'verified_satisfied';
+interface PortfolioAllocationEntry {
+    targetRepo: string;
+    targetUid: string;
+    targetPath: string;
+    targetDigest: string;
+    coverageRole?: string;
+    readonlyTarget?: boolean;
+    verifiedReceiptPath?: string;
+    allocationStatus?: 'active' | 'absorbed' | string;
+    absorbedBy?: string;
+}
+interface PortfolioAllocationItem {
+    sourceUid: string;
+    sourcePath: string;
+    sourceDigest: string;
+    title?: string;
+    disposition: PortfolioDisposition | string;
+    dispositionNote?: string;
+    mergedInto?: string | null;
+    remainingScope?: string[];
+    allocations?: PortfolioAllocationEntry[];
+}
+interface PortfolioAllocationsFile {
+    schemaVersion: '1.0';
+    portfolioId?: string;
+    title?: string;
+    items: PortfolioAllocationItem[];
+}
+interface UpstreamBindingEntry {
+    localUid: string;
+    localPath: string;
+    localDigest: string;
+    upstreamUid: string;
+    upstreamPath: string;
+    upstreamDigest: string;
+}
+interface UpstreamBindingsFile {
+    schemaVersion: '1.0';
+    upstreamPortfolio: string;
+    bindings: UpstreamBindingEntry[];
+}
+interface BidirectionalAlignmentIssue {
+    code: string;
+    layer: 'intra-repo' | 'portfolio' | 'child-upstream';
+    severity: BidirectionalAlignmentSeverity;
+    message: string;
+    remediation: string[];
+    file?: string;
+    uid?: string;
+    targetRepo?: string;
+    targetUid?: string;
+    edgeId?: string;
+    expectedDigest?: string;
+    actualDigest?: string;
+}
+interface PortfolioAllocationCheckDetail {
+    targetRepo: string;
+    targetUid: string;
+    targetPath: string;
+    readonlyTarget: boolean;
+    allocationStatus?: string;
+    absorbedBy?: string;
+    targetRepoReachable: boolean;
+    satisfied: boolean;
+    traceabilityLocked?: boolean;
+    hasFreshImplementsLock: boolean;
+    hasFreshVerifiesLock: boolean;
+    verifiedReceiptValid?: boolean;
+    executionReceiptValid?: boolean;
+}
+interface PortfolioItemEvaluation {
+    sourceUid: string;
+    sourcePath: string;
+    title?: string;
+    disposition: string;
+    computedSatisfaction: PortfolioSatisfactionStatus;
+    remainingScope: string[];
+    allocationsCount: number;
+    verifiedAllocationsCount: number;
+    traceabilityLockedAllocationsCount: number;
+    issues: BidirectionalAlignmentIssue[];
+    allocations: PortfolioAllocationCheckDetail[];
+}
+interface BidirectionalAlignmentAuditResult {
+    schemaVersion: '1.0';
+    root: string;
+    ok: boolean;
+    strict: boolean;
+    modes: {
+        intraRepo: boolean;
+        portfolio: boolean;
+        childProject: boolean;
+    };
+    intraRepo: {
+        graphErrorCount: number;
+        totalLocks: number;
+        freshLocks: number;
+        implementsLocksCount: number;
+        verifiesLocksCount: number;
+        implementationSurfaceChecked: boolean;
+        matchedEntries: string[];
+        unclaimedEntries: string[];
+    };
+    portfolio?: {
+        filePath: string;
+        portfolioId?: string;
+        title?: string;
+        totalItems: number;
+        satisfactionSummary: Record<PortfolioSatisfactionStatus, number>;
+        items: PortfolioItemEvaluation[];
+    };
+    childProject?: {
+        filePath: string;
+        upstreamPortfolio: string;
+        resolvedPortfolioRoot?: string;
+        upstreamReachable: boolean;
+        totalBindings: number;
+        matchedBindings: number;
+    };
+    issues: BidirectionalAlignmentIssue[];
+    summary: {
+        totalIssues: number;
+        errorCount: number;
+        warningCount: number;
+    };
+}
+interface AlignmentAuditOptions {
+    portfolioRoot?: string;
+    strict?: boolean;
+}
+interface AlignmentLockOptions {
+    portfolioRoot?: string;
+}
+interface RefreshBidirectionalAlignmentResult {
+    schemaVersion: '1.0';
+    root: string;
+    ok: boolean;
+    updatedFiles: string[];
+    refreshedAllocations: number;
+    refreshedBindings: number;
+    skipped: Array<{
+        scope: 'portfolio' | 'child-upstream';
+        uid: string;
+        reason: string;
+    }>;
+    issues: BidirectionalAlignmentIssue[];
+}
+declare function auditBidirectionalAlignment(root: string, opts?: AlignmentAuditOptions): Promise<BidirectionalAlignmentAuditResult>;
+declare function refreshBidirectionalAlignmentLocks(root: string, opts?: AlignmentLockOptions): Promise<RefreshBidirectionalAlignmentResult>;
+declare function renderBidirectionalAlignmentAuditMarkdown(result: BidirectionalAlignmentAuditResult): string;
+declare function renderBidirectionalAlignmentLockMarkdown(result: RefreshBidirectionalAlignmentResult): string;
+
 /** Diagnostics captured by the last successful loadConfig for this schema object. */
 declare function getConfigDiagnostics(schema: ArtifactSchema): ConfigDocumentDiagnosis | undefined;
+declare function parseSafeFrontmatter(raw: string): matter.GrayMatterFile<string>;
 interface ArtifactNode {
     uid: string;
     type: string;
@@ -1957,6 +2218,12 @@ interface E2eWaiver {
     id: string;
     reason: string;
 }
+/** Optional declaration of public code/skill entry surface for bidirectional alignment checks. */
+interface ImplementationSurfaceConfig {
+    entryGlobs?: string[];
+    excludeGlobs?: string[];
+    requireCodeLocks?: boolean;
+}
 interface ArtifactSchema {
     types: Record<string, ArtifactTypeSchema>;
     idPatterns: Record<string, string>;
@@ -1978,6 +2245,10 @@ interface ArtifactSchema {
         /** When false, skip universal baseline injection. Default: true. */
         universal_baseline?: boolean;
     };
+    /** Optional implementation surface globs and code-lock enforcement policy. */
+    implementationSurface?: ImplementationSurfaceConfig;
+    /** Optional declarative workspace settings for external workbench tools (e.g. skill-family-studio). */
+    studio?: Record<string, unknown>;
     /** E2E coverage proof configuration */
     e2e?: {
         /** Minimum executable_ref coverage rate (0-1) for warning */
@@ -2114,6 +2385,7 @@ interface ContextOptions {
 }
 declare const DEFAULT_SCHEMA: ArtifactSchema;
 declare function loadConfig(root: string): Promise<ArtifactSchema>;
+declare const SPECIALIZED_PARSER_TYPES: Set<string>;
 declare function buildGraph(nodes: Omit<ArtifactNode, 'uid'>[], edges: ArtifactEdge[], diagnostics?: ValidationIssue[], root?: string): ArtifactGraph;
 interface ScanArtifactsOptions {
     /**
@@ -2252,4 +2524,4 @@ declare function discoverTargets(graph: ArtifactGraph, options?: DiscoverOptions
 declare function resolveArtifactContext(graph: ArtifactGraph, opts: ContextOptions): ContextManifest;
 declare function formatContextMarkdown(manifest: ContextManifest): string;
 
-export { ALWAYS_PRESENT_ITEMS as ALWAYS_PRESENT, type ArtifactChainDoctorReport, type ArtifactEdge, type ArtifactEdgeRule, type ArtifactExtraFieldSchema, type ArtifactGraph, type ArtifactGraphCliCandidate, type ArtifactGraphCliResolution, type ArtifactGraphCliSource, type ArtifactNode, type ArtifactSchema, type ArtifactTarget, type ArtifactTypeMetadata, type ArtifactTypeRole, type ArtifactTypeSchema, BASELINE_CONSTRAINTS, BASELINE_CONSTRAINTS_COUNT, BASELINE_ITEMS_COUNT, type BatchDefinition, type ByteRange, CONTRACTS_PACKAGE_NAME, CONTRACT_ERROR_CODES, type CanonicalIR, type CheckProfessionalOptions, type CheckProfessionalResult, type CollectChangedPathsOptions, type ConfigDiagnostic, type ConfigDocumentDiagnosis, type ContextItem, type ContextManifest, type ContextMode, type ContextOptions, type ContextTier, ContractCatalog, type ContractCatalogEntry, type ContractDefinition, ContractError, type ContractErrorCode, type ContractIdentity, ContractRegistry, type ContractRegistryEntry, type ContractSchema, type CoverageBoundaryReport, DEFAULT_MAX_CHARS, DEFAULT_SCHEMA, type DeclaredVerificationReference, type DiscoverOptions, E2E_NORMALIZER_CONFIG, type E2eCoverageStats, type E2eCoverageThresholds, type E2eRegistry, type E2eRegistryBatch, type E2eRunnerConfig, type E2eWaiver, type Evidence, type EvidenceObject, type ExecutorType, type ExternalEntryInfo, FILE_SET_RESULT_OBJECT, FOUNDATION_PACKAGE_NAME, type FileSnapshot, type Finding, type FindingLocation, type FindingSeverity, type FindingStatus, type FoundationModule, GRAPH_DOMAIN_CODES, GRAPH_PROVIDER_ENTRY, GRAPH_PROVIDER_ID, type GitChangeMode, type GitChangeResult, type GitHookName, type GraphDomainCode, type HookInstallResult, type ImpactEdgeRef, type ImpactMode, type ImpactNodeRef, type ImpactOptions, type ImpactReport, type ImplementationBlueprintDraft, type ImplementationPacket, type LegacyFieldMapping, type LoadContractOptions, MIN_PROMPT_CHARS, type ManagedHookBlockOptions, type MissingDetail, type NodeTimeView, type NormalizationResult, type NormalizerConfig, PROFESSIONAL_CONCLUSION_OBJECT, type PacketAuditEntry, type PacketAuditSummary, type PacketCategory, type PacketItem, type PacketOmittedItem, type PacketOptions, type PacketPromptError, type PacketPromptOptions, type PacketTarget, type PacketTargetType, type PacketValidationIssue, type PacketValidationResult, type PartialSupersedeAnnotation, type PolicyCompatibilityResult, type PreparedManagedHookBlock, type Producer, type ProfessionalConclusion, type ProjectConfigDiagnosis, type ProjectPolicy, type PromptValidationIssue, type PromptValidationResult, type ProofReadResult, type ProofReadStatus, type QueryOptions, RESTRUCTURE_MAX_OPERATIONS, RESTRUCTURE_MAX_TOTAL_BYTES, RESTRUCTURE_PLAN_SCHEMA_VERSION, RESTRUCTURE_QUALIFIED_ARCH, RESTRUCTURE_QUALIFIED_FILESYSTEM, RESTRUCTURE_QUALIFIED_PLATFORM, RESTRUCTURE_RECOVERY_JOURNAL_REL_PATH, RESTRUCTURE_RECOVERY_REL_PATH, RESTRUCTURE_RECOVERY_ROOT_MODE, RESTRUCTURE_VALIDATION_TIMEOUT_MS, type ReadProofOptions, type RecordBoundaryResult, type RelationSemanticsSpec, type RepairData, type RepairValidation, type ResolveArtifactGraphCliOptions, type RestructureApplyInput, type RestructureBoundaryLimits, type RestructureCandidate, type RestructureFileSetApplyOptions, type RestructureFinding, type RestructureInspection, type RestructureMaintenanceOptions, type RestructureMapping, type RestructureMechanismProjection, type RestructureMechanismQualification, type RestructureMechanismRootOptions, type RestructureOperationBoundary, type RestructurePlan, type RestructurePlanDocument, type RestructurePlanOperation, type RestructurePruneInput, type RestructureRecoveryInput, type RestructureRequest, type RestructureResult, type RestructureValidationCallback, type ReviewData, type ReviewDecision, type ReviewMetrics, type ReviewOrderStep, type ReviewResult, type ReviewStatus, type RiskChecklistItem, type ScanArtifactsOptions, type SchemaValidationResult, TARGET_ARTIFACT_TYPES, type TargetArtifactType, type TimeBucket, type TimeView, type TraceVersionResult, VALID_PACKET_TARGET_TYPES, VERSION_INDEX_SCHEMA_VERSION, VERSION_LOCK_PATH, VERSION_LOCK_SCHEMA_VERSION, type ValidationError, type ValidationIssue, type VersionEdgeKind, type VersionIndex, type VersionLockAuditMarkdownOptions, type VersionLockAuditResult, type VersionLockBootstrapOptions, type VersionLockEntry, type VersionLockFile, type VersionLockIssue, type VersionLockIssueSeverity, type VersionLockRef, type VersionLockRefreshOptions, type VersionLockRefreshResult, type VersionLockSourceRef, type VersionLockStatus, type VersionLockUpdateOptions, type VersionSourceKind, type VersionedEdge, type VersionedNode, type ViewExcludedNode, type ViewSelection, applyPreparedManagedHookBlocks, applyRestructure, applyRestructureFileSet, assemblePacket, auditPackets, auditVersionLock, bootstrapVersionLock, buildFileSetApplyRequest, buildGraph, buildVersionIndex, candidateByteDigest, collectChangedPaths, computeCoverageBoundary, computeE2eCoverageStats, computeImpact, computeRevisionDigest, createModeForUmask, createRestructureRootBinding, createRestructureValidationCallback, diagnoseConfigDocument, diagnoseProjectConfig, digestRestructureValue, discoverAndAuditPackets, discoverTargets, doctorArtifactChain, ensureRestructureMechanismRoot, filterGraphByView, formatContextMarkdown, gateRestructureOperationPlan, generateE2eRegistry, getArtifactTypeMetadata, getConfigDiagnostics, getExternalEntryInfo, getTargetArtifactTypes, inspectRestructure, installManagedHookBlock, isOfficialNamespace, isPacketTargetType, isPacketTargetTypeDynamic, isTargetArtifactType, isVersionLockIssueBlocking, loadConfig, loadContract, loadContractCatalog, loadContractsFromDirectory, loadFoundationModule, locateSoftwareRecord, markdownRecordHeadings, matchesConfiguredArtifactPath, nextId, normalizeE2eLegacyArtifact, normalizeToCanonical, observeRestructureJournal, parseTargetSelector, parseTargetsFile, planRestructure, planningUmask, prepareManagedHookBlock, projectRestructureFileSetResult, pruneRestructureFileSet, pruneRestructureRecovery, qualifyRestructureMechanism, queryGraph, recoverRestructure, recoverRestructureFileSet, refreshVersionLock, renderCoverageBoundaryMarkdown, renderDoctorMarkdown, renderImpactMarkdown, renderMermaid, renderPacketMarkdown, renderPacketPrompt, renderTraceVersionMarkdown, renderVersionLockAuditMarkdown, renderVersionLockRefreshMarkdown, replaceSoftwareHeader, resolveArtifactContext, resolveArtifactGraphCli, resolveArtifactTypeName, resolveCliTarget, resolveGitHookPath, resolveMatrixEdges, resolveNodeTimeView, resolveRealRoot, restructureBoundaryFindings, runCheckProfessional, runReadProof, scanArtifacts, traceVersion, updateVersionLock, validateContractAgainstSchema, validateExecutableTraceability, validateGraph, validateNamespaceAuthority, validatePacket, validatePacketMarkdown, validatePacketPrompt, validatePolicyCompatibility, validateReviewResult, validateScenarioPrdLinkIndex, validateScenarioPrdLinks, verifyDigest, verifyMechanismResult, versionLockIssueSeverity, writeGraphCache };
+export { ALWAYS_PRESENT_ITEMS as ALWAYS_PRESENT, type AddInboxIdeaOptions, type AddInboxIdeaResult, type AlignmentAuditOptions, type AlignmentLockOptions, type ArtifactChainDoctorReport, type ArtifactEdge, type ArtifactEdgeRule, type ArtifactExtraFieldSchema, type ArtifactGraph, type ArtifactGraphCliCandidate, type ArtifactGraphCliResolution, type ArtifactGraphCliSource, type ArtifactNode, type ArtifactSchema, type ArtifactTarget, type ArtifactTypeMetadata, type ArtifactTypeRole, type ArtifactTypeSchema, BASELINE_CONSTRAINTS, BASELINE_CONSTRAINTS_COUNT, BASELINE_ITEMS_COUNT, type BatchDefinition, type BidirectionalAlignmentAuditResult, type BidirectionalAlignmentIssue, type BidirectionalAlignmentSeverity, type ByteRange, CONTRACTS_PACKAGE_NAME, CONTRACT_ERROR_CODES, type CanonicalIR, type CheckProfessionalOptions, type CheckProfessionalResult, type CollectChangedPathsOptions, type ConfigDiagnostic, type ConfigDocumentDiagnosis, type ContextItem, type ContextManifest, type ContextMode, type ContextOptions, type ContextTier, ContractCatalog, type ContractCatalogEntry, type ContractDefinition, ContractError, type ContractErrorCode, type ContractIdentity, ContractRegistry, type ContractRegistryEntry, type ContractSchema, type CoverageBoundaryReport, DEFAULT_INBOX_RELATIVE_PATH, DEFAULT_MAX_CHARS, DEFAULT_SCHEMA, type DeclaredVerificationReference, type DiscoverOptions, E2E_NORMALIZER_CONFIG, type E2eCoverageStats, type E2eCoverageThresholds, type E2eRegistry, type E2eRegistryBatch, type E2eRunnerConfig, type E2eWaiver, type Evidence, type EvidenceObject, type ExecutorType, type ExternalEntryInfo, FILE_SET_RESULT_OBJECT, FOUNDATION_PACKAGE_NAME, type FileSnapshot, type Finding, type FindingLocation, type FindingSeverity, type FindingStatus, type FoundationModule, GRAPH_DOMAIN_CODES, GRAPH_PROVIDER_ENTRY, GRAPH_PROVIDER_ID, type GitChangeMode, type GitChangeResult, type GitHookName, type GraphDomainCode, type HookInstallResult, type ImpactEdgeRef, type ImpactMode, type ImpactNodeRef, type ImpactOptions, type ImpactReport, type ImplementationBlueprintDraft, type ImplementationPacket, type ImplementationSurfaceConfig, type InboxIdea, type InboxIdeaStatus, type InboxMatchCandidate, type InboxMatchKind, type LegacyFieldMapping, type ListInboxIdeasOptions, type ListInboxIdeasResult, type LoadContractOptions, MIN_PROMPT_CHARS, type ManagedHookBlockOptions, type MatchInboxIdeaOptions, type MatchInboxIdeaResult, type MissingDetail, type NodeTimeView, type NormalizationResult, type NormalizerConfig, PORTFOLIO_ALLOCATIONS_PATH, PROFESSIONAL_CONCLUSION_OBJECT, type PacketAuditEntry, type PacketAuditSummary, type PacketCategory, type PacketItem, type PacketOmittedItem, type PacketOptions, type PacketPromptError, type PacketPromptOptions, type PacketTarget, type PacketTargetType, type PacketValidationIssue, type PacketValidationResult, type PartialSupersedeAnnotation, type PolicyCompatibilityResult, type PortfolioAllocationCheckDetail, type PortfolioAllocationEntry, type PortfolioAllocationItem, type PortfolioAllocationsFile, type PortfolioDisposition, type PortfolioItemEvaluation, type PortfolioSatisfactionStatus, type PreparedManagedHookBlock, type Producer, type ProfessionalConclusion, type ProjectConfigDiagnosis, type ProjectPolicy, type PromptValidationIssue, type PromptValidationResult, type ProofReadResult, type ProofReadStatus, type QueryOptions, RESTRUCTURE_MAX_OPERATIONS, RESTRUCTURE_MAX_TOTAL_BYTES, RESTRUCTURE_PLAN_SCHEMA_VERSION, RESTRUCTURE_QUALIFIED_ARCH, RESTRUCTURE_QUALIFIED_FILESYSTEM, RESTRUCTURE_QUALIFIED_PLATFORM, RESTRUCTURE_RECOVERY_JOURNAL_REL_PATH, RESTRUCTURE_RECOVERY_REL_PATH, RESTRUCTURE_RECOVERY_ROOT_MODE, RESTRUCTURE_VALIDATION_TIMEOUT_MS, type ReadProofOptions, type RecordBoundaryResult, type RefreshBidirectionalAlignmentResult, type RelationSemanticsSpec, type RepairData, type RepairValidation, type ResolveArtifactGraphCliOptions, type RestructureApplyInput, type RestructureBoundaryLimits, type RestructureCandidate, type RestructureFileSetApplyOptions, type RestructureFinding, type RestructureInspection, type RestructureMaintenanceOptions, type RestructureMapping, type RestructureMechanismProjection, type RestructureMechanismQualification, type RestructureMechanismRootOptions, type RestructureOperationBoundary, type RestructurePlan, type RestructurePlanDocument, type RestructurePlanOperation, type RestructurePruneInput, type RestructureRecoveryInput, type RestructureRequest, type RestructureResult, type RestructureValidationCallback, type ReviewData, type ReviewDecision, type ReviewMetrics, type ReviewOrderStep, type ReviewResult, type ReviewStatus, type RiskChecklistItem, SPECIALIZED_PARSER_TYPES, type ScanArtifactsOptions, type SchemaValidationResult, TARGET_ARTIFACT_TYPES, type TargetArtifactType, type TimeBucket, type TimeView, type TraceVersionResult, UPSTREAM_BINDINGS_PATH, type UninstallManagedHookBlockOptions, type UpstreamBindingEntry, type UpstreamBindingsFile, VALID_PACKET_TARGET_TYPES, VERSION_INDEX_SCHEMA_VERSION, VERSION_LOCK_PATH, VERSION_LOCK_SCHEMA_VERSION, type ValidateReviewResultOptions, type ValidationError, type ValidationIssue, type VersionEdgeKind, type VersionIndex, type VersionLockAuditMarkdownOptions, type VersionLockAuditResult, type VersionLockBootstrapOptions, type VersionLockEntry, type VersionLockFile, type VersionLockIssue, type VersionLockIssueSeverity, type VersionLockRef, type VersionLockRefreshOptions, type VersionLockRefreshResult, type VersionLockSourceRef, type VersionLockStatus, type VersionLockUpdateOptions, type VersionSourceKind, type VersionedEdge, type VersionedNode, type ViewExcludedNode, type ViewSelection, addInboxIdea, applyPreparedManagedHookBlocks, applyRestructure, applyRestructureFileSet, assemblePacket, auditBidirectionalAlignment, auditPackets, auditVersionLock, bootstrapVersionLock, buildFileSetApplyRequest, buildGraph, buildVersionIndex, candidateByteDigest, collectChangedPaths, computeCoverageBoundary, computeE2eCoverageStats, computeImpact, computeRevisionDigest, createModeForUmask, createRestructureRootBinding, createRestructureValidationCallback, diagnoseConfigDocument, diagnoseProjectConfig, digestRestructureValue, discoverAndAuditPackets, discoverTargets, doctorArtifactChain, ensureRestructureMechanismRoot, extractInformativeTerms, filterGraphByView, formatContextMarkdown, gateRestructureOperationPlan, generateE2eRegistry, getArtifactTypeMetadata, getConfigDiagnostics, getExternalEntryInfo, getTargetArtifactTypes, inspectRestructure, installManagedHookBlock, isOfficialNamespace, isPacketTargetType, isPacketTargetTypeDynamic, isTargetArtifactType, isVersionLockIssueBlocking, listInboxIdeas, loadConfig, loadContract, loadContractCatalog, loadContractsFromDirectory, loadFoundationModule, locateSoftwareRecord, markdownRecordHeadings, matchInboxIdea, matchesConfiguredArtifactPath, nextId, normalizeE2eLegacyArtifact, normalizeSha256Digest, normalizeToCanonical, observeRestructureJournal, parseSafeFrontmatter, parseTargetSelector, parseTargetsFile, planRestructure, planningUmask, prepareManagedHookBlock, projectRestructureFileSetResult, pruneRestructureFileSet, pruneRestructureRecovery, qualifyRestructureMechanism, queryGraph, readInboxIdeasFile, recoverRestructure, recoverRestructureFileSet, refreshBidirectionalAlignmentLocks, refreshVersionLock, renderBidirectionalAlignmentAuditMarkdown, renderBidirectionalAlignmentLockMarkdown, renderCoverageBoundaryMarkdown, renderDoctorMarkdown, renderImpactMarkdown, renderInboxAddMarkdown, renderInboxListMarkdown, renderInboxMatchMarkdown, renderMermaid, renderPacketMarkdown, renderPacketPrompt, renderTraceVersionMarkdown, renderVersionLockAuditMarkdown, renderVersionLockRefreshMarkdown, replaceSoftwareHeader, resolveArtifactContext, resolveArtifactGraphCli, resolveArtifactTypeName, resolveCliTarget, resolveGitHookPath, resolveInboxFilePath, resolveMatrixEdges, resolveNodeTimeView, resolveRealRoot, restructureBoundaryFindings, runCheckProfessional, runReadProof, scanArtifacts, traceVersion, uninstallManagedHookBlock, updateVersionLock, validateContractAgainstSchema, validateExecutableTraceability, validateGraph, validateNamespaceAuthority, validatePacket, validatePacketMarkdown, validatePacketPrompt, validatePolicyCompatibility, validateReviewResult, validateScenarioPrdLinkIndex, validateScenarioPrdLinks, verifyDigest, verifyMechanismResult, versionLockIssueSeverity, writeGraphCache };

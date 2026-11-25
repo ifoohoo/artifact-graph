@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.2.1
+
+### Changed
+
+- Released in lockstep with artifact-chain-assistant 1.2.1 to connect the standalone GitHub Pages documentation site (`https://ifoohoo.github.io/artifact-chain-assistant-site/`) and explicit package documentation entry links. Graph runtime, CLI, API, and contract semantics are unchanged from 1.1.0.
+
 ## 1.2.0
 
 ### Changed

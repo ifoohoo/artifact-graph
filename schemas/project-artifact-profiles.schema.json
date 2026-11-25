@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://artifact-graph.dev/schemas/project-artifact-profiles/v1.0.schema.json",
   "title": "Project Artifact Profiles",
-  "description": "Static published lists of common-minimum, project-type standard, lifecycle, and capability-triggered artifact types. schema_version must be 1.0. This file is a recommendation contract; reading it does not enable project types.",
+  "description": "随包发布的项目制品类型推荐清单契约（schema_version 固定为 1.0），定义跨项目最小集合、已批准项目形态标准、采用阶段候选与能力触发候选；仅作为裁剪参考，读取该清单不会自动启用目标项目类型。",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "common_minimum", "project_standards", "lifecycle", "conditional"],
@@ -10,11 +10,11 @@
     "schema_version": {
       "type": "string",
       "const": "1.0",
-      "description": "Contract version. Must be '1.0' for this schema."
+      "description": "推荐清单契约版本号，当前 Schema 固定为 \"1.0\"。"
     },
     "common_minimum": {
       "type": "array",
-      "description": "Cross-project common minimum artifact types. Unique names; not auto-enabled.",
+      "description": "跨项目通用的最小制品类型名称集合（去重且不会在运行时自动启用）。",
       "minItems": 1,
       "uniqueItems": true,
       "items": {
@@ -24,7 +24,7 @@
     },
     "project_standards": {
       "type": "object",
-      "description": "Approved project-shape standards. Only skill-plugin is currently an independent category standard.",
+      "description": "已批准的项目形态标准扩展映射，当前仅包含 skill-plugin 这一独立品类标准。",
       "additionalProperties": false,
       "properties": {
         "skill-plugin": {
@@ -34,14 +34,14 @@
     },
     "lifecycle": {
       "type": "array",
-      "description": "Stage-triggered candidates. condition is for skill interpretation; no runtime condition interpreter is implied.",
+      "description": "按采用阶段触发的候选制品类型列表；condition 供引导技能理解判读，不包含运行时条件求值器。",
       "items": {
         "$ref": "#/$defs/lifecycleEntry"
       }
     },
     "conditional": {
       "type": "array",
-      "description": "Capability-triggered candidates for matching project shapes. Not auto-enabled.",
+      "description": "按项目形态与具体能力特征按需纳入的候选制品类型列表，默认不自动启用。",
       "items": {
         "$ref": "#/$defs/conditionalEntry"
       }

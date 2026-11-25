@@ -1,6 +1,6 @@
 {
   "name": "artifact-graph",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Git-native Markdown artifact graph scanner and validator",
   "license": "Apache-2.0",
   "type": "module",
@@ -91,7 +91,7 @@
   "bugs": {
     "url": "https://github.com/ifoohoo/artifact-graph/issues"
   },
-  "homepage": "https://github.com/ifoohoo/artifact-graph#readme",
+  "homepage": "https://ifoohoo.github.io/artifact-chain-assistant-site/",
   "author": "广州市风荷科技有限公司",
   "contributors": [
     "mzdbxqh"

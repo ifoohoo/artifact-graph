@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://artifact-graph.dev/schemas/review-result/v1.0.schema.json",
   "title": "Review Result Protocol",
-  "description": "Versioned, machine-verifiable result schema for artifact review, repair, and batch processing workflows. Covers run-level, stage/batch-level, and finding-level results with severity, status, evidence, and repair relationships. Cross-object producer/reviewer identity comparison requires the semantic TypeScript validator because JSON Schema cannot compare field values.",
+  "description": "制品审阅、修复与分批处理工作流的版本化机读结果协议（v1.0）。覆盖整轮、单阶段/批次与逐条问题结论；跨对象的执行者与复审者身份独立性、以及目标文件 SHA-256 防串单校验须配合 validateReviewResult 语义校验器执行。",
   "version": "1.0",
   "type": "object",
   "additionalProperties": false,
@@ -11,90 +11,94 @@
     "schema_version": {
       "type": "string",
       "const": "1.0",
-      "description": "Protocol version. Must be '1.0' for this schema."
+      "description": "协议版本号，当前版本固定为 \"1.0\"。"
     },
     "run_id": {
       "type": "string",
       "minLength": 1,
-      "description": "Unique identifier for this review/repair run."
+      "description": "本轮审阅或修复运行的唯一标识。"
     },
     "stage_id": {
       "type": "string",
-      "description": "Stage or batch identifier within the run. Omitted for final/run-level results."
+      "description": "整轮运行内的阶段或分批标识；整轮汇总级结果可省略。"
     },
     "attempt": {
       "type": "integer",
       "minimum": 1,
       "maximum": 3,
-      "description": "Attempt number for this stage. Defaults to 1."
+      "description": "当前阶段的执行尝试轮次（取值 1 至 3，默认第 1 轮）。"
     },
     "status": {
       "type": "string",
       "enum": ["SUCCEEDED", "FAILED", "BLOCKED", "NEEDS_INPUT", "SKIPPED"],
-      "description": "Execution status. SUCCEEDED means the stage completed; decision may still be FAIL."
+      "description": "运行执行状态。SUCCEEDED 仅表示审阅或修复动作本身正常跑完，业务裁决 decision 仍可能为 FAIL。"
     },
     "decision": {
       "type": "string",
       "enum": ["PASS", "FAIL", "PASS_WITH_RESIDUAL_MINOR", "BLOCKED", "NEEDS_INPUT", "NOT_APPLICABLE"],
-      "description": "Business decision. PASS means no blocking findings; FAIL means blocking findings remain."
+      "description": "业务审阅裁决结论。PASS 表示无阻断项且全部通过；PASS_WITH_RESIDUAL_MINOR 表示仅存非阻断轻微项；FAIL 表示仍存阻断问题。"
     },
     "summary": {
       "type": "string",
-      "description": "Human-readable summary of the result."
+      "description": "面向人类阅读的本轮或本阶段结论摘要。"
     },
     "outputs": {
       "type": "array",
       "items": { "type": "string" },
-      "description": "Paths to output files produced by this stage."
+      "description": "当前阶段产出的结果文件路径列表。"
     },
     "warnings": {
       "type": "array",
       "items": { "type": "string" },
-      "description": "Non-blocking warning messages."
+      "description": "非阻断提示或告警信息列表。"
     },
     "blocking_reason": {
       "type": ["string", "null"],
-      "description": "Reason the stage is blocked. Null if not blocked."
+      "description": "流程受阻（BLOCKED）或待补输入（NEEDS_INPUT）时的具体原因；未受阻时为 null。"
     },
     "degradation": {
       "type": ["string", "null"],
-      "description": "Description of any quality degradation (e.g., partial execution, timeout fallback)."
+      "description": "执行过程中的质量降级说明（如局部执行、超时回退等）；无降级时为 null。"
     },
     "producer": {
       "type": "object",
-      "description": "Identity of what produced this result.",
+      "description": "生成本条结果记录的执行主体身份。",
       "required": ["executor", "name"],
       "properties": {
         "executor": {
           "type": "string",
           "enum": ["script", "worker", "agent", "manual", "cli"],
-          "description": "Type of executor."
+          "description": "执行器类别（脚本、工作器、智能体、人工或命令行工具）。"
         },
         "name": {
           "type": "string",
-          "description": "Name of the executor (script filename, worker name, etc.)."
+          "description": "执行器稳定名称（如脚本文件名、worker 名称或独立审阅者标识）。"
         },
         "skill": {
           "type": "string",
-          "description": "Skill or plugin that owns this executor."
+          "description": "所属技能或插件名称元数据。"
         }
       }
     },
     "acceptance": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Independent re-review identity and the repair result being accepted. The semantic validator compares stable executor+name identity (skill is metadata) and rejects self-acceptance.",
+      "description": "独立复审验收身份及所验收的修复结果引用。语义校验器按 executor+name 稳定身份核对职责隔离（skill 仅作元数据），严禁同一执行主体自审自签。",
       "required": ["reviewer", "source_result"],
       "properties": {
-        "reviewer": { "$ref": "#/$defs/producer" },
+        "reviewer": {
+          "$ref": "#/$defs/producer",
+          "description": "执行独立复审验收的审阅主体身份。"
+        },
         "source_result": {
           "type": "object",
           "additionalProperties": false,
+          "description": "被本次独立复审验收的上游修复结果身份引用。",
           "required": ["run_id", "producer"],
           "properties": {
-            "run_id": { "type": "string", "minLength": 1 },
-            "stage_id": { "type": "string" },
-            "producer": { "$ref": "#/$defs/producer" }
+            "run_id": { "type": "string", "minLength": 1, "description": "上游修复结果的运行标识。" },
+            "stage_id": { "type": "string", "description": "上游修复结果的阶段标识（若有）。" },
+            "producer": { "$ref": "#/$defs/producer", "description": "产出该修复结果的原执行主体身份。" }
           }
         }
       }
@@ -103,108 +107,120 @@
       "type": "array",
       "items": {
         "oneOf": [
-          { "type": "string" },
+          { "type": "string", "description": "简写证据路径或引用说明。" },
           {
             "type": "object",
+            "description": "结构化证据条目。",
             "required": ["type", "path"],
             "properties": {
               "type": {
                 "type": "string",
-                "description": "Evidence type (e.g., task, deterministic-result, semantic-report, repair-log)."
+                "description": "证据类型（如 task、deterministic-result、semantic-report、repair-log、reviewed-input、target-digest）。"
               },
-              "path": { "type": "string" },
-              "status": { "type": "string" },
-              "decision": { "type": "string" },
-              "summary": { "type": "string" },
-              "command": { "type": "string" },
-              "result": { "type": "string" }
+              "path": { "type": "string", "description": "关联证据文件或受检输入路径。" },
+              "status": { "type": "string", "description": "该证据对应的执行状态。" },
+              "decision": { "type": "string", "description": "该证据对应的检查结论。" },
+              "summary": { "type": "string", "description": "证据要点摘要。" },
+              "command": { "type": "string", "description": "产生该证据的实际命令。" },
+              "result": { "type": "string", "description": "校验结果值或内容摘要（如 sha256:<64位十六进制>）。" }
             }
           }
         ]
       },
-      "description": "Evidence items supporting this result."
+      "description": "支撑本次结论的命令记录、检查报告或输入摘要证据列表。"
     },
     "review": {
       "type": "object",
-      "description": "Review-specific data. Present for review stages.",
+      "description": "审阅阶段专属载荷数据（在审阅与复审结果中提供）。",
       "properties": {
         "source_files": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Files reviewed in this stage."
+          "description": "本阶段审阅期间实际读取的源文件与上下文参考路径列表。"
         },
         "files": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "All files in scope for the run."
+          "description": "本轮审阅纳管的全部目标文件路径。"
+        },
+        "target_digests": {
+          "type": "object",
+          "description": "被审目标路径到内容 SHA-256 摘要（sha256:<64位十六进制> 或 64 位十六进制）的绑定映射，用于在验收或合并前拦截旧快照混入与审阅对象串单。",
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^(?:sha256:)?[A-Fa-f0-9]{64}$"
+          }
         },
         "batches": {
           "type": "array",
           "items": {
             "type": "object",
+            "description": "单个审阅分批定义。",
             "required": ["id", "files"],
             "properties": {
-              "id": { "type": "string" },
-              "files": { "type": "array", "items": { "type": "string" } },
-              "chars": { "type": "integer" }
+              "id": { "type": "string", "description": "批次唯一标识。" },
+              "files": { "type": "array", "items": { "type": "string" }, "description": "归入该批次的文件路径列表。" },
+              "chars": { "type": "integer", "description": "该批次估算字符总量。" }
             }
           },
-          "description": "Batch definitions for batch processing."
+          "description": "分批审阅切分方案列表。"
         },
         "metrics": {
           "type": "object",
-          "description": "Quantitative metrics for this review.",
+          "description": "本次审阅的定量统计指标。",
           "properties": {
-            "files_reviewed": { "type": "integer", "minimum": 0 },
-            "files_scanned": { "type": "integer", "minimum": 0 },
-            "findings_count": { "type": "integer", "minimum": 0 },
-            "deterministic_findings_count": { "type": "integer", "minimum": 0 },
-            "semantic_findings_count": { "type": "integer", "minimum": 0 },
-            "block_count": { "type": "integer", "minimum": 0 },
-            "warn_count": { "type": "integer", "minimum": 0 },
-            "info_count": { "type": "integer", "minimum": 0 },
-            "resolved_count": { "type": "integer", "minimum": 0 },
-            "batch_count": { "type": "integer", "minimum": 0 },
-            "scenario_count": { "type": "integer", "minimum": 0 }
+            "files_reviewed": { "type": "integer", "minimum": 0, "description": "已完成实质审阅的文件数。" },
+            "files_scanned": { "type": "integer", "minimum": 0, "description": "已扫描的文件总数。" },
+            "findings_count": { "type": "integer", "minimum": 0, "description": "发现的问题总条数。" },
+            "deterministic_findings_count": { "type": "integer", "minimum": 0, "description": "确定性检查检出的问题条数。" },
+            "semantic_findings_count": { "type": "integer", "minimum": 0, "description": "语义审阅检出的问题条数。" },
+            "block_count": { "type": "integer", "minimum": 0, "description": "阻断级（block）问题条数。" },
+            "warn_count": { "type": "integer", "minimum": 0, "description": "警告级（warn）问题条数。" },
+            "info_count": { "type": "integer", "minimum": 0, "description": "提示级（info）问题条数。" },
+            "resolved_count": { "type": "integer", "minimum": 0, "description": "已解决的问题条数。" },
+            "batch_count": { "type": "integer", "minimum": 0, "description": "审阅分批数量。" },
+            "scenario_count": { "type": "integer", "minimum": 0, "description": "覆盖的场景数量。" }
           }
         },
         "findings": {
           "type": "array",
           "items": { "$ref": "#/$defs/finding" },
-          "description": "Open findings from this review."
+          "description": "本次审阅发现的未关闭问题列表。"
         },
         "resolved_findings": {
           "type": "array",
           "items": { "$ref": "#/$defs/finding" },
-          "description": "Findings that were resolved (by repair or acceptance)."
+          "description": "已通过返修或独立复审确认关闭的问题列表。"
         },
         "repair_worker_needed": {
           "type": "boolean",
-          "description": "Whether a repair worker should be dispatched."
+          "description": "是否需要继续调度返修流程（repair worker）处理剩余问题。"
         }
       }
     },
     "repair": {
       "type": "object",
-      "description": "Repair-specific data. Present for repair stages.",
+      "description": "返修阶段专属载荷数据（在修复结果中提供）。",
       "properties": {
-        "source_review_run_id": { "type": "string" },
-        "source_review_stage_id": { "type": "string" },
+        "source_review_run_id": { "type": "string", "description": "触发本次返修的上游审阅运行标识。" },
+        "source_review_stage_id": { "type": "string", "description": "触发本次返修的上游审阅阶段标识。" },
         "findings_addressed": {
           "type": "array",
-          "items": { "$ref": "#/$defs/finding" }
+          "items": { "$ref": "#/$defs/finding" },
+          "description": "本轮返修实际处置的问题条目列表。"
         },
         "files_modified": {
           "type": "array",
-          "items": { "type": "string" }
+          "items": { "type": "string" },
+          "description": "本轮返修实际修改的文件路径列表。"
         },
         "validation_after_repair": {
           "type": "object",
-          "description": "Re-validation results after repair.",
+          "description": "返修完成后执行的本地自检验证结果。",
           "properties": {
-            "command": { "type": "string" },
-            "exit_code": { "type": "integer" },
-            "findings_remaining": { "type": "integer", "minimum": 0 }
+            "command": { "type": "string", "description": "验证所执行的命令。" },
+            "exit_code": { "type": "integer", "description": "验证命令退出码。" },
+            "findings_remaining": { "type": "integer", "minimum": 0, "description": "验证后仍剩余的未解决问题数。" }
           }
         }
       }
@@ -256,62 +272,76 @@
   "$defs": {
     "producer": {
       "type": "object",
+      "description": "执行或审阅主体的稳定身份声明。",
       "required": ["executor", "name"],
       "properties": {
-        "executor": { "type": "string", "enum": ["script", "worker", "agent", "manual", "cli"] },
-        "name": { "type": "string", "minLength": 1 },
-        "skill": { "type": "string" }
+        "executor": {
+          "type": "string",
+          "enum": ["script", "worker", "agent", "manual", "cli"],
+          "description": "执行器类别（脚本、工作器、智能体、人工或命令行工具）。"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "执行器或审阅者稳定非空名称。"
+        },
+        "skill": {
+          "type": "string",
+          "description": "所属技能或插件名称元数据（不单独构成独立身份）。"
+        }
       }
     },
     "finding": {
       "type": "object",
+      "description": "审阅检出的单条问题及处置状态记录。",
       "required": ["id", "severity", "message"],
       "properties": {
         "id": {
           "type": "string",
-          "description": "Unique finding identifier within the run (e.g., B043-SF-001)."
+          "description": "本轮审阅内唯一的问题编号（如 B043-SF-001）。"
         },
         "severity": {
           "type": "string",
           "enum": ["block", "warn", "info"],
-          "description": "Finding severity."
+          "description": "问题严重等级（block 阻断、warn 警告、info 提示）。"
         },
         "category": {
           "type": "string",
-          "description": "Finding category (e.g., structure, semantic, link, format)."
+          "description": "问题类别（如 structure 结构、semantic 语义、link 关联链接、format 格式）。"
         },
         "message": {
           "type": "string",
-          "description": "Human-readable finding description."
+          "description": "面向人类阅读的具体问题描述。"
         },
         "location": {
           "type": "object",
+          "description": "问题在被审文件中的源码或文档位置。",
           "properties": {
-            "file": { "type": "string" },
-            "line": { "type": "integer" },
-            "column": { "type": "integer" }
+            "file": { "type": "string", "description": "文件路径。" },
+            "line": { "type": "integer", "description": "行号。" },
+            "column": { "type": "integer", "description": "列号。" }
           }
         },
         "artifact_id": {
           "type": "string",
-          "description": "Related artifact ID (e.g., S-01, A1, D-ARCH-01)."
+          "description": "关联的制品编号（如 S-01、A1、D-ARCH-01）。"
         },
         "evidence": {
           "type": "string",
-          "description": "Evidence supporting this finding."
+          "description": "支撑该问题判断的原文摘录或验证依据。"
         },
         "suggested_fix": {
           "type": "string",
-          "description": "Suggested fix or remediation."
+          "description": "建议的最小修复方式或整改指引。"
         },
         "status": {
           "type": "string",
           "enum": ["open", "resolved", "accepted", "superseded"],
-          "description": "Current status of this finding."
+          "description": "该问题当前的处置状态（open 未关闭、resolved 已修复、accepted 已裁决接受、superseded 已替代）。"
         },
         "resolved_by": {
           "type": "string",
-          "description": "How the finding was resolved (e.g., repair, acceptance, superseded by another finding)."
+          "description": "问题关闭方式或依据说明（如返修通过、人工接受或被后续发现替代）。"
         }
       }
     }
