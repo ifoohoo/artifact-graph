@@ -1,6 +1,6 @@
 {
   "name": "artifact-graph",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "Git-native Markdown artifact graph scanner and validator",
   "license": "Apache-2.0",
   "type": "module",
@@ -54,14 +54,14 @@
     "commander": "^13.1.0",
     "gray-matter": "^4.0.3",
     "js-yaml": "^4.2.0",
-    "skill-family-contracts": "0.22.0",
-    "skill-family-harness-node": "0.22.0"
+    "skill-family-contracts": "0.39.2",
+    "skill-family-harness-node": "0.39.2"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^22.19.20",
-    "skill-family-engineering-kit": "0.22.0",
+    "skill-family-engineering-kit": "0.39.2",
     "tsup": "^8.4.0",
     "typescript": "^5.7.0",
     "vitest": "^3.1.0"

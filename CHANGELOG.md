@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.2.2
+
+### Changed
+
+- Upgraded `skill-family-contracts`, `skill-family-harness-node`, and `skill-family-engineering-kit` from `0.22.0` to `0.39.2` (`Contracts 1.23.0`), unifying the Foundation dependency baseline across the ecosystem in lockstep with `artifact-chain-assistant` 1.2.2. Graph runtime, CLI, API, and contract semantics are unchanged.
+
 ## 1.2.1
 
 ### Changed
