@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.2.3
+
+### Added
+
+- Added fine-grained non-code asset SHA-256 locks (`assetLocks` in `traceability-version-lock.json`, `CAP-P4-01`) for prompt templates, `SKILL.md`, and `references/**` knowledge packs, enforcing regular-file symlink containment via `lstatSync` and reporting `ASSET_DRIFT`, `ASSET_MISSING`, and `ASSET_INVALID_TARGET` during `version-lock audit`.
+
 ## 1.2.2
 
 ### Changed

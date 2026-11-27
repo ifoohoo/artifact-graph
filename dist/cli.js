@@ -508,6 +508,7 @@ function collectNestedUnknownKeyWarnings(document, warnings) {
     warnUnknownArrayObjectKeys(e2eRecord.runners, "e2e.runners", RUNNER_KEYS, warnings);
   }
   warnUnknownObjectKeys(document.implementationSurface, "implementationSurface", IMPLEMENTATION_SURFACE_KEYS, warnings);
+  warnUnknownObjectKeys(document.knowledgeAssets, "knowledgeAssets", KNOWLEDGE_ASSETS_KEYS, warnings);
 }
 function typeHasDefaultPaths(typeName) {
   const base = DEFAULT_SCHEMA.types[typeName];
@@ -738,6 +739,32 @@ function collectImplementationSurfaceErrors(value, errors) {
     pushError(errors, "implementationSurface.requireCodeLocks", "implementationSurface.requireCodeLocks \u914D\u7F6E\u65E0\u6548\uFF1A\u5FC5\u987B\u4E3A\u5E03\u5C14\u503C\uFF08true \u6216 false\uFF09\u3002");
   }
 }
+function collectKnowledgeAssetsErrors(value, errors) {
+  if (value === void 0) return;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    pushError(errors, "knowledgeAssets", "knowledgeAssets \u914D\u7F6E\u65E0\u6548\uFF1A\u5FC5\u987B\u4E3A\u5305\u542B globs \u6216 excludeGlobs \u7684\u5BF9\u8C61\u3002");
+    return;
+  }
+  const record = value;
+  for (const field of ["globs", "excludeGlobs"]) {
+    if (record[field] !== void 0) {
+      if (!Array.isArray(record[field]) || record[field].some((item) => typeof item !== "string" || !item.trim())) {
+        pushError(errors, `knowledgeAssets.${field}`, `knowledgeAssets.${field} \u914D\u7F6E\u65E0\u6548\uFF1A\u5FC5\u987B\u7531\u975E\u7A7A glob \u5B57\u7B26\u4E32\u7EC4\u6210\u7684\u6570\u7EC4\u6784\u6210\u3002`);
+        continue;
+      }
+      for (const pat of record[field]) {
+        const norm = pat.trim().replace(/\\/g, "/");
+        if (norm.startsWith("/") || /^[A-Za-z]:/.test(norm) || /(?:^|\/)\.\.(?:\/|$)/.test(norm)) {
+          pushError(
+            errors,
+            `knowledgeAssets.${field}`,
+            `knowledgeAssets.${field} \u5305\u542B\u8D8A\u754C\u6216\u7EDD\u5BF9\u8DEF\u5F84\u6A21\u5F0F "${pat}"\uFF1A\u4EC5\u5141\u8BB8\u5DE5\u4F5C\u533A\u5185\u7684\u76F8\u5BF9\u8DEF\u5F84\u6A21\u5F0F\u3002`
+          );
+        }
+      }
+    }
+  }
+}
 function collectStudioConfigErrors(value, errors) {
   if (value === void 0) return;
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -751,6 +778,7 @@ function collectExistingLoaderErrors(document, errors) {
   collectRelationSemanticsErrors(document.relationSemantics, errors);
   collectStatusViewsErrors(document.statusViews, errors);
   collectImplementationSurfaceErrors(document.implementationSurface, errors);
+  collectKnowledgeAssetsErrors(document.knowledgeAssets, errors);
   collectStudioConfigErrors(document.studio, errors);
   collectAllowedEdgesPresenceError(document, errors);
 }
@@ -821,7 +849,7 @@ async function diagnoseProjectConfig(root) {
   const diagnosis = diagnoseConfigDocument(document);
   return { exists: true, errors: diagnosis.errors, warnings: diagnosis.warnings };
 }
-var KNOWN_TOP_LEVEL_KEYS, IMPLEMENTATION_SURFACE_KEYS, TYPE_OBJECT_KEYS, EXTRA_FIELD_KEYS, EDGE_RULE_KEYS, CONTEXT_KEYS, ID_RANGE_ENTRY_KEYS, RELATION_SEMANTICS_KEYS, RELATION_PARTIAL_KEYS, E2E_KEYS, WAIVER_KEYS, RUNNER_KEYS, EDGE_RULE_SCHEMA, EXTRA_FIELD_SCHEMA, ID_RANGE_ENTRY_SCHEMA, CONFIG_SHAPE_SCHEMA, _validateConfigShape, ALLOWED_EDGES_REQUIRED_MESSAGE;
+var KNOWN_TOP_LEVEL_KEYS, IMPLEMENTATION_SURFACE_KEYS, KNOWLEDGE_ASSETS_KEYS, TYPE_OBJECT_KEYS, EXTRA_FIELD_KEYS, EDGE_RULE_KEYS, CONTEXT_KEYS, ID_RANGE_ENTRY_KEYS, RELATION_SEMANTICS_KEYS, RELATION_PARTIAL_KEYS, E2E_KEYS, WAIVER_KEYS, RUNNER_KEYS, EDGE_RULE_SCHEMA, EXTRA_FIELD_SCHEMA, ID_RANGE_ENTRY_SCHEMA, CONFIG_SHAPE_SCHEMA, _validateConfigShape, ALLOWED_EDGES_REQUIRED_MESSAGE;
 var init_doctor = __esm({
   "src/doctor.ts"() {
     "use strict";
@@ -839,12 +867,17 @@ var init_doctor = __esm({
       "context",
       "e2e",
       "implementationSurface",
+      "knowledgeAssets",
       "studio"
     ]);
     IMPLEMENTATION_SURFACE_KEYS = /* @__PURE__ */ new Set([
       "entryGlobs",
       "excludeGlobs",
       "requireCodeLocks"
+    ]);
+    KNOWLEDGE_ASSETS_KEYS = /* @__PURE__ */ new Set([
+      "globs",
+      "excludeGlobs"
     ]);
     TYPE_OBJECT_KEYS = /* @__PURE__ */ new Set([
       "paths",
@@ -1421,6 +1454,73 @@ async function auditVersionLock(root, lockPath = VERSION_LOCK_PATH, graph, confi
       });
     }
   }
+  const hashCacheForAssets = /* @__PURE__ */ new Map();
+  const discoveredAssets = await discoverDeclaredKnowledgeAssets(root, index, schema, hashCacheForAssets, safeLockPath);
+  const discoveredAssetByEdgeId = new Map(discoveredAssets.map((item) => [item.edgeId, item]));
+  const assetLocks = lock.assetLocks ?? [];
+  let assetFresh = 0;
+  for (const assetLock of assetLocks) {
+    const entryIssues = [];
+    if (assetLock.owner) {
+      const ownerKey = `${assetLock.owner.type}:${assetLock.owner.id}`;
+      const ownerNode = nodeByArtifact.get(ownerKey);
+      if (!ownerNode) {
+        issues.push({
+          status: "orphan_lock",
+          edgeId: assetLock.edgeId,
+          message: `Knowledge asset lock references missing owner artifact ${ownerKey}`
+        });
+        continue;
+      }
+      if (ownerNode.path !== assetLock.owner.path) {
+        entryIssues.push({
+          status: "artifact_changed",
+          edgeId: assetLock.edgeId,
+          message: `Knowledge asset owner ${ownerKey} moved from ${assetLock.owner.path} to ${ownerNode.path}`,
+          currentArtifactHash: ownerNode.contentHash
+        });
+      }
+    }
+    if (!discoveredAssetByEdgeId.has(assetLock.edgeId)) {
+      entryIssues.push({
+        status: "orphan_lock",
+        edgeId: assetLock.edgeId,
+        message: `Knowledge asset ${assetLock.path} is no longer declared or no longer exists in the workspace`
+      });
+    } else {
+      const liveAsset = discoveredAssetByEdgeId.get(assetLock.edgeId);
+      if (liveAsset.path !== assetLock.path) {
+        entryIssues.push({
+          status: "source_changed",
+          edgeId: assetLock.edgeId,
+          message: `Knowledge asset path drifted from ${assetLock.path} to ${liveAsset.path}`,
+          currentSourceHash: liveAsset.contentHash
+        });
+      } else if (liveAsset.contentHash !== assetLock.contentHash) {
+        entryIssues.push({
+          status: "source_changed",
+          edgeId: assetLock.edgeId,
+          message: `Knowledge asset ${assetLock.path} changed since the lock was written`,
+          currentSourceHash: liveAsset.contentHash
+        });
+      }
+    }
+    if (entryIssues.length === 0) {
+      assetFresh += 1;
+    } else {
+      issues.push(...entryIssues);
+    }
+  }
+  for (const liveAsset of discoveredAssets) {
+    if (!assetLocks.some((item) => item.edgeId === liveAsset.edgeId)) {
+      issues.push({
+        status: "missing_lock",
+        edgeId: liveAsset.edgeId,
+        message: `Declared knowledge asset ${liveAsset.path} has no version lock`
+      });
+    }
+  }
+  const hasAnyAssets = discoveredAssets.length > 0 || assetLocks.length > 0;
   return {
     schemaVersion: "1.0",
     root,
@@ -1429,6 +1529,7 @@ async function auditVersionLock(root, lockPath = VERSION_LOCK_PATH, graph, confi
     fresh,
     totalArtifactRelationLocks: artifactRelationLocks.length,
     artifactRelationFresh,
+    ...hasAnyAssets ? { totalAssetLocks: assetLocks.length, assetFresh } : {},
     issues: sortBy(issues.map(enrichVersionLockIssue), (issue2) => `${issue2.status}	${issue2.edgeId}	${issue2.verifiedByPath ?? ""}`)
   };
 }
@@ -1571,7 +1672,8 @@ async function updateVersionLock(root, options) {
   const next = {
     schemaVersion: VERSION_LOCK_SCHEMA_VERSION,
     locks: sortBy([...filtered, entry], (item) => item.edgeId),
-    artifactRelations: lock.artifactRelations
+    artifactRelations: lock.artifactRelations,
+    ...lock.assetLocks && lock.assetLocks.length > 0 ? { assetLocks: lock.assetLocks } : {}
   };
   await writeVersionLock(root, lockPath, next);
   return next;
@@ -1618,10 +1720,12 @@ async function bootstrapVersionLock(root, options = {}) {
     }
     artifactRelationEntries.set(identity, relationLock);
   }
+  const discoveredAssets = await discoverDeclaredKnowledgeAssets(root, index, config, /* @__PURE__ */ new Map(), lockPath);
   const next = {
     schemaVersion: VERSION_LOCK_SCHEMA_VERSION,
     locks: sortBy([...entries.values()], (item) => item.edgeId),
-    artifactRelations: sortBy([...artifactRelationEntries.values()], artifactRelationLockSortKey)
+    artifactRelations: sortBy([...artifactRelationEntries.values()], artifactRelationLockSortKey),
+    ...discoveredAssets.length > 0 ? { assetLocks: sortBy(discoveredAssets, (item) => item.edgeId) } : {}
   };
   await writeVersionLock(root, lockPath, next);
   return next;
@@ -1646,6 +1750,7 @@ async function refreshVersionLock(root, options = {}) {
   const nodeByPath = new Map(index.nodes.map((node) => [node.path, node]));
   const currentImplementationEdges = await lockableImplementationEdges(root, index, config);
   const currentArtifactRelationEdgeList = artifactRelationEdges(index);
+  const discoveredAssets = await discoverDeclaredKnowledgeAssets(root, index, config, /* @__PURE__ */ new Map(), lockPath);
   const currentEdgePairs = new Set(currentImplementationEdges.map((edge2) => `${edge2.from}	${edge2.to}`));
   const currentEntries = /* @__PURE__ */ new Map();
   const changedPathSet = new Set(changedPaths);
@@ -1653,7 +1758,8 @@ async function refreshVersionLock(root, options = {}) {
     removeOrphanEdges,
     lock,
     new Set(currentImplementationEdges.map((edge2) => edge2.edgeId)),
-    new Set(currentArtifactRelationEdgeList.map((edge2) => edge2.edgeId))
+    new Set(currentArtifactRelationEdgeList.map((edge2) => edge2.edgeId)),
+    new Set(discoveredAssets.map((asset) => asset.edgeId))
   );
   const affectedEdges = /* @__PURE__ */ new Set();
   const addedLocks = [];
@@ -1779,13 +1885,63 @@ async function refreshVersionLock(root, options = {}) {
       nextArtifactRelationLocks.push(existingLock);
     }
   }
+  const existingAssetLocks = lock.assetLocks ?? [];
+  const addedAssetLocks = [];
+  const updatedAssetLocks = [];
+  const retainedAssetOrphans = [];
+  const removedAssetLocks = [];
+  const nextAssetLocks = [];
+  const processedAssetEdgeIds = /* @__PURE__ */ new Set();
+  for (const liveAsset of discoveredAssets) {
+    if (processedAssetEdgeIds.has(liveAsset.edgeId)) continue;
+    processedAssetEdgeIds.add(liveAsset.edgeId);
+    const existingAsset = existingAssetLocks.find((item) => item.edgeId === liveAsset.edgeId);
+    const affected = all || existingAsset && assetLockTouchesPaths(existingAsset, changedPathSet) || assetLockTouchesPaths(liveAsset, changedPathSet);
+    if (!affected) {
+      if (existingAsset) {
+        nextAssetLocks.push(existingAsset);
+      }
+      continue;
+    }
+    affectedEdges.add(liveAsset.edgeId);
+    if (existingAsset) {
+      if (stableAssetLockJson(existingAsset) === stableAssetLockJson(liveAsset)) {
+        nextAssetLocks.push(existingAsset);
+      } else {
+        updatedAssetLocks.push(liveAsset.edgeId);
+        nextAssetLocks.push(liveAsset);
+      }
+    } else {
+      addedAssetLocks.push(liveAsset.edgeId);
+      nextAssetLocks.push(liveAsset);
+    }
+  }
+  for (const existingAsset of existingAssetLocks) {
+    if (processedAssetEdgeIds.has(existingAsset.edgeId)) continue;
+    const removePrecisely = removeOrphanEdges.has(existingAsset.edgeId);
+    const affected = removePrecisely || all || assetLockTouchesPaths(existingAsset, changedPathSet);
+    if (affected) {
+      affectedEdges.add(existingAsset.edgeId);
+      if (removePrecisely || options.removeOrphans === true) {
+        removedAssetLocks.push(existingAsset.edgeId);
+      } else {
+        retainedAssetOrphans.push(existingAsset.edgeId);
+        nextAssetLocks.push(existingAsset);
+      }
+    } else {
+      nextAssetLocks.push(existingAsset);
+    }
+  }
+  const hasAssetSection = nextAssetLocks.length > 0;
   const next = {
     schemaVersion: VERSION_LOCK_SCHEMA_VERSION,
     locks: sortBy([...nextLocks.values()], (item) => item.edgeId),
-    artifactRelations: sortBy(nextArtifactRelationLocks, artifactRelationLockSortKey)
+    artifactRelations: sortBy(nextArtifactRelationLocks, artifactRelationLockSortKey),
+    ...hasAssetSection ? { assetLocks: sortBy(nextAssetLocks, (item) => item.edgeId) } : {}
   };
   await writeVersionLock(root, lockPath, next);
   const postAudit = await auditVersionLock(root, lockPath, void 0, config);
+  const includeAssetDiffs = hasAssetSection || existingAssetLocks.length > 0 || discoveredAssets.length > 0;
   return {
     schemaVersion: "1.0",
     root,
@@ -1801,20 +1957,26 @@ async function refreshVersionLock(root, options = {}) {
     updatedArtifactRelationLocks: sortUnique2(updatedArtifactRelationLocks),
     retainedArtifactRelationOrphans: sortUnique2(retainedArtifactRelationOrphans),
     removedArtifactRelationLocks: sortUnique2(removedArtifactRelationLocks),
+    ...includeAssetDiffs ? {
+      addedAssetLocks: sortUnique2(addedAssetLocks),
+      updatedAssetLocks: sortUnique2(updatedAssetLocks),
+      retainedAssetOrphans: sortUnique2(retainedAssetOrphans),
+      removedAssetLocks: sortUnique2(removedAssetLocks)
+    } : {},
     postAudit,
     warnings
   };
 }
-function validatePreciseOrphanRemoval(requestedEdgeIds, lock, currentImplementationEdgeIds, currentArtifactRelationEdgeIds) {
+function validatePreciseOrphanRemoval(requestedEdgeIds, lock, currentImplementationEdgeIds, currentArtifactRelationEdgeIds, currentAssetEdgeIds = /* @__PURE__ */ new Set()) {
   for (const edgeId of requestedEdgeIds) {
-    const matches = lock.locks.filter((entry) => entry.edgeId === edgeId).length + (lock.artifactRelations ?? []).filter((entry) => entry.edgeId === edgeId).length;
+    const matches = lock.locks.filter((entry) => entry.edgeId === edgeId).length + (lock.artifactRelations ?? []).filter((entry) => entry.edgeId === edgeId).length + (lock.assetLocks ?? []).filter((entry) => entry.edgeId === edgeId).length;
     if (matches === 0) {
       throw new Error(`Cannot remove orphan edge ${edgeId}: edgeId does not exist in the version lock`);
     }
     if (matches !== 1) {
       throw new Error(`Cannot remove orphan edge ${edgeId}: edgeId does not match exactly one version lock entry`);
     }
-    if (currentImplementationEdgeIds.has(edgeId) || currentArtifactRelationEdgeIds.has(edgeId)) {
+    if (currentImplementationEdgeIds.has(edgeId) || currentArtifactRelationEdgeIds.has(edgeId) || currentAssetEdgeIds.has(edgeId)) {
       throw new Error(`Cannot remove orphan edge ${edgeId}: edge is currently active`);
     }
   }
@@ -1837,6 +1999,7 @@ async function traceVersion(root, target, lockPath = VERSION_LOCK_PATH) {
     const targetKey = `${rel.target.type}:${rel.target.id}`;
     return sourceKey === targetUid || targetKey === targetUid;
   });
+  const targetAssetLocks = (lock.assetLocks ?? []).filter((asset) => asset.owner !== null && `${asset.owner.type}:${asset.owner.id}` === targetUid);
   return {
     schemaVersion: "1.0",
     root,
@@ -1848,7 +2011,8 @@ async function traceVersion(root, target, lockPath = VERSION_LOCK_PATH) {
     currentEdges: index.edges.filter((edge2) => edge2.from === targetUid || edge2.to === targetUid),
     locks: lock.locks.filter((entry) => `${entry.artifact.type}:${entry.artifact.id}` === targetUid),
     artifactRelations: targetArtifactRelations,
-    issues: [...targetIssues.map(enrichVersionLockIssue), ...audit.issues.filter((issue2) => `${issue2.artifact?.type}:${issue2.artifact?.id}` === targetUid || issue2.edgeId.includes(`#${targetUid}`))]
+    ...targetAssetLocks.length > 0 ? { assetLocks: targetAssetLocks } : {},
+    issues: [...targetIssues.map(enrichVersionLockIssue), ...audit.issues.filter((issue2) => `${issue2.artifact?.type}:${issue2.artifact?.id}` === targetUid || issue2.edgeId.includes(`#${targetUid}`) || issue2.edgeId.startsWith(`asset:${targetUid}#`))]
   };
 }
 function renderIssueBlockingTag(issue2, strictMissingLock) {
@@ -1892,6 +2056,7 @@ function renderVersionLockAuditMarkdown(result, options = {}) {
     `- \u9501\u6587\u4EF6: \`${result.lockPath}\``,
     `- \u5B9E\u73B0/\u9A8C\u8BC1\u9501: ${result.totalLocks}\uFF08\u65B0\u9C9C ${result.fresh}\uFF09`,
     `- \u5236\u54C1\u5173\u7CFB\u9501: ${result.totalArtifactRelationLocks}\uFF08\u65B0\u9C9C ${result.artifactRelationFresh}\uFF09`,
+    ...result.totalAssetLocks !== void 0 ? [`- \u77E5\u8BC6\u8D44\u4EA7\u9501: ${result.totalAssetLocks}\uFF08\u65B0\u9C9C ${result.assetFresh ?? 0}\uFF09`] : [],
     `- \u963B\u65AD\u7B56\u7565: ${strictMissingLock ? "--strict-missing-lock\uFF08missing_lock \u5347\u7EA7\u4E3A\u963B\u65AD\uFF09" : "\u9ED8\u8BA4\uFF08missing_lock \u4E0D\u963B\u65AD\uFF09"}`,
     `- \u95EE\u9898: ${result.issues.length}\uFF08\u963B\u65AD ${blockingCount}\uFF0C\u4E0D\u963B\u65AD ${nonBlockingCount}\uFF09`,
     "",
@@ -1928,6 +2093,7 @@ function renderVersionLockRefreshMarkdown(result) {
     `- \u6A21\u5F0F: \`${result.mode}\`\uFF08\u53D8\u66F4\u8DEF\u5F84 ${result.changedPaths.length} \u4E2A\uFF0C\u53D7\u5F71\u54CD\u8FB9 ${result.affectedEdges.length} \u6761\uFF09`,
     `- \u5B9E\u73B0/\u9A8C\u8BC1\u9501: \u65B0\u589E ${result.addedLocks.length} | \u66F4\u65B0 ${result.updatedLocks.length} | \u4FDD\u7559\u5B64\u7ACB ${result.retainedOrphans.length} | \u5220\u9664\u5B64\u7ACB ${result.removedOrphans.length}`,
     `- \u5236\u54C1\u5173\u7CFB\u9501: \u65B0\u589E ${result.addedArtifactRelationLocks.length} | \u66F4\u65B0 ${result.updatedArtifactRelationLocks.length} | \u4FDD\u7559\u5B64\u7ACB ${result.retainedArtifactRelationOrphans.length} | \u5220\u9664 ${result.removedArtifactRelationLocks.length}`,
+    ...result.addedAssetLocks !== void 0 ? [`- \u77E5\u8BC6\u8D44\u4EA7\u9501: \u65B0\u589E ${result.addedAssetLocks.length} | \u66F4\u65B0 ${(result.updatedAssetLocks ?? []).length} | \u4FDD\u7559\u5B64\u7ACB ${(result.retainedAssetOrphans ?? []).length} | \u5220\u9664 ${(result.removedAssetLocks ?? []).length}`] : [],
     `- \u963B\u65AD\u7B56\u7565: refresh \u56FA\u5B9A\u6309 --strict-missing-lock \u5224\u5B9A\uFF0Cmissing_lock \u4E5F\u4F1A\u963B\u65AD`,
     `- \u5237\u65B0\u540E\u5BA1\u8BA1\u95EE\u9898: ${result.postAudit.issues.length}\uFF08\u963B\u65AD ${blockingCount}\uFF0C\u4E0D\u963B\u65AD ${nonBlockingCount}\uFF09`,
     "",
@@ -1954,6 +2120,10 @@ function renderVersionLockRefreshMarkdown(result) {
     lines.push("");
   }
   appendList(lines, "\u5220\u9664\u7684\u5236\u54C1\u5173\u7CFB\u9501", result.removedArtifactRelationLocks);
+  appendList(lines, "\u65B0\u589E\u7684\u77E5\u8BC6\u8D44\u4EA7\u9501", result.addedAssetLocks ?? []);
+  appendList(lines, "\u66F4\u65B0\u7684\u77E5\u8BC6\u8D44\u4EA7\u9501", result.updatedAssetLocks ?? []);
+  appendList(lines, "\u4FDD\u7559\u7684\u5B64\u7ACB\u77E5\u8BC6\u8D44\u4EA7\u9501", result.retainedAssetOrphans ?? []);
+  appendList(lines, "\u5220\u9664\u7684\u77E5\u8BC6\u8D44\u4EA7\u9501", result.removedAssetLocks ?? []);
   appendList(lines, "\u63D0\u9192", result.warnings);
   if (result.postAudit.issues.length > 0) {
     if (blockingCount > 0) {
@@ -1987,6 +2157,13 @@ function renderTraceVersionMarkdown(result) {
     lines.push("## Artifact Relations");
     for (const rel of result.artifactRelations) {
       lines.push(`- \`${rel.edgeId}\` kind=\`${rel.kind}\` source=\`${rel.source.type}:${rel.source.id}\` target=\`${rel.target.type}:${rel.target.id}\``);
+    }
+    lines.push("");
+  }
+  if ((result.assetLocks ?? []).length > 0) {
+    lines.push("## Knowledge Asset Locks");
+    for (const asset of result.assetLocks ?? []) {
+      lines.push(`- \`${asset.edgeId}\` path=\`${asset.path}\` contentHash=\`${asset.contentHash}\``);
     }
     lines.push("");
   }
@@ -2035,10 +2212,12 @@ function validateVersionLockFile(value, lockPath) {
   const seen = /* @__PURE__ */ new Set();
   const locks = record.locks.map((entry, index) => validateVersionLockEntry(entry, index, seen));
   const artifactRelations = record.artifactRelations !== void 0 ? validateArtifactRelationLocks(record.artifactRelations, lockPath) : [];
+  const assetLocks = record.assetLocks !== void 0 ? validateAssetVersionLocks(record.assetLocks, lockPath) : void 0;
   return {
     schemaVersion: VERSION_LOCK_SCHEMA_VERSION,
     locks,
-    artifactRelations
+    artifactRelations,
+    ...assetLocks !== void 0 ? { assetLocks } : {}
   };
 }
 function validateVersionLockEntry(value, index, seen) {
@@ -2142,6 +2321,236 @@ function validateArtifactRelationEndpoint(value, path) {
 }
 function artifactRelationLockSortKey(lock) {
   return `${lock.kind}	${lock.source.type}	${lock.source.id}	${lock.target.type}	${lock.target.id}`;
+}
+function validateAssetVersionLocks(value, lockPath) {
+  if (!Array.isArray(value)) {
+    throw new Error(`Invalid version lock schema in ${lockPath}: assetLocks must be an array`);
+  }
+  const seen = /* @__PURE__ */ new Set();
+  const result = value.map((entry, index) => {
+    if (!entry || typeof entry !== "object") {
+      throw new Error(`Invalid assetLocks[${index}] in ${lockPath}: entry must be an object`);
+    }
+    const rec = entry;
+    const edgeId = requireString(rec.edgeId, `assetLocks[${index}].edgeId`);
+    if (seen.has(edgeId)) {
+      throw new Error(`Invalid assetLocks[${index}] in ${lockPath}: duplicate edgeId ${edgeId}`);
+    }
+    seen.add(edgeId);
+    let owner = null;
+    if (rec.owner !== null && rec.owner !== void 0) {
+      if (typeof rec.owner !== "object" || Array.isArray(rec.owner)) {
+        throw new Error(`Invalid assetLocks[${index}].owner in ${lockPath}: expected object or null`);
+      }
+      const ow = rec.owner;
+      owner = {
+        type: requireString(ow.type, `assetLocks[${index}].owner.type`),
+        id: requireString(ow.id, `assetLocks[${index}].owner.id`),
+        path: requireSafeRelativePath(requireString(ow.path, `assetLocks[${index}].owner.path`), `assetLocks[${index}].owner.path`)
+      };
+    }
+    const path = requireSafeRelativePath(requireString(rec.path, `assetLocks[${index}].path`), `assetLocks[${index}].path`);
+    const expectedEdgeId = owner === null ? `asset:workspace#locks_asset#${path}` : `asset:${owner.type}:${owner.id}#locks_asset#${path}`;
+    if (edgeId !== expectedEdgeId) {
+      throw new Error(
+        `Invalid assetLocks[${index}].edgeId in ${lockPath}: expected "${expectedEdgeId}", got "${edgeId}"`
+      );
+    }
+    const contentHash = requireHash(rec.contentHash, `assetLocks[${index}].contentHash`);
+    return { edgeId, owner, path, contentHash };
+  });
+  return sortBy(result, (item) => item.edgeId);
+}
+function assetLockTouchesPaths(lock, paths) {
+  return paths.has(lock.path) || lock.owner !== null && paths.has(lock.owner.path);
+}
+function stableAssetLockJson(lock) {
+  return JSON.stringify({
+    edgeId: lock.edgeId,
+    owner: lock.owner,
+    path: lock.path,
+    contentHash: lock.contentHash
+  });
+}
+function assertSafeAssetGlobPattern(rawPat, fieldName) {
+  const norm = String(rawPat ?? "").trim().replace(/\\/g, "/");
+  if (!norm || norm.startsWith("/") || /^[A-Za-z]:/.test(norm) || /(?:^|\/)\.\.(?:\/|$)/.test(norm)) {
+    throw new Error(`Invalid ${fieldName} pattern "${rawPat}": must be a contained workspace-relative glob`);
+  }
+}
+function globMayTraverseDirectory(rawPat, dirRel) {
+  const cleanPat = rawPat.trim().replace(/\\/g, "/").replace(/^\.\//, "");
+  if (cleanPat === "**" || cleanPat.startsWith("**/")) return true;
+  if (matchesRunnerGlob(dirRel, cleanPat) || matchesRunnerGlob(`${dirRel}/placeholder.md`, cleanPat)) return true;
+  const patSegs = cleanPat.split("/").filter(Boolean);
+  const dirSegs = dirRel.split("/").filter(Boolean);
+  for (let i = 0; i < dirSegs.length && i < patSegs.length; i += 1) {
+    if (patSegs[i] === "**") return true;
+    if (!matchesRunnerGlob(dirSegs[i], patSegs[i])) return false;
+  }
+  return dirSegs.length <= patSegs.length;
+}
+function resolveRegularAssetRelativePath(root, inputPath) {
+  if (typeof inputPath !== "string" || inputPath.trim().length === 0 || inputPath.includes("\0")) {
+    throw new Error(`Invalid knowledge asset path: ${String(inputPath)}`);
+  }
+  const trimmed = inputPath.trim();
+  if (trimmed.startsWith("/") || trimmed.startsWith("\\") || /^[A-Za-z]:/.test(trimmed) || isAbsolute2(trimmed)) {
+    throw new Error(`Knowledge asset path must be a repository-relative path (got absolute path "${inputPath}")`);
+  }
+  const slashNorm = trimmed.replace(/\\/g, "/");
+  const rawSegments = slashNorm.split("/");
+  if (rawSegments.some((seg) => seg === "..")) {
+    throw new Error(`Knowledge asset path cannot contain ".." parent traversal segments: "${inputPath}"`);
+  }
+  const segments = rawSegments.filter((seg) => seg.length > 0 && seg !== ".");
+  if (segments.length === 0) {
+    throw new Error(`Invalid knowledge asset path: "${inputPath}"`);
+  }
+  const rel = segments.join("/");
+  const resolvedRoot = resolve(root);
+  const realRoot = existsSync(resolvedRoot) ? realpathSync(resolvedRoot) : resolvedRoot;
+  let cursor = realRoot;
+  for (let idx = 0; idx < segments.length; idx += 1) {
+    cursor = join3(cursor, segments[idx]);
+    let st;
+    try {
+      st = lstatSync(cursor);
+    } catch (err) {
+      if (err.code === "ENOENT") {
+        throw new Error(`Declared knowledge asset "${inputPath}" does not exist at ${rel}`);
+      }
+      throw err;
+    }
+    if (st.isSymbolicLink()) {
+      throw new Error(`Symlink path is outside allowed policy: ${inputPath}`);
+    }
+    if (idx === segments.length - 1 && !st.isFile()) {
+      throw new Error(`Knowledge asset "${inputPath}" must be a regular file (got non-file at ${rel})`);
+    }
+    if (idx < segments.length - 1 && !st.isDirectory()) {
+      throw new Error(`Knowledge asset ancestor "${segments[idx]}" is not a directory in ${rel}`);
+    }
+  }
+  return rel;
+}
+async function isKnowledgeAssetRelevantPath(root, candidatePath, schema, lockPath = VERSION_LOCK_PATH, cached) {
+  const normalized = candidatePath.replace(/\\/g, "/").replace(/^\.\//, "");
+  const globs = schema.knowledgeAssets?.globs ?? [];
+  const excludeGlobs = schema.knowledgeAssets?.excludeGlobs ?? [];
+  if (globs.some((pat) => matchesRunnerGlob(normalized, pat)) && !excludeGlobs.some((pat) => matchesRunnerGlob(normalized, pat))) {
+    return true;
+  }
+  const existingLock = cached ? cached.existingLock ??= await readVersionLock(root, lockPath) : await readVersionLock(root, lockPath);
+  if ((existingLock.assetLocks ?? []).some((item) => item.path === normalized)) {
+    return true;
+  }
+  const index = cached ? cached.index ??= await buildVersionIndex(root) : await buildVersionIndex(root);
+  for (const node of index.nodes) {
+    if (node.sourceKind !== "artifact" || !node.path.toLowerCase().endsWith(".md")) continue;
+    try {
+      const raw = await readFile2(join3(root, node.path), "utf-8");
+      const fm = parseSafeFrontmatter(raw).data?.knowledge_assets;
+      if (Array.isArray(fm) && fm.some((p) => typeof p === "string" && p.trim().replace(/\\/g, "/").replace(/^\.\//, "") === normalized)) {
+        return true;
+      }
+    } catch {
+    }
+  }
+  return false;
+}
+async function discoverDeclaredKnowledgeAssets(root, index, schema, hashCache, safeLockPath = VERSION_LOCK_PATH) {
+  const results = /* @__PURE__ */ new Map();
+  const globs = schema.knowledgeAssets?.globs ?? [];
+  const excludeGlobs = schema.knowledgeAssets?.excludeGlobs ?? [];
+  for (const pat of globs) assertSafeAssetGlobPattern(pat, "knowledgeAssets.globs");
+  for (const pat of excludeGlobs) assertSafeAssetGlobPattern(pat, "knowledgeAssets.excludeGlobs");
+  const resolvedRoot = resolve(root);
+  const realRoot = existsSync(resolvedRoot) ? realpathSync(resolvedRoot) : resolvedRoot;
+  if (globs.length > 0) {
+    const explicitHidden = collectExplicitHiddenDirSegments(globs);
+    const { readdir: readdir7 } = await import("fs/promises");
+    const checkSymlinks = async (dirAbs) => {
+      let entries;
+      try {
+        entries = await readdir7(dirAbs, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const ent of entries) {
+        if (SKIPPED_WALK_DIRS.has(ent.name)) continue;
+        if (ent.name.startsWith(".") && !explicitHidden.some((seg) => matchesRunnerGlob(ent.name, seg))) continue;
+        const full = join3(dirAbs, ent.name);
+        const rel = relative2(realRoot, full).replace(/\\/g, "/");
+        if (ent.isSymbolicLink()) {
+          if (globs.some((pat) => globMayTraverseDirectory(pat, rel)) && !excludeGlobs.some((pat) => matchesRunnerGlob(rel, pat) || matchesRunnerGlob(`${rel}/x`, pat))) {
+            throw new Error(`Symlink path is outside allowed policy: ${rel}`);
+          }
+          continue;
+        }
+        if (ent.isDirectory()) {
+          await checkSymlinks(full);
+        }
+      }
+    };
+    await checkSymlinks(realRoot);
+    const allFiles = await walkFiles(realRoot, realRoot, void 0, explicitHidden);
+    for (const rel of allFiles) {
+      const normalized = rel.replace(/\\/g, "/");
+      if (normalized === safeLockPath || normalized === VERSION_LOCK_PATH) continue;
+      if (!globs.some((pat) => matchesRunnerGlob(normalized, pat))) continue;
+      if (excludeGlobs.some((pat) => matchesRunnerGlob(normalized, pat))) continue;
+      const safeRel = resolveRegularAssetRelativePath(root, normalized);
+      const contentHash = await hashRelativePath(root, safeRel, hashCache);
+      const edgeId = `asset:workspace#locks_asset#${safeRel}`;
+      results.set(edgeId, {
+        edgeId,
+        owner: null,
+        path: safeRel,
+        contentHash
+      });
+    }
+  }
+  for (const node of index.nodes) {
+    if (node.sourceKind !== "artifact" || !node.path.toLowerCase().endsWith(".md")) continue;
+    let raw;
+    try {
+      raw = await readFile2(join3(root, node.path), "utf-8");
+    } catch {
+      continue;
+    }
+    let fmAssets;
+    try {
+      fmAssets = parseSafeFrontmatter(raw).data?.knowledge_assets;
+    } catch {
+      continue;
+    }
+    if (fmAssets === void 0) continue;
+    if (!Array.isArray(fmAssets) || fmAssets.length === 0 || fmAssets.some((item) => typeof item !== "string" || item.trim().length === 0)) {
+      throw new Error(
+        `Invalid knowledge_assets in ${node.path}: expected a non-empty array of relative file paths`
+      );
+    }
+    for (const rawAssetPath of fmAssets) {
+      const preClean = rawAssetPath.trim().replace(/\\/g, "/").replace(/^(?:\.\/)+/, "");
+      if (preClean === safeLockPath || preClean === VERSION_LOCK_PATH) {
+        throw new Error(`knowledge_assets in ${node.path} cannot reference the version lock file itself (${preClean})`);
+      }
+      const safeRel = resolveRegularAssetRelativePath(root, rawAssetPath.trim());
+      if (safeRel === safeLockPath || safeRel === VERSION_LOCK_PATH) {
+        throw new Error(`knowledge_assets in ${node.path} cannot reference the version lock file itself (${safeRel})`);
+      }
+      const contentHash = await hashRelativePath(root, safeRel, hashCache);
+      const edgeId = `asset:${node.type}:${node.id}#locks_asset#${safeRel}`;
+      results.set(edgeId, {
+        edgeId,
+        owner: { type: node.type, id: node.id, path: node.path },
+        path: safeRel,
+        contentHash
+      });
+    }
+  }
+  return sortBy([...results.values()], (item) => item.edgeId);
 }
 function artifactRelationLockTouchesPaths(lock, paths) {
   return paths.has(lock.source.path) || paths.has(lock.target.path);
@@ -2581,6 +2990,7 @@ var init_versioned_traceability = __esm({
     "use strict";
     init_index();
     init_glob_matcher();
+    init_file_walker();
     VERSION_LOCK_PATH = "artifacts/traceability-version-lock.json";
     VERSION_INDEX_SCHEMA_VERSION = "1.0";
     VERSION_LOCK_SCHEMA_VERSION = "1.0";
@@ -10965,6 +11375,7 @@ __export(index_exports, {
   getTargetArtifactTypes: () => getTargetArtifactTypes,
   inspectRestructure: () => inspectRestructure,
   installManagedHookBlock: () => installManagedHookBlock,
+  isKnowledgeAssetRelevantPath: () => isKnowledgeAssetRelevantPath,
   isOfficialNamespace: () => isOfficialNamespace,
   isPacketTargetType: () => isPacketTargetType,
   isPacketTargetTypeDynamic: () => isPacketTargetTypeDynamic,
@@ -17406,7 +17817,13 @@ async function runCli(argv, io = {}) {
               return 1;
             }
             const schema = await loadConfig(root);
-            const unstagedGraphPaths = changeResult.unstagedPaths.filter((path) => isGraphRelevantPath(path, schema));
+            const unstagedGraphPaths = [];
+            const assetCheckCache = {};
+            for (const candidatePath of changeResult.unstagedPaths) {
+              if (isGraphRelevantPath(candidatePath, schema) || await isKnowledgeAssetRelevantPath(root, candidatePath, schema, lockPath, assetCheckCache)) {
+                unstagedGraphPaths.push(candidatePath);
+              }
+            }
             if (unstagedGraphPaths.length > 0) {
               err("Cannot refresh staged version locks because graph-relevant unstaged changes may affect working-tree hashes:\n");
               for (const conflictPath of unstagedGraphPaths) {
